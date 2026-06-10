@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::io::{BufReader, Read};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -681,6 +682,316 @@ fn usage_rollup() -> UsageRollup {
     }
 }
 
+// ── Sessions ──────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone, Default)]
+struct TokenTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    est_dollars: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct SessionMeta {
+    id: String,
+    provider: String,           // "claude-code" | "cowork"
+    repo_path: Option<String>,
+    title: Option<String>,
+    started_at: Option<u64>,    // unix secs
+    last_activity: u64,         // unix secs
+    token_totals: Option<TokenTotals>,
+    status: String,             // "running" | "waiting" | "idle" | "done"
+    project_slug: Option<String>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn session_status(last_activity_secs: u64, has_live: bool) -> &'static str {
+    let now = now_unix();
+    let age = now.saturating_sub(last_activity_secs);
+    if has_live && age < 120 {
+        "running"
+    } else if has_live && age < 600 {
+        "waiting"
+    } else if last_activity_secs >= (now / 86400) * 86400 {
+        "idle"
+    } else {
+        "done"
+    }
+}
+
+fn count_live_claude() -> usize {
+    std::process::Command::new("ps")
+        .args(["ax", "-o", "comm="])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| {
+                    let t = l.trim();
+                    t == "claude" || t.ends_with("/claude")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn match_basename_to_slug(basename: &str, registry: &Registry) -> Option<String> {
+    for (slug, proj) in &registry.projects {
+        for repo in &proj.repos {
+            if repo.as_str() == basename {
+                return Some(slug.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Read first 8 KB of a JSONL file; extract (title, cwd, first_timestamp).
+fn cc_session_cheap_parse(path: &Path) -> (Option<String>, Option<String>, Option<u64>) {
+    let Ok(f) = fs::File::open(path) else {
+        return (None, None, None);
+    };
+    let mut buf = String::new();
+    let _ = BufReader::new(f).take(8192).read_to_string(&mut buf);
+
+    let mut title: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut first_ts: Option<u64> = None;
+
+    for line in buf.lines() {
+        if title.is_some() && cwd.is_some() && first_ts.is_some() {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if title.is_none() && typ == "ai-title" {
+            title = v.get("aiTitle")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+        }
+        if cwd.is_none() {
+            if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !c.is_empty() {
+                    cwd = Some(c.to_string());
+                }
+            }
+        }
+        if first_ts.is_none() {
+            if let Some(t_str) = v.get("timestamp").and_then(|t| t.as_str()) {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t_str) {
+                    first_ts = Some(dt.timestamp() as u64);
+                }
+            }
+        }
+    }
+    (title, cwd, first_ts)
+}
+
+fn scan_claude_code_sessions(
+    registry: &Registry,
+    has_live: bool,
+    cache: &UsageCache,
+) -> Vec<SessionMeta> {
+    let projects_dir = home_dir().join(".claude/projects");
+    let Ok(proj_dirs) = fs::read_dir(&projects_dir) else {
+        return vec![];
+    };
+    let mut sessions = vec![];
+
+    for proj_entry in proj_dirs.flatten() {
+        let proj_dir = proj_entry.path();
+        if !proj_dir.is_dir() {
+            continue;
+        }
+        let dir_name = proj_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let Ok(files) = fs::read_dir(&proj_dir) else {
+            continue;
+        };
+        for fe in files.flatten() {
+            let fpath = fe.path();
+            if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let id = fpath
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let last_activity = mtime_secs(&fpath).unwrap_or(0);
+
+            let (title, cwd, first_ts) = cc_session_cheap_parse(&fpath);
+
+            // Project slug: prefer cwd basename, fall back to encoded dir name
+            let project_slug = {
+                let from_cwd = cwd
+                    .as_deref()
+                    .and_then(|c| Path::new(c).file_name())
+                    .and_then(|n| n.to_str())
+                    .and_then(|bn| match_basename_to_slug(bn, registry));
+                if from_cwd.is_some() {
+                    from_cwd
+                } else {
+                    let s = match_dir_to_slug(&dir_name, registry);
+                    if s == "unfiled" { None } else { Some(s) }
+                }
+            };
+
+            // Token totals from usage cache (no re-parse needed)
+            let fpath_str = fpath.to_string_lossy().into_owned();
+            let token_totals = cache.files.get(&fpath_str).map(|entry| {
+                let mut total = DayBucket::default();
+                for b in entry.days.values() {
+                    total.add(b);
+                }
+                TokenTotals {
+                    input: total.input,
+                    output: total.output,
+                    cache_read: total.cache_read,
+                    cache_write: total.cache_write,
+                    est_dollars: total.est_dollars,
+                }
+            });
+
+            sessions.push(SessionMeta {
+                id,
+                provider: "claude-code".to_string(),
+                repo_path: cwd,
+                title,
+                started_at: first_ts,
+                last_activity,
+                token_totals,
+                status: session_status(last_activity, has_live).to_string(),
+                project_slug,
+            });
+        }
+    }
+    sessions
+}
+
+fn scan_cowork_sessions(registry: &Registry, has_live: bool) -> Vec<SessionMeta> {
+    let cowork_root = home_dir()
+        .join("Library/Application Support/Claude/local-agent-mode-sessions");
+    let Ok(space_dirs) = fs::read_dir(&cowork_root) else {
+        return vec![];
+    };
+    let mut sessions = vec![];
+    let cutoff = now_unix().saturating_sub(90 * 86400);
+
+    for space_entry in space_dirs.flatten() {
+        let space_dir = space_entry.path();
+        if !space_dir.is_dir() {
+            continue;
+        }
+        let Ok(ws_dirs) = fs::read_dir(&space_dir) else {
+            continue;
+        };
+        for ws_entry in ws_dirs.flatten() {
+            let ws_dir = ws_entry.path();
+            if !ws_dir.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&ws_dir) else {
+                continue;
+            };
+            for fe in files.flatten() {
+                let fpath = fe.path();
+                let fname = fpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !fname.starts_with("local_") || !fname.ends_with(".json") {
+                    continue;
+                }
+
+                let file_mtime = mtime_secs(&fpath).unwrap_or(0);
+                if file_mtime < cutoff {
+                    continue;
+                }
+
+                let parsed = fs::read_to_string(&fpath)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
+
+                let (id, title, repo_path, started_at, cowork_la) = match parsed {
+                    Some(v) => {
+                        let id = v.get("sessionId")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or(fname)
+                            .to_string();
+                        let title = v.get("title")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        let repo_path = v.get("userSelectedFolders")
+                            .and_then(|f| f.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string());
+                        let started_at = v.get("createdAt")
+                            .and_then(|t| t.as_u64())
+                            .map(|ms| ms / 1000);
+                        let la = v.get("lastActivityAt")
+                            .and_then(|t| t.as_u64())
+                            .map(|ms| ms / 1000);
+                        (id, title, repo_path, started_at, la)
+                    }
+                    None => (fname.to_string(), None, None, None, None),
+                };
+
+                let effective_la = cowork_la.unwrap_or(file_mtime);
+                let project_slug = repo_path
+                    .as_deref()
+                    .and_then(|rp| Path::new(rp).file_name())
+                    .and_then(|n| n.to_str())
+                    .and_then(|bn| match_basename_to_slug(bn, registry));
+
+                sessions.push(SessionMeta {
+                    id,
+                    provider: "cowork".to_string(),
+                    repo_path,
+                    title,
+                    started_at,
+                    last_activity: effective_la,
+                    token_totals: None,
+                    status: session_status(effective_la, has_live).to_string(),
+                    project_slug,
+                });
+            }
+        }
+    }
+    sessions
+}
+
+#[tauri::command]
+fn list_sessions() -> Vec<SessionMeta> {
+    let registry = load_registry();
+    let has_live = count_live_claude() > 0;
+    let cache: UsageCache = fs::read_to_string(app_data_dir().join("usage_cache.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    let mut sessions = vec![];
+    sessions.extend(scan_claude_code_sessions(&registry, has_live, &cache));
+    sessions.extend(scan_cowork_sessions(&registry, has_live));
+    sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    sessions
+}
+
+#[tauri::command]
+fn active_session_count() -> usize {
+    count_live_claude()
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -692,6 +1003,8 @@ fn main() {
             get_settings,
             save_settings,
             usage_rollup,
+            list_sessions,
+            active_session_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

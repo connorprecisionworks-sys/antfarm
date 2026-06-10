@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronLeft, Activity, FileText } from "lucide-react";
-import { ProjectDetail as PD } from "../types";
+import { ChevronLeft, FileText } from "lucide-react";
+import { ProjectDetail as PD, SessionMeta } from "../types";
 import { relativeTime } from "../lib/relativeTime";
 import { MarkdownView } from "../components/MarkdownView";
+import { SessionRow } from "../components/SessionRow";
 
 type Tab = "overview" | "ideas" | "notes" | "sessions";
 
@@ -16,6 +17,7 @@ export function ProjectDetail() {
   const [tab, setTab] = useState<Tab>("overview");
   const [noteContent, setNoteContent] = useState<string | null>(null);
   const [selectedNote, setSelectedNote] = useState<string | null>(null);
+  const [projSessions, setProjSessions] = useState<SessionMeta[] | null>(null);
 
   useEffect(() => {
     if (!slug) return;
@@ -25,6 +27,7 @@ export function ProjectDetail() {
     setTab("overview");
     setNoteContent(null);
     setSelectedNote(null);
+    setProjSessions(null);
     invoke<PD | null>("get_project_detail", { slug })
       .then((d) => {
         if (!d) setNotFound(true);
@@ -36,6 +39,14 @@ export function ProjectDetail() {
         setLoading(false);
       });
   }, [slug]);
+
+  useEffect(() => {
+    if (tab === "sessions" && slug && projSessions === null) {
+      invoke<SessionMeta[]>("list_sessions")
+        .then((all) => setProjSessions(all.filter((s) => s.project_slug === slug)))
+        .catch(() => setProjSessions([]));
+    }
+  }, [tab, slug, projSessions]);
 
   function openNote(filename: string) {
     if (!slug) return;
@@ -194,10 +205,17 @@ export function ProjectDetail() {
         )}
 
         {tab === "sessions" && (
-          <div className="flex flex-col items-center justify-center py-16 gap-3 text-center">
-            <Activity size={28} className="text-zinc-700" strokeWidth={1.5} />
-            <p className="text-sm text-zinc-500">Sessions tracking arrives in the next phase.</p>
-          </div>
+          projSessions === null ? (
+            <p className="text-sm text-zinc-500 animate-pulse">Loading…</p>
+          ) : projSessions.length === 0 ? (
+            <EmptyState message="No sessions found for this project." />
+          ) : (
+            <div className="-mx-3">
+              {projSessions.map((s) => (
+                <SessionRow key={`${s.provider}:${s.id}`} session={s} />
+              ))}
+            </div>
+          )
         )}
       </div>
     </div>

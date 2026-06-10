@@ -1,6 +1,6 @@
 import { ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Lightbulb, Zap } from "lucide-react";
+import { Lightbulb, Zap, GitBranch } from "lucide-react";
 import { Project } from "../types";
 import { relativeTime } from "../lib/relativeTime";
 
@@ -47,7 +47,7 @@ export function ProjectCard({ project }: Props) {
           />
         )}
         {project.repos.map((repo) => (
-          <Pill key={repo} icon="⌥" label={repo} mono />
+          <Pill key={repo} icon={<GitBranch size={11} strokeWidth={1.75} />} label={repo} mono />
         ))}
       </div>
 

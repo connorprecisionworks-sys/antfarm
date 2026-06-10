@@ -1,4 +1,6 @@
+import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Home,
   Layers,
@@ -17,6 +19,19 @@ const NAV = [
 ];
 
 export function Sidebar() {
+  const [liveCount, setLiveCount] = useState(0);
+
+  useEffect(() => {
+    function refresh() {
+      invoke<number>("active_session_count")
+        .then((n) => setLiveCount(n))
+        .catch(() => setLiveCount(0));
+    }
+    refresh();
+    const id = setInterval(refresh, 30_000);
+    return () => clearInterval(id);
+  }, []);
+
   return (
     <aside className="flex flex-col w-[220px] shrink-0 h-full bg-surface-1 border-r border-zinc-800/80">
       {/* Wordmark */}
@@ -42,7 +57,12 @@ export function Sidebar() {
             }
           >
             <Icon size={16} strokeWidth={1.75} className="shrink-0" />
-            {label}
+            <span className="flex-1">{label}</span>
+            {label === "Sessions" && liveCount > 0 && (
+              <span className="text-xs bg-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded-full leading-none tabular-nums">
+                {liveCount}
+              </span>
+            )}
           </NavLink>
         ))}
       </nav>

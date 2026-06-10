@@ -64,3 +64,23 @@ export interface Settings {
   weekly_cap_tokens: number;
   reset_weekday: number; // 0=Mon … 6=Sun
 }
+
+export interface TokenTotals {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  est_dollars: number;
+}
+
+export interface SessionMeta {
+  id: string;
+  provider: "claude-code" | "cowork";
+  repo_path: string | null;
+  title: string | null;
+  started_at: number | null;
+  last_activity: number;
+  token_totals: TokenTotals | null;
+  status: "running" | "waiting" | "idle" | "done";
+  project_slug: string | null;
+}
