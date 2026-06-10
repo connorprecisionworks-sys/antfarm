@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use notify::{RecommendedWatcher, Watcher, RecursiveMode, Config as NotifyConfig};
+use tauri::Emitter;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -20,6 +23,155 @@ fn brain_root() -> PathBuf {
 
 fn app_data_dir() -> PathBuf {
     home_dir().join("Library/Application Support/com.connordore.antfarm")
+}
+
+// ── Event store ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct RawAntfarmEvent {
+    session_id: Option<String>,
+    hook_event_name: Option<String>,
+    cwd: Option<String>,
+    notification_type: Option<String>,
+}
+
+#[derive(Clone)]
+struct EventDerivedStatus {
+    status: String,
+    project_slug: Option<String>,
+    attention: bool,
+}
+
+struct EventsStateInner {
+    sessions: HashMap<String, EventDerivedStatus>,
+}
+
+struct EventsState(Arc<Mutex<EventsStateInner>>);
+
+fn events_file_path() -> PathBuf {
+    home_dir().join(".antfarm/events.jsonl")
+}
+
+fn offset_path() -> PathBuf {
+    app_data_dir().join("events_offset.json")
+}
+
+fn load_offset() -> u64 {
+    fs::read_to_string(offset_path())
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("offset").and_then(|o| o.as_u64()))
+        .unwrap_or(0)
+}
+
+fn save_offset(offset: u64) {
+    let _ = fs::create_dir_all(app_data_dir());
+    let _ = fs::write(offset_path(), format!("{{\"offset\":{}}}", offset));
+}
+
+fn match_cwd_to_slug_ci(cwd: &str, registry: &Registry) -> Option<String> {
+    let basename = Path::new(cwd).file_name()?.to_str()?.to_lowercase();
+    for (slug, proj) in &registry.projects {
+        for repo in &proj.repos {
+            if repo.to_lowercase() == basename {
+                return Some(slug.clone());
+            }
+        }
+    }
+    None
+}
+
+fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry) {
+    let path = events_file_path();
+    let file_size = match fs::metadata(&path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    let mut offset = load_offset();
+    if file_size < offset {
+        eprintln!("antfarm events: file shrank ({} < {}), resetting offset to 0", file_size, offset);
+        offset = 0;
+        save_offset(0);
+    }
+    if file_size == offset {
+        return;
+    }
+    let Ok(mut f) = fs::File::open(&path) else { return };
+    if offset > 0 && f.seek(SeekFrom::Start(offset)).is_err() {
+        return;
+    }
+    let mut raw = Vec::new();
+    let Ok(bytes_read) = f.read_to_end(&mut raw) else { return };
+    let new_offset = offset + bytes_read as u64;
+    let text = String::from_utf8_lossy(&raw);
+    {
+        let mut guard = store.lock().unwrap();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let ev: RawAntfarmEvent = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let (Some(sid), Some(hook)) = (&ev.session_id, &ev.hook_event_name) else { continue };
+            let status = match hook.as_str() {
+                "SessionStart" => "running",
+                "Stop" => "idle",
+                "SessionEnd" => "done",
+                "Notification" => match ev.notification_type.as_deref() {
+                    Some("permission_prompt") => "needs_permission",
+                    _ => "waiting",
+                },
+                _ => continue,
+            };
+            let project_slug = ev.cwd.as_deref()
+                .and_then(|c| match_cwd_to_slug_ci(c, registry));
+            let attention = matches!(status, "needs_permission" | "waiting");
+            guard.sessions.insert(sid.clone(), EventDerivedStatus {
+                status: status.to_string(),
+                project_slug,
+                attention,
+            });
+        }
+    }
+    save_offset(new_offset);
+}
+
+fn spawn_events_watcher(app: tauri::AppHandle, store: Arc<Mutex<EventsStateInner>>) {
+    let offset = load_offset();
+    eprintln!("antfarm events: starting, resuming from offset={}", offset);
+    {
+        let registry = load_registry();
+        process_events_file(&store, &registry);
+    }
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(
+            move |res| { let _ = tx.send(res); },
+            NotifyConfig::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => { eprintln!("antfarm events: watcher init failed: {e}"); return; }
+        };
+        let watch_dir = home_dir().join(".antfarm");
+        if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+            eprintln!("antfarm events: watch failed: {e}");
+            return;
+        }
+        eprintln!("antfarm events: watching {:?}", watch_dir);
+        let target = events_file_path();
+        for result in &rx {
+            match result {
+                Ok(event) if event.paths.iter().any(|p| p == &target) => {
+                    let reg = load_registry();
+                    process_events_file(&store, &reg);
+                    let _ = app.emit("antfarm-events-updated", ());
+                }
+                Err(e) => eprintln!("antfarm events: watch error: {e}"),
+                _ => {}
+            }
+        }
+    });
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -803,8 +955,9 @@ struct SessionMeta {
     started_at: Option<u64>,    // unix secs
     last_activity: u64,         // unix secs
     token_totals: Option<TokenTotals>,
-    status: String,             // "running" | "waiting" | "idle" | "done"
+    status: String,             // "running" | "idle" | "needs_permission" | "waiting" | "done"
     project_slug: Option<String>,
+    attention: bool,            // true when status is needs_permission or waiting
 }
 
 fn now_unix() -> u64 {
@@ -976,6 +1129,7 @@ fn scan_claude_code_sessions(
                 token_totals,
                 status: session_status(last_activity, has_live).to_string(),
                 project_slug,
+                attention: false,
             });
         }
     }
@@ -1086,6 +1240,7 @@ fn scan_cowork_sessions(registry: &Registry, has_live: bool, cache: &UsageCache)
                     token_totals,
                     status: session_status(effective_la, has_live).to_string(),
                     project_slug,
+                    attention: false,
                 });
             }
         }
@@ -1094,7 +1249,7 @@ fn scan_cowork_sessions(registry: &Registry, has_live: bool, cache: &UsageCache)
 }
 
 #[tauri::command]
-fn list_sessions() -> Vec<SessionMeta> {
+fn list_sessions(state: tauri::State<'_, EventsState>) -> Vec<SessionMeta> {
     let registry = load_registry();
     let has_live = count_live_claude() > 0;
     let cache: UsageCache = fs::read_to_string(app_data_dir().join("usage_cache.json"))
@@ -1105,7 +1260,27 @@ fn list_sessions() -> Vec<SessionMeta> {
     sessions.extend(scan_claude_code_sessions(&registry, has_live, &cache));
     sessions.extend(scan_cowork_sessions(&registry, has_live, &cache));
     sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    // Merge event-derived statuses — overrides ps/mtime heuristic
+    let event_map = state.0.lock().unwrap();
+    for session in &mut sessions {
+        if let Some(ev) = event_map.sessions.get(&session.id) {
+            session.status = ev.status.clone();
+            session.attention = ev.attention;
+            if session.project_slug.is_none() {
+                session.project_slug = ev.project_slug.clone();
+            }
+        }
+    }
     sessions
+}
+
+#[tauri::command]
+fn needs_you_count(state: tauri::State<'_, EventsState>) -> usize {
+    state.0.lock().unwrap()
+        .sessions
+        .values()
+        .filter(|s| s.attention)
+        .count()
 }
 
 #[tauri::command]
@@ -1575,7 +1750,17 @@ fn git_metrics_rollup() -> GitMetricsRollup {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    let events_inner = Arc::new(Mutex::new(EventsStateInner {
+        sessions: HashMap::new(),
+    }));
+    let events_state = EventsState(Arc::clone(&events_inner));
+
     tauri::Builder::default()
+        .manage(events_state)
+        .setup(move |app| {
+            spawn_events_watcher(app.handle().clone(), Arc::clone(&events_inner));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_projects,
             get_project_detail,
@@ -1585,6 +1770,7 @@ fn main() {
             usage_rollup,
             list_sessions,
             active_session_count,
+            needs_you_count,
             git_metrics_rollup,
             working_tree_rollup,
         ])

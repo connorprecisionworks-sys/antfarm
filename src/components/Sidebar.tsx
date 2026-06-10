@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Home,
   Layers,
@@ -20,16 +21,28 @@ const NAV = [
 
 export function Sidebar() {
   const [liveCount, setLiveCount] = useState(0);
+  const [needsYou, setNeedsYou] = useState(0);
 
   useEffect(() => {
-    function refresh() {
+    function refreshLive() {
       invoke<number>("active_session_count")
         .then((n) => setLiveCount(n))
         .catch(() => setLiveCount(0));
     }
-    refresh();
-    const id = setInterval(refresh, 30_000);
-    return () => clearInterval(id);
+    function refreshNeeds() {
+      invoke<number>("needs_you_count")
+        .then((n) => setNeedsYou(n))
+        .catch(() => setNeedsYou(0));
+    }
+    refreshLive();
+    refreshNeeds();
+    const interval = setInterval(refreshLive, 30_000);
+    let unlisten: (() => void) | undefined;
+    listen("antfarm-events-updated", refreshNeeds).then((fn) => { unlisten = fn; });
+    return () => {
+      clearInterval(interval);
+      unlisten?.();
+    };
   }, []);
 
   return (
@@ -58,11 +71,15 @@ export function Sidebar() {
           >
             <Icon size={16} strokeWidth={1.75} className="shrink-0" />
             <span className="flex-1">{label}</span>
-            {label === "Sessions" && liveCount > 0 && (
+            {label === "Sessions" && (needsYou > 0 ? (
+              <span className="text-xs bg-amber-900/60 text-amber-400 font-medium px-1.5 py-0.5 rounded-full leading-none tabular-nums">
+                {needsYou}
+              </span>
+            ) : liveCount > 0 ? (
               <span className="text-xs bg-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded-full leading-none tabular-nums">
                 {liveCount}
               </span>
-            )}
+            ) : null)}
           </NavLink>
         ))}
       </nav>

@@ -81,8 +81,9 @@ export interface SessionMeta {
   started_at: number | null;
   last_activity: number;
   token_totals: TokenTotals | null;
-  status: "running" | "waiting" | "idle" | "done";
+  status: "running" | "idle" | "needs_permission" | "waiting" | "done";
   project_slug: string | null;
+  attention: boolean;
 }
 
 export interface GitPeriodMetrics {

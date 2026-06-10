@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { SessionMeta } from "../types";
 import { SessionRow } from "../components/SessionRow";
 
@@ -13,13 +14,24 @@ export function Sessions() {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  function fetchSessions() {
     invoke<SessionMeta[]>("list_sessions")
       .then((s) => {
         setSessions(s);
         setLoading(false);
       })
       .catch(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    fetchSessions();
+    let unlisten: (() => void) | undefined;
+    listen("antfarm-events-updated", () => {
+      invoke<SessionMeta[]>("list_sessions")
+        .then(setSessions)
+        .catch(() => {});
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
   }, []);
 
   if (loading) {
@@ -46,15 +58,19 @@ export function Sessions() {
     return bMax - aMax;
   });
 
-  const activeCount = sessions.filter(
-    (s) => s.status === "running" || s.status === "waiting"
-  ).length;
+  const needsYouCount = sessions.filter((s) => s.attention).length;
+  const activeCount = sessions.filter((s) => s.status === "running").length;
 
   return (
     <div className="flex flex-col h-full">
       <div className="px-6 pt-6 pb-4 border-b border-zinc-800 shrink-0">
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold text-zinc-100">Sessions</h1>
+          {needsYouCount > 0 && (
+            <span className="text-xs bg-amber-900/50 text-amber-400 font-medium px-2 py-0.5 rounded-full">
+              {needsYouCount} need you
+            </span>
+          )}
           {activeCount > 0 && (
             <span className="text-xs bg-emerald-900/50 text-emerald-400 px-2 py-0.5 rounded-full">
               {activeCount} active
