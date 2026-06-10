@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronLeft, FileText } from "lucide-react";
-import { ProjectDetail as PD, SessionMeta, GitMetricsRollup, ProjectGitMetrics } from "../types";
+import { ProjectDetail as PD, SessionMeta, GitMetricsRollup, ProjectGitMetrics, WorkingTreeRollup, ProjectWorkingTree } from "../types";
 import { relativeTime, fmtNet } from "../lib/relativeTime";
 import { MarkdownView } from "../components/MarkdownView";
 import { SessionRow } from "../components/SessionRow";
@@ -19,6 +19,7 @@ export function ProjectDetail() {
   const [selectedNote, setSelectedNote] = useState<string | null>(null);
   const [projSessions, setProjSessions] = useState<SessionMeta[] | null>(null);
   const [gitMetrics, setGitMetrics] = useState<ProjectGitMetrics | null | undefined>(undefined);
+  const [workingTree, setWorkingTree] = useState<ProjectWorkingTree | null | undefined>(undefined);
 
   useEffect(() => {
     if (!slug) return;
@@ -30,12 +31,19 @@ export function ProjectDetail() {
     setSelectedNote(null);
     setProjSessions(null);
     setGitMetrics(undefined);
+    setWorkingTree(undefined);
     invoke<GitMetricsRollup>("git_metrics_rollup")
       .then((data) => {
         const found = data.by_project.find((m) => m.slug === slug) ?? null;
         setGitMetrics(found);
       })
       .catch(() => setGitMetrics(null));
+    invoke<WorkingTreeRollup>("working_tree_rollup")
+      .then((data) => {
+        const found = data.by_project.find((m) => m.slug === slug) ?? null;
+        setWorkingTree(found);
+      })
+      .catch(() => setWorkingTree(null));
     invoke<PD | null>("get_project_detail", { slug })
       .then((d) => {
         if (!d) setNotFound(true);
@@ -151,11 +159,14 @@ export function ProjectDetail() {
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto p-6">
         {tab === "overview" && (
-          detail.readme ? (
-            <MarkdownView content={detail.readme} className="max-w-2xl" />
-          ) : (
-            <EmptyState message="No README found for this project." />
-          )
+          <div className="max-w-2xl space-y-6">
+            <WorkingTreeSection tree={workingTree} />
+            {detail.readme ? (
+              <MarkdownView content={detail.readme} />
+            ) : (
+              <EmptyState message="No README found for this project." />
+            )}
+          </div>
         )}
 
         {tab === "ideas" && (
@@ -233,6 +244,44 @@ export function ProjectDetail() {
 
 function EmptyState({ message }: { message: string }) {
   return <p className="text-sm text-zinc-600">{message}</p>;
+}
+
+const STATE_COLOR: Record<string, string> = {
+  modified: "text-amber-400",
+  staged: "text-sky-400",
+  added: "text-emerald-400",
+  deleted: "text-rose-400",
+  renamed: "text-purple-400",
+  untracked: "text-zinc-500",
+  changed: "text-amber-400",
+};
+
+function WorkingTreeSection({ tree }: { tree: ProjectWorkingTree | null | undefined }) {
+  if (tree === undefined) return null; // still loading
+  if (tree === null || tree.no_data) return null; // no repos / error — show nothing
+
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4">
+      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-3">
+        Working tree
+      </p>
+      {tree.dirty_count === 0 ? (
+        <p className="text-xs text-zinc-600">all committed</p>
+      ) : (
+        <div className="space-y-1.5">
+          {tree.files.map((f, i) => (
+            <div key={i} className="flex items-center gap-3 text-xs">
+              <span className={`w-16 shrink-0 font-medium ${STATE_COLOR[f.state] ?? "text-amber-400"}`}>
+                {f.state}
+              </span>
+              <span className="font-mono text-zinc-300 flex-1 min-w-0 truncate">{f.path}</span>
+              <span className="text-zinc-600 shrink-0">{relativeTime(f.mtime)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function GitSummaryLine({ metrics }: { metrics: ProjectGitMetrics | null | undefined }) {

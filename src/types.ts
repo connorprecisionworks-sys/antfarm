@@ -112,3 +112,20 @@ export interface GitMetricsRollup {
   week_total: GitPeriodMetrics;
   resolutions: RepoResolution[];
 }
+
+export interface DirtyFile {
+  path: string;
+  state: string;
+  mtime: number | null;
+}
+
+export interface ProjectWorkingTree {
+  slug: string;
+  dirty_count: number;
+  files: DirtyFile[];
+  no_data: boolean;
+}
+
+export interface WorkingTreeRollup {
+  by_project: ProjectWorkingTree[];
+}

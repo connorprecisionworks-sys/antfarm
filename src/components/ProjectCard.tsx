@@ -7,6 +7,7 @@ import { relativeTime, fmtNet } from "../lib/relativeTime";
 interface Props {
   project: Project;
   gitMetrics?: ProjectGitMetrics;
+  dirtyCount?: number;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -23,7 +24,7 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-export function ProjectCard({ project, gitMetrics }: Props) {
+export function ProjectCard({ project, gitMetrics, dirtyCount }: Props) {
   const hasGitWeek = gitMetrics && !gitMetrics.no_data && gitMetrics.week.commits > 0;
   return (
     <Link
@@ -32,7 +33,14 @@ export function ProjectCard({ project, gitMetrics }: Props) {
     >
       <div className="flex items-start justify-between gap-2">
         <h2 className="text-sm font-semibold text-zinc-100 leading-snug">{project.name}</h2>
-        {project.status && <StatusBadge status={project.status} />}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {dirtyCount && dirtyCount > 0 ? (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/70 text-amber-400 font-medium border border-amber-800/40">
+              {dirtyCount} uncommitted
+            </span>
+          ) : null}
+          {project.status && <StatusBadge status={project.status} />}
+        </div>
       </div>
 
       <div className="flex flex-wrap gap-2 mt-auto">

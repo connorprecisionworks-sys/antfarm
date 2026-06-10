@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { UsageRollup, Settings, GitMetricsRollup } from "../types";
+import { UsageRollup, Settings, GitMetricsRollup, WorkingTreeRollup } from "../types";
 import { StatCard } from "../components/StatCard";
 import { TokenChart } from "../components/TokenChart";
 import { ProjectBreakdown } from "../components/ProjectBreakdown";
@@ -10,6 +10,7 @@ export function Home() {
   const [rollup, setRollup] = useState<UsageRollup | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [gitMetrics, setGitMetrics] = useState<GitMetricsRollup | null>(null);
+  const [wtData, setWtData] = useState<WorkingTreeRollup | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -21,9 +22,11 @@ export function Home() {
       setSettings(s);
       setLoading(false);
     }).catch(() => setLoading(false));
-    // Load git metrics independently so a slow git scan doesn't block the page
     invoke<GitMetricsRollup>("git_metrics_rollup")
       .then(setGitMetrics)
+      .catch(() => {});
+    invoke<WorkingTreeRollup>("working_tree_rollup")
+      .then(setWtData)
       .catch(() => {});
   }, []);
 
@@ -128,7 +131,19 @@ export function Home() {
           <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-4">
             By project (all time)
           </p>
-          <ProjectBreakdown projects={by_project} compact />
+          <ProjectBreakdown
+            projects={by_project}
+            compact
+            dirtyBySlug={
+              wtData
+                ? Object.fromEntries(
+                    wtData.by_project
+                      .filter((p) => !p.no_data && p.dirty_count > 0)
+                      .map((p) => [p.slug, p.dirty_count])
+                  )
+                : undefined
+            }
+          />
         </div>
       )}
     </div>

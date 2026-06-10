@@ -1113,6 +1113,121 @@ fn active_session_count() -> usize {
     count_live_claude()
 }
 
+// ── Working tree ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct DirtyFile {
+    path: String,
+    state: String,
+    mtime: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+struct ProjectWorkingTree {
+    slug: String,
+    dirty_count: u32,
+    files: Vec<DirtyFile>,
+    no_data: bool,
+}
+
+#[derive(Serialize)]
+struct WorkingTreeRollup {
+    by_project: Vec<ProjectWorkingTree>,
+}
+
+fn xy_to_state(x: char, y: char) -> &'static str {
+    if x == '?' { return "untracked"; }
+    match x {
+        'A' => return "added",
+        'D' => return "deleted",
+        'R' | 'C' => return "renamed",
+        'M' | 'T' => return "staged",
+        _ => {}
+    }
+    match y {
+        'M' | 'T' => "modified",
+        'D' => "deleted",
+        'A' => "added",
+        _ => "changed",
+    }
+}
+
+fn parse_porcelain_line(line: &str, repo_root: &Path) -> Option<DirtyFile> {
+    if line.len() < 4 { return None; }
+    let mut chars = line.chars();
+    let x = chars.next()?;
+    let y = chars.next()?;
+    if x == '!' { return None; } // skip ignored entries
+    if line.as_bytes().get(2) != Some(&b' ') { return None; }
+    let raw = &line[3..];
+    // Rename format: "orig -> new" — use the destination path
+    let file_path = if let Some(idx) = raw.find(" -> ") {
+        &raw[idx + 4..]
+    } else {
+        raw
+    };
+    let state = xy_to_state(x, y);
+    let abs_path = repo_root.join(file_path);
+    let mtime = mtime_secs(&abs_path);
+    Some(DirtyFile {
+        path: file_path.to_string(),
+        state: state.to_string(),
+        mtime,
+    })
+}
+
+#[tauri::command]
+fn working_tree_rollup() -> WorkingTreeRollup {
+    let registry = load_registry();
+    let session_paths = discover_session_repo_paths();
+    let mut by_project: Vec<ProjectWorkingTree> = vec![];
+
+    for (slug, proj) in &registry.projects {
+        let mut all_files: Vec<DirtyFile> = vec![];
+        let mut any_data = false;
+
+        for repo_basename in &proj.repos {
+            let Some(repo_path) = resolve_repo_path(repo_basename, &session_paths) else {
+                continue;
+            };
+            any_data = true;
+
+            let output = match std::process::Command::new("git")
+                .args(["-C", repo_path.to_str().unwrap_or(""), "status", "--porcelain"])
+                .output()
+            {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Some(f) = parse_porcelain_line(line, &repo_path) {
+                    all_files.push(f);
+                }
+            }
+        }
+
+        // Sort oldest-first (lowest mtime first = sat longest); None mtime goes last
+        all_files.sort_by(|a, b| match (a.mtime, b.mtime) {
+            (Some(ta), Some(tb)) => ta.cmp(&tb),
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        let dirty_count = all_files.len() as u32;
+        by_project.push(ProjectWorkingTree {
+            slug: slug.clone(),
+            dirty_count,
+            files: all_files,
+            no_data: !any_data,
+        });
+    }
+
+    WorkingTreeRollup { by_project }
+}
+
 // ── Git metrics ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -1471,6 +1586,7 @@ fn main() {
             list_sessions,
             active_session_count,
             git_metrics_rollup,
+            working_tree_rollup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

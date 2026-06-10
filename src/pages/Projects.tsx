@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Project, GitMetricsRollup, ProjectGitMetrics } from "../types";
+import { Project, GitMetricsRollup, ProjectGitMetrics, WorkingTreeRollup } from "../types";
 import { ProjectCard } from "../components/ProjectCard";
 
 export function Projects() {
@@ -8,6 +8,7 @@ export function Projects() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
   const [gitData, setGitData] = useState<GitMetricsRollup | null>(null);
+  const [wtData, setWtData] = useState<WorkingTreeRollup | null>(null);
 
   useEffect(() => {
     invoke<Project[]>("list_projects")
@@ -22,12 +23,24 @@ export function Projects() {
     invoke<GitMetricsRollup>("git_metrics_rollup")
       .then(setGitData)
       .catch(() => {});
+    invoke<WorkingTreeRollup>("working_tree_rollup")
+      .then(setWtData)
+      .catch(() => {});
   }, []);
 
   const gitBySlug = useMemo<Record<string, ProjectGitMetrics>>(() => {
     if (!gitData) return {};
     return Object.fromEntries(gitData.by_project.map((m) => [m.slug, m]));
   }, [gitData]);
+
+  const dirtyBySlug = useMemo<Record<string, number>>(() => {
+    if (!wtData) return {};
+    return Object.fromEntries(
+      wtData.by_project
+        .filter((p) => !p.no_data && p.dirty_count > 0)
+        .map((p) => [p.slug, p.dirty_count])
+    );
+  }, [wtData]);
 
   return (
     <div className="p-6">
@@ -61,7 +74,12 @@ export function Projects() {
           style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}
         >
           {projects.map((p) => (
-            <ProjectCard key={p.slug} project={p} gitMetrics={gitBySlug[p.slug]} />
+            <ProjectCard
+              key={p.slug}
+              project={p}
+              gitMetrics={gitBySlug[p.slug]}
+              dirtyCount={dirtyBySlug[p.slug]}
+            />
           ))}
         </div>
       )}
