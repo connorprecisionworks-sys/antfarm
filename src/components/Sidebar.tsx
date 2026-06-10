@@ -5,6 +5,7 @@ import {
   Activity,
   BarChart2,
   Settings,
+  Hexagon,
 } from "lucide-react";
 
 const NAV = [
@@ -20,7 +21,7 @@ export function Sidebar() {
     <aside className="flex flex-col w-[220px] shrink-0 h-full bg-surface-1 border-r border-zinc-800/80">
       {/* Wordmark */}
       <div className="flex items-center gap-2.5 px-4 h-14 border-b border-zinc-800/60 shrink-0">
-        <span className="text-xl leading-none select-none">🐜</span>
+        <Hexagon size={18} strokeWidth={1.5} className="text-zinc-400 shrink-0" />
         <span className="text-sm font-semibold text-zinc-100 tracking-tight">Ant Farm</span>
       </div>
 

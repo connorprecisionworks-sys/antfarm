@@ -1,4 +1,6 @@
+import { ReactNode } from "react";
 import { Link } from "react-router-dom";
+import { Lightbulb, Zap } from "lucide-react";
 import { Project } from "../types";
 import { relativeTime } from "../lib/relativeTime";
 
@@ -7,7 +9,6 @@ interface Props {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  // Truncate long status strings for the card badge
   const display = status.length > 40 ? status.slice(0, 40) + "…" : status;
   const lower = status.toLowerCase();
   let dot = "bg-zinc-500";
@@ -35,13 +36,13 @@ export function ProjectCard({ project }: Props) {
       <div className="flex flex-wrap gap-2 mt-auto">
         {project.idea_count > 0 && (
           <Pill
-            icon="💡"
+            icon={<Lightbulb size={11} strokeWidth={1.75} />}
             label={`${project.idea_count} idea${project.idea_count !== 1 ? "s" : ""}`}
           />
         )}
         {project.decision_count > 0 && (
           <Pill
-            icon="⚡"
+            icon={<Zap size={11} strokeWidth={1.75} />}
             label={`${project.decision_count} decision${project.decision_count !== 1 ? "s" : ""}`}
           />
         )}
@@ -60,7 +61,7 @@ function Pill({
   label,
   mono,
 }: {
-  icon: string;
+  icon: ReactNode;
   label: string;
   mono?: boolean;
 }) {
@@ -68,7 +69,7 @@ function Pill({
     <span
       className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-800 text-xs text-zinc-400 ${mono ? "font-mono" : ""}`}
     >
-      <span>{icon}</span>
+      <span className="shrink-0 flex items-center">{icon}</span>
       {label}
     </span>
   );
