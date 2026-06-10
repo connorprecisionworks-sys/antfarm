@@ -444,9 +444,15 @@ fn parse_jsonl_file(path: &Path) -> HashMap<String, DayBucket> {
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let timestamp = match obj.get("timestamp").and_then(|t| t.as_str()) {
-            Some(t) if t.len() >= 10 => t,
-            _ => continue,
+        // Cowork audit.jsonl uses "_audit_timestamp"; CC uses "timestamp"
+        let timestamp = match obj
+            .get("timestamp")
+            .or_else(|| obj.get("_audit_timestamp"))
+            .and_then(|t| t.as_str())
+            .filter(|t| t.len() >= 10)
+        {
+            Some(t) => t,
+            None => continue,
         };
         let date = timestamp[..10].to_string();
         let est = est_dollars_for(model, input, output, cache_read, cache_write);
@@ -587,6 +593,101 @@ fn usage_rollup() -> UsageRollup {
                     let proj_map = by_project_day.entry(slug.clone()).or_default();
                     for (date, bucket) in &days_data {
                         proj_map.entry(date.clone()).or_default().add(bucket);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Cowork audit.jsonl files ──────────────────────────────────────────────
+    // Each session companion dir contains audit.jsonl with the same usage shape as CC.
+    let cowork_base = home_dir()
+        .join("Library/Application Support/Claude/local-agent-mode-sessions");
+    if let Ok(space_dirs) = fs::read_dir(&cowork_base) {
+        for space_entry in space_dirs.flatten() {
+            let space_dir = space_entry.path();
+            if !space_dir.is_dir() {
+                continue;
+            }
+            if let Ok(ws_dirs) = fs::read_dir(&space_dir) {
+                for ws_entry in ws_dirs.flatten() {
+                    let ws_dir = ws_entry.path();
+                    if !ws_dir.is_dir() {
+                        continue;
+                    }
+                    if let Ok(session_dirs) = fs::read_dir(&ws_dir) {
+                        for sd_entry in session_dirs.flatten() {
+                            let sd = sd_entry.path();
+                            let sd_name = sd
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("");
+                            if !sd.is_dir() || !sd_name.starts_with("local_") {
+                                continue;
+                            }
+                            let audit = sd.join("audit.jsonl");
+                            if !audit.is_file() {
+                                continue;
+                            }
+
+                            // Resolve project slug from sibling .json metadata
+                            let meta_path = ws_dir.join(format!("{}.json", sd_name));
+                            let slug = fs::read_to_string(&meta_path)
+                                .ok()
+                                .and_then(|c| {
+                                    serde_json::from_str::<serde_json::Value>(&c).ok()
+                                })
+                                .and_then(|v| {
+                                    v.get("userSelectedFolders")
+                                        .and_then(|f| f.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|s| s.as_str())
+                                        .and_then(|rp| Path::new(rp).file_name())
+                                        .and_then(|n| n.to_str())
+                                        .and_then(|bn| {
+                                            match_basename_to_slug(bn, &registry)
+                                        })
+                                })
+                                .unwrap_or_else(|| "unfiled".to_string());
+
+                            let fpath_str = audit.to_string_lossy().into_owned();
+                            let Ok(meta) = fs::metadata(&audit) else {
+                                continue;
+                            };
+                            let fmtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let fsize = meta.len();
+
+                            let cached = cache.files.get(&fpath_str);
+                            let days_data = if cached
+                                .map(|e| e.mtime == fmtime && e.size == fsize)
+                                .unwrap_or(false)
+                            {
+                                cached_files += 1;
+                                cached.unwrap().days.clone()
+                            } else {
+                                parsed_files += 1;
+                                let days = parse_jsonl_file(&audit);
+                                cache.files.insert(
+                                    fpath_str.clone(),
+                                    FileCacheEntry {
+                                        mtime: fmtime,
+                                        size: fsize,
+                                        days: days.clone(),
+                                    },
+                                );
+                                days
+                            };
+
+                            let proj_map = by_project_day.entry(slug).or_default();
+                            for (date, bucket) in &days_data {
+                                proj_map.entry(date.clone()).or_default().add(bucket);
+                            }
+                        }
                     }
                 }
             }
@@ -881,7 +982,7 @@ fn scan_claude_code_sessions(
     sessions
 }
 
-fn scan_cowork_sessions(registry: &Registry, has_live: bool) -> Vec<SessionMeta> {
+fn scan_cowork_sessions(registry: &Registry, has_live: bool, cache: &UsageCache) -> Vec<SessionMeta> {
     let cowork_root = home_dir()
         .join("Library/Application Support/Claude/local-agent-mode-sessions");
     let Ok(space_dirs) = fs::read_dir(&cowork_root) else {
@@ -955,6 +1056,26 @@ fn scan_cowork_sessions(registry: &Registry, has_live: bool) -> Vec<SessionMeta>
                     .and_then(|n| n.to_str())
                     .and_then(|bn| match_basename_to_slug(bn, registry));
 
+                // Token totals from audit.jsonl (populated into cache by usage_rollup)
+                let session_dir_name = &fname[..fname.len() - 5]; // strip ".json"
+                let audit_path = ws_dir.join(session_dir_name).join("audit.jsonl");
+                let token_totals = {
+                    let ap_str = audit_path.to_string_lossy().into_owned();
+                    cache.files.get(&ap_str).map(|entry| {
+                        let mut total = DayBucket::default();
+                        for b in entry.days.values() {
+                            total.add(b);
+                        }
+                        TokenTotals {
+                            input: total.input,
+                            output: total.output,
+                            cache_read: total.cache_read,
+                            cache_write: total.cache_write,
+                            est_dollars: total.est_dollars,
+                        }
+                    })
+                };
+
                 sessions.push(SessionMeta {
                     id,
                     provider: "cowork".to_string(),
@@ -962,7 +1083,7 @@ fn scan_cowork_sessions(registry: &Registry, has_live: bool) -> Vec<SessionMeta>
                     title,
                     started_at,
                     last_activity: effective_la,
-                    token_totals: None,
+                    token_totals,
                     status: session_status(effective_la, has_live).to_string(),
                     project_slug,
                 });
@@ -982,7 +1103,7 @@ fn list_sessions() -> Vec<SessionMeta> {
         .unwrap_or_default();
     let mut sessions = vec![];
     sessions.extend(scan_claude_code_sessions(&registry, has_live, &cache));
-    sessions.extend(scan_cowork_sessions(&registry, has_live));
+    sessions.extend(scan_cowork_sessions(&registry, has_live, &cache));
     sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
     sessions
 }
