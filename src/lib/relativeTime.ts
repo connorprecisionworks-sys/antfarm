@@ -13,3 +13,26 @@ export function relativeTime(epochSecs: number | null): string {
   if (diffMonths < 12) return `${diffMonths}mo ago`;
   return `${Math.floor(diffMonths / 12)}y ago`;
 }
+
+export function formatDate(iso: string): string {
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+export function formatDateShort(iso: string): string {
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("en-US", { weekday: "short" });
+}
+
+export function fmtTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
+  return String(n);
+}
+
+export function fmtDollars(n: number): string {
+  if (n < 0.01) return "<$0.01";
+  if (n < 10) return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(0)}`;
+}

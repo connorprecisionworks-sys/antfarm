@@ -7,3 +7,60 @@ export interface Project {
   decision_count: number;
   repos: string[];
 }
+
+export interface ProjectDetail {
+  slug: string;
+  name: string;
+  status: string | null;
+  last_activity: number | null;
+  repos: string[];
+  readme: string | null;
+  ideas: string | null;
+  notes_files: string[];
+}
+
+export interface DayUsage {
+  date: string;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  est_dollars: number;
+  total_tokens: number;
+}
+
+export interface ProjectUsage {
+  slug: string;
+  name: string;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  est_dollars: number;
+  total_tokens: number;
+}
+
+export interface WeekTotals {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  est_dollars: number;
+  total_tokens: number;
+  week_start: string;
+  today: string;
+  days_until_reset: number;
+}
+
+export interface UsageRollup {
+  days: DayUsage[];
+  week: WeekTotals;
+  by_project: ProjectUsage[];
+  cached_files: number;
+  parsed_files: number;
+}
+
+export interface Settings {
+  weekly_cap_tokens: number;
+  reset_weekday: number; // 0=Mon … 6=Sun
+}
