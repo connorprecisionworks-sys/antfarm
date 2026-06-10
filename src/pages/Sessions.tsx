@@ -58,7 +58,6 @@ export function Sessions() {
     return bMax - aMax;
   });
 
-  const needsYouCount = sessions.filter((s) => s.attention).length;
   const activeCount = sessions.filter((s) => s.status === "running").length;
 
   return (
@@ -66,11 +65,6 @@ export function Sessions() {
       <div className="px-6 pt-6 pb-4 border-b border-zinc-800 shrink-0">
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold text-zinc-100">Sessions</h1>
-          {needsYouCount > 0 && (
-            <span className="text-xs bg-amber-900/50 text-amber-400 font-medium px-2 py-0.5 rounded-full">
-              {needsYouCount} need you
-            </span>
-          )}
           {activeCount > 0 && (
             <span className="text-xs bg-emerald-900/50 text-emerald-400 px-2 py-0.5 rounded-full">
               {activeCount} active

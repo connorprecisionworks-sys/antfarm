@@ -120,13 +120,13 @@ fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry
                 "SessionEnd" => "done",
                 "Notification" => match ev.notification_type.as_deref() {
                     Some("permission_prompt") => "needs_permission",
-                    _ => "waiting",
+                    _ => "idle", // idle_prompt: muted, no alert
                 },
                 _ => continue,
             };
             let project_slug = ev.cwd.as_deref()
                 .and_then(|c| match_cwd_to_slug_ci(c, registry));
-            let attention = matches!(status, "needs_permission" | "waiting");
+            let attention = status == "needs_permission";
             guard.sessions.insert(sid.clone(), EventDerivedStatus {
                 status: status.to_string(),
                 project_slug,
@@ -1266,6 +1266,14 @@ fn list_sessions(state: tauri::State<'_, EventsState>) -> Vec<SessionMeta> {
         if let Some(ev) = event_map.sessions.get(&session.id) {
             session.status = ev.status.clone();
             session.attention = ev.attention;
+            // Gate: only flag attention if the session is still live by the heuristic.
+            // Clears stale permission prompts from dead or timed-out sessions.
+            if session.attention {
+                let age = now_unix().saturating_sub(session.last_activity);
+                if !has_live || age > 600 {
+                    session.attention = false;
+                }
+            }
             if session.project_slug.is_none() {
                 session.project_slug = ev.project_slug.clone();
             }
