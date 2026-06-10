@@ -1,12 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Project } from "../types";
+import { Project, GitMetricsRollup, ProjectGitMetrics } from "../types";
 import { ProjectCard } from "../components/ProjectCard";
 
 export function Projects() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
+  const [gitData, setGitData] = useState<GitMetricsRollup | null>(null);
 
   useEffect(() => {
     invoke<Project[]>("list_projects")
@@ -18,7 +19,15 @@ export function Projects() {
         setError(String(err));
         setLoading(false);
       });
+    invoke<GitMetricsRollup>("git_metrics_rollup")
+      .then(setGitData)
+      .catch(() => {});
   }, []);
+
+  const gitBySlug = useMemo<Record<string, ProjectGitMetrics>>(() => {
+    if (!gitData) return {};
+    return Object.fromEntries(gitData.by_project.map((m) => [m.slug, m]));
+  }, [gitData]);
 
   return (
     <div className="p-6">
@@ -52,7 +61,7 @@ export function Projects() {
           style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}
         >
           {projects.map((p) => (
-            <ProjectCard key={p.slug} project={p} />
+            <ProjectCard key={p.slug} project={p} gitMetrics={gitBySlug[p.slug]} />
           ))}
         </div>
       )}

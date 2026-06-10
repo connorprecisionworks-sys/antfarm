@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { UsageRollup, Settings } from "../types";
+import { UsageRollup, Settings, GitMetricsRollup } from "../types";
 import { StatCard } from "../components/StatCard";
 import { TokenChart } from "../components/TokenChart";
 import { ProjectBreakdown } from "../components/ProjectBreakdown";
-import { fmtTokens, fmtDollars, formatDate } from "../lib/relativeTime";
+import { fmtTokens, fmtDollars, fmtNet, formatDate } from "../lib/relativeTime";
 
 export function Home() {
   const [rollup, setRollup] = useState<UsageRollup | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [gitMetrics, setGitMetrics] = useState<GitMetricsRollup | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -20,6 +21,10 @@ export function Home() {
       setSettings(s);
       setLoading(false);
     }).catch(() => setLoading(false));
+    // Load git metrics independently so a slow git scan doesn't block the page
+    invoke<GitMetricsRollup>("git_metrics_rollup")
+      .then(setGitMetrics)
+      .catch(() => {});
   }, []);
 
   if (loading) {
@@ -92,6 +97,28 @@ export function Home() {
             value={resetLabel}
             sub="until next week"
           />
+          {gitMetrics && gitMetrics.week_total.commits > 0 && (
+            <>
+              <div className="border-t border-zinc-800 pt-1">
+                <p className="text-[10px] text-zinc-600 uppercase tracking-wider">Git this week</p>
+              </div>
+              <StatCard
+                label="Commits"
+                value={String(gitMetrics.week_total.commits)}
+                sub="this week"
+              />
+              <StatCard
+                label="Net lines"
+                value={fmtNet(gitMetrics.week_total.lines_added - gitMetrics.week_total.lines_removed)}
+                sub={`+${gitMetrics.week_total.lines_added.toLocaleString()} / −${gitMetrics.week_total.lines_removed.toLocaleString()}`}
+              />
+              <StatCard
+                label="Files touched"
+                value={gitMetrics.week_total.files_changed.toLocaleString()}
+                sub="this week"
+              />
+            </>
+          )}
         </div>
       </div>
 

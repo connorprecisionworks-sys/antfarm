@@ -84,3 +84,31 @@ export interface SessionMeta {
   status: "running" | "waiting" | "idle" | "done";
   project_slug: string | null;
 }
+
+export interface GitPeriodMetrics {
+  commits: number;
+  lines_added: number;
+  lines_removed: number;
+  files_changed: number;
+}
+
+export interface ProjectGitMetrics {
+  slug: string;
+  week: GitPeriodMetrics;
+  all_time: GitPeriodMetrics;
+  last_commit_ts: number | null;
+  last_commit_subject: string | null;
+  no_data: boolean;
+}
+
+export interface RepoResolution {
+  basename: string;
+  path: string | null;
+  status: string;
+}
+
+export interface GitMetricsRollup {
+  by_project: ProjectGitMetrics[];
+  week_total: GitPeriodMetrics;
+  resolutions: RepoResolution[];
+}

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chrono::{Datelike, Local, Weekday};
+use chrono::{Datelike, Local, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -1113,6 +1113,350 @@ fn active_session_count() -> usize {
     count_live_claude()
 }
 
+// ── Git metrics ───────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct GitPeriodMetrics {
+    commits: u32,
+    lines_added: i64,
+    lines_removed: i64,
+    files_changed: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GitRepoCacheEntry {
+    head_sha: String,
+    week_start: String,
+    week: GitPeriodMetrics,
+    all_time: GitPeriodMetrics,
+    last_commit_ts: Option<u64>,
+    last_commit_subject: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct GitMetricsCache {
+    repos: HashMap<String, GitRepoCacheEntry>,
+}
+
+#[derive(Serialize, Clone)]
+struct RepoResolution {
+    basename: String,
+    path: Option<String>,
+    status: String,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct ProjectGitMetrics {
+    slug: String,
+    week: GitPeriodMetrics,
+    all_time: GitPeriodMetrics,
+    last_commit_ts: Option<u64>,
+    last_commit_subject: Option<String>,
+    no_data: bool,
+}
+
+#[derive(Serialize)]
+struct GitMetricsRollup {
+    by_project: Vec<ProjectGitMetrics>,
+    week_total: GitPeriodMetrics,
+    resolutions: Vec<RepoResolution>,
+}
+
+fn git_head_sha(repo_path: &Path) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["-C", repo_path.to_str().unwrap_or(""), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn compute_git_metrics_for_repo(
+    repo_path: &Path,
+    week_start_epoch: i64,
+) -> (GitPeriodMetrics, GitPeriodMetrics, Option<u64>, Option<String>) {
+    let output = match std::process::Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().unwrap_or(""),
+            "log",
+            "--numstat",
+            "--format=COMMIT %H %ct %s",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return (Default::default(), Default::default(), None, None),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut week = GitPeriodMetrics::default();
+    let mut all_time = GitPeriodMetrics::default();
+    let mut last_ts: Option<u64> = None;
+    let mut last_subject: Option<String> = None;
+    let mut current_ts: Option<i64> = None;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("COMMIT ") {
+            // rest = "<40-char sha> <unix-ts> <subject>"
+            if rest.len() > 41 {
+                let after_hash = &rest[41..]; // skip sha (40 chars) + space
+                let mut sp = after_hash.splitn(2, ' ');
+                if let Some(ts_str) = sp.next() {
+                    if let Ok(ts) = ts_str.trim().parse::<i64>() {
+                        current_ts = Some(ts);
+                        all_time.commits += 1;
+                        if ts >= week_start_epoch {
+                            week.commits += 1;
+                        }
+                        if last_ts.is_none() {
+                            last_ts = Some(ts as u64);
+                            last_subject = sp.next().map(|s| s.trim().to_string());
+                        }
+                    }
+                }
+            }
+        } else if !line.is_empty() {
+            // numstat line: "added\tremoved\tpath" (binary files show "-")
+            let mut tabs = line.splitn(3, '\t');
+            if let (Some(a_str), Some(r_str), Some(_)) =
+                (tabs.next(), tabs.next(), tabs.next())
+            {
+                let added = a_str.parse::<i64>().unwrap_or(0);
+                let removed = r_str.parse::<i64>().unwrap_or(0);
+                if let Some(ts) = current_ts {
+                    all_time.lines_added += added;
+                    all_time.lines_removed += removed;
+                    all_time.files_changed += 1;
+                    if ts >= week_start_epoch {
+                        week.lines_added += added;
+                        week.lines_removed += removed;
+                        week.files_changed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    (week, all_time, last_ts, last_subject)
+}
+
+fn add_git_metrics(a: &mut GitPeriodMetrics, b: &GitPeriodMetrics) {
+    a.commits += b.commits;
+    a.lines_added += b.lines_added;
+    a.lines_removed += b.lines_removed;
+    a.files_changed += b.files_changed;
+}
+
+fn discover_session_repo_paths() -> HashMap<String, PathBuf> {
+    let mut map: HashMap<String, PathBuf> = HashMap::new();
+    let projects_dir = home_dir().join(".claude/projects");
+    let Ok(dirs) = fs::read_dir(&projects_dir) else {
+        return map;
+    };
+    for dir_entry in dirs.flatten() {
+        let dir = dir_entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&dir) else {
+            continue;
+        };
+        // Read just the first JSONL in each project dir to get a CWD
+        for fe in files.flatten() {
+            let fpath = fe.path();
+            if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let (_, cwd_opt, _) = cc_session_cheap_parse(&fpath);
+            if let Some(cwd) = cwd_opt {
+                let p = PathBuf::from(&cwd);
+                if let Some(basename) = p.file_name().and_then(|n| n.to_str()) {
+                    map.entry(basename.to_string()).or_insert(p);
+                }
+            }
+            break;
+        }
+    }
+    map
+}
+
+fn resolve_repo_path(basename: &str, session_paths: &HashMap<String, PathBuf>) -> Option<PathBuf> {
+    // Try exact basename and dash-stripped variant (e.g. "ant-farm" → "antfarm")
+    let nodash = basename.replace('-', "");
+    let mut variants = vec![basename.to_string()];
+    if nodash != basename {
+        variants.push(nodash);
+    }
+
+    // 1. Session-discovered CWDs
+    for v in &variants {
+        if let Some(p) = session_paths.get(v.as_str()) {
+            if p.join(".git").exists() {
+                return Some(p.clone());
+            }
+        }
+    }
+    // 2. ~/Desktop/<variant>
+    for v in &variants {
+        let p = home_dir().join("Desktop").join(v.as_str());
+        if p.join(".git").exists() {
+            return Some(p);
+        }
+    }
+    // 3. ~/<variant>
+    for v in &variants {
+        let p = home_dir().join(v.as_str());
+        if p.join(".git").exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn git_metrics_rollup() -> GitMetricsRollup {
+    let registry = load_registry();
+    let settings = get_settings();
+
+    // Compute week start
+    let today = Local::now();
+    let today_dow = weekday_to_dow(today.weekday());
+    let reset_dow = settings.reset_weekday.min(6);
+    let days_since_reset = ((today_dow + 7 - reset_dow) % 7) as i64;
+    let week_start_local = today - chrono::Duration::days(days_since_reset);
+    let week_start_date = week_start_local.format("%Y-%m-%d").to_string();
+    // Epoch at local midnight of the week-start day
+    let secs_in_day = week_start_local.time().num_seconds_from_midnight() as i64;
+    let week_start_epoch = week_start_local.timestamp() - secs_in_day;
+
+    // Load git metrics cache
+    let data_dir = app_data_dir();
+    let _ = fs::create_dir_all(&data_dir);
+    let git_cache_path = data_dir.join("git_metrics_cache.json");
+    let mut git_cache: GitMetricsCache = fs::read_to_string(&git_cache_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+
+    let session_paths = discover_session_repo_paths();
+
+    let mut by_project: Vec<ProjectGitMetrics> = vec![];
+    let mut week_total = GitPeriodMetrics::default();
+    let mut resolutions: Vec<RepoResolution> = vec![];
+
+    for (slug, proj) in &registry.projects {
+        let mut proj_week = GitPeriodMetrics::default();
+        let mut proj_all_time = GitPeriodMetrics::default();
+        let mut proj_last_ts: Option<u64> = None;
+        let mut proj_last_subject: Option<String> = None;
+        let mut any_data = false;
+
+        for repo_basename in &proj.repos {
+            let resolved = resolve_repo_path(repo_basename, &session_paths);
+
+            resolutions.push(RepoResolution {
+                basename: repo_basename.clone(),
+                path: resolved.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                status: if resolved.is_some() {
+                    "resolved".to_string()
+                } else {
+                    "not-found".to_string()
+                },
+            });
+
+            let Some(repo_path) = resolved else {
+                continue;
+            };
+
+            let Some(head_sha) = git_head_sha(&repo_path) else {
+                continue;
+            };
+
+            let path_key = repo_path.to_string_lossy().into_owned();
+
+            let (week_m, all_time_m, last_ts, last_subject) = {
+                let cached = git_cache.repos.get(&path_key);
+                if let Some(entry) = cached {
+                    if entry.head_sha == head_sha && entry.week_start == week_start_date {
+                        eprintln!("git cache hit: {}", path_key);
+                        (
+                            entry.week.clone(),
+                            entry.all_time.clone(),
+                            entry.last_commit_ts,
+                            entry.last_commit_subject.clone(),
+                        )
+                    } else {
+                        let (w, a, ts, subj) =
+                            compute_git_metrics_for_repo(&repo_path, week_start_epoch);
+                        git_cache.repos.insert(
+                            path_key.clone(),
+                            GitRepoCacheEntry {
+                                head_sha,
+                                week_start: week_start_date.clone(),
+                                week: w.clone(),
+                                all_time: a.clone(),
+                                last_commit_ts: ts,
+                                last_commit_subject: subj.clone(),
+                            },
+                        );
+                        (w, a, ts, subj)
+                    }
+                } else {
+                    let (w, a, ts, subj) =
+                        compute_git_metrics_for_repo(&repo_path, week_start_epoch);
+                    git_cache.repos.insert(
+                        path_key.clone(),
+                        GitRepoCacheEntry {
+                            head_sha,
+                            week_start: week_start_date.clone(),
+                            week: w.clone(),
+                            all_time: a.clone(),
+                            last_commit_ts: ts,
+                            last_commit_subject: subj.clone(),
+                        },
+                    );
+                    (w, a, ts, subj)
+                }
+            };
+
+            any_data = true;
+            add_git_metrics(&mut proj_week, &week_m);
+            add_git_metrics(&mut proj_all_time, &all_time_m);
+            if let Some(ts) = last_ts {
+                if proj_last_ts.map(|ex| ts > ex).unwrap_or(true) {
+                    proj_last_ts = Some(ts);
+                    proj_last_subject = last_subject;
+                }
+            }
+        }
+
+        add_git_metrics(&mut week_total, &proj_week);
+
+        by_project.push(ProjectGitMetrics {
+            slug: slug.clone(),
+            week: proj_week,
+            all_time: proj_all_time,
+            last_commit_ts: proj_last_ts,
+            last_commit_subject: proj_last_subject,
+            no_data: !any_data,
+        });
+    }
+
+    if let Ok(json) = serde_json::to_string(&git_cache) {
+        let _ = fs::write(&git_cache_path, json);
+    }
+
+    by_project.sort_by(|a, b| b.week.commits.cmp(&a.week.commits));
+
+    GitMetricsRollup {
+        by_project,
+        week_total,
+        resolutions,
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1126,6 +1470,7 @@ fn main() {
             usage_rollup,
             list_sessions,
             active_session_count,
+            git_metrics_rollup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

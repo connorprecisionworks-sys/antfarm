@@ -36,3 +36,10 @@ export function fmtDollars(n: number): string {
   if (n < 10) return `$${n.toFixed(2)}`;
   return `$${n.toFixed(0)}`;
 }
+
+export function fmtNet(n: number): string {
+  if (n === 0) return "0";
+  const abs = Math.abs(n);
+  const formatted = abs >= 1000 ? `${(abs / 1000).toFixed(0)}K` : String(abs);
+  return n > 0 ? `+${formatted}` : `-${formatted}`;
+}

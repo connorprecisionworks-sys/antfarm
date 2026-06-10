@@ -1,11 +1,12 @@
 import { ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { Lightbulb, Zap, GitBranch } from "lucide-react";
-import { Project } from "../types";
-import { relativeTime } from "../lib/relativeTime";
+import { Lightbulb, Zap, GitBranch, GitCommitHorizontal } from "lucide-react";
+import { Project, ProjectGitMetrics } from "../types";
+import { relativeTime, fmtNet } from "../lib/relativeTime";
 
 interface Props {
   project: Project;
+  gitMetrics?: ProjectGitMetrics;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -22,7 +23,8 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-export function ProjectCard({ project }: Props) {
+export function ProjectCard({ project, gitMetrics }: Props) {
+  const hasGitWeek = gitMetrics && !gitMetrics.no_data && gitMetrics.week.commits > 0;
   return (
     <Link
       to={`/projects/${project.slug}`}
@@ -49,6 +51,18 @@ export function ProjectCard({ project }: Props) {
         {project.repos.map((repo) => (
           <Pill key={repo} icon={<GitBranch size={11} strokeWidth={1.75} />} label={repo} mono />
         ))}
+        {hasGitWeek && gitMetrics && (
+          <>
+            <Pill
+              icon={<GitCommitHorizontal size={11} strokeWidth={1.75} />}
+              label={`${gitMetrics.week.commits}c`}
+            />
+            <Pill
+              icon={<span className="text-[10px] leading-none">±</span>}
+              label={fmtNet(gitMetrics.week.lines_added - gitMetrics.week.lines_removed)}
+            />
+          </>
+        )}
       </div>
 
       <div className="text-xs text-zinc-500">{relativeTime(project.last_activity)}</div>

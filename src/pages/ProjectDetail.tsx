@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronLeft, FileText } from "lucide-react";
-import { ProjectDetail as PD, SessionMeta } from "../types";
-import { relativeTime } from "../lib/relativeTime";
+import { ProjectDetail as PD, SessionMeta, GitMetricsRollup, ProjectGitMetrics } from "../types";
+import { relativeTime, fmtNet } from "../lib/relativeTime";
 import { MarkdownView } from "../components/MarkdownView";
 import { SessionRow } from "../components/SessionRow";
 
@@ -18,6 +18,7 @@ export function ProjectDetail() {
   const [noteContent, setNoteContent] = useState<string | null>(null);
   const [selectedNote, setSelectedNote] = useState<string | null>(null);
   const [projSessions, setProjSessions] = useState<SessionMeta[] | null>(null);
+  const [gitMetrics, setGitMetrics] = useState<ProjectGitMetrics | null | undefined>(undefined);
 
   useEffect(() => {
     if (!slug) return;
@@ -28,6 +29,13 @@ export function ProjectDetail() {
     setNoteContent(null);
     setSelectedNote(null);
     setProjSessions(null);
+    setGitMetrics(undefined);
+    invoke<GitMetricsRollup>("git_metrics_rollup")
+      .then((data) => {
+        const found = data.by_project.find((m) => m.slug === slug) ?? null;
+        setGitMetrics(found);
+      })
+      .catch(() => setGitMetrics(null));
     invoke<PD | null>("get_project_detail", { slug })
       .then((d) => {
         if (!d) setNotFound(true);
@@ -111,6 +119,7 @@ export function ProjectDetail() {
                 </span>
               ))}
             </div>
+            <GitSummaryLine metrics={gitMetrics} />
           </div>
         </div>
 
@@ -224,4 +233,29 @@ export function ProjectDetail() {
 
 function EmptyState({ message }: { message: string }) {
   return <p className="text-sm text-zinc-600">{message}</p>;
+}
+
+function GitSummaryLine({ metrics }: { metrics: ProjectGitMetrics | null | undefined }) {
+  if (metrics === undefined) return null; // still loading
+  if (metrics === null || metrics.no_data) {
+    return <p className="text-xs text-zinc-600 mt-1">no git data</p>;
+  }
+  const net = metrics.week.lines_added - metrics.week.lines_removed;
+  const parts: string[] = [];
+  if (metrics.week.commits > 0) {
+    parts.push(`${metrics.week.commits} commit${metrics.week.commits !== 1 ? "s" : ""} this week`);
+    parts.push(`${fmtNet(net)} lines`);
+  }
+  if (metrics.last_commit_ts) {
+    const subj = metrics.last_commit_subject
+      ? ` — ${metrics.last_commit_subject.slice(0, 72)}`
+      : "";
+    parts.push(`${relativeTime(metrics.last_commit_ts)}${subj}`);
+  }
+  if (parts.length === 0) return null;
+  return (
+    <p className="text-xs text-zinc-500 mt-1 truncate max-w-lg">
+      {parts.join(" · ")}
+    </p>
+  );
 }
