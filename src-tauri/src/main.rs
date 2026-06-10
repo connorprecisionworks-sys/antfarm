@@ -359,24 +359,27 @@ struct UsageRollup {
     parsed_files: usize,
 }
 
+// Named rate table — easy to retune. Returns (input_rate, output_rate) per 1M tokens.
+// Cache multipliers are applied from the model's input_rate in est_dollars_for().
+fn model_rates(model: &str) -> (f64, f64) {
+    match model {
+        "claude-opus-4-8"  => (5.0,  25.0),
+        "claude-sonnet-4-6" => (3.0, 15.0),
+        _                  => (4.0,  20.0), // blended fallback for unknown/future models
+    }
+}
+
 fn est_dollars_for(model: &str, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
     if model == "<synthetic>" {
         return 0.0;
     }
-    // Rates per 1M tokens: (input, output, cache_read, cache_write)
-    let (ir, or_, crr, cwr): (f64, f64, f64, f64) = if model.starts_with("claude-opus-4") {
-        (15.0, 75.0, 1.50, 18.75)
-    } else if model.starts_with("claude-haiku-4") {
-        (0.80, 4.0, 0.08, 1.00)
-    } else {
-        // Default: Sonnet 4.x rates
-        (3.0, 15.0, 0.30, 3.75)
-    };
-    (input as f64 * ir
-        + output as f64 * or_
-        + cache_read as f64 * crr
-        + cache_write as f64 * cwr)
-        / 1_000_000.0
+    let (ir, or_) = model_rates(model);
+    // Cache multipliers applied to the model's own input rate per message
+    (input      as f64 * ir * 1.00   // input_tokens        → input_rate × 1.0
+        + output      as f64 * or_       // output_tokens       → output_rate
+        + cache_read  as f64 * ir * 0.10 // cache_read          → input_rate × 0.10
+        + cache_write as f64 * ir * 1.25 // cache_creation      → input_rate × 1.25
+    ) / 1_000_000.0
 }
 
 fn match_dir_to_slug(dir_name: &str, registry: &Registry) -> String {
