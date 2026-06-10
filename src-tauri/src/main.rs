@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dispatch;
+
 use chrono::{Datelike, Local, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1755,6 +1757,32 @@ fn git_metrics_rollup() -> GitMetricsRollup {
     }
 }
 
+// ── Project path resolution for dispatch ─────────────────────────────────────
+
+#[derive(Serialize)]
+struct RepoPath {
+    repo: String,
+    path: String,
+}
+
+#[tauri::command]
+fn get_project_paths(slug: String) -> Vec<RepoPath> {
+    let registry = load_registry();
+    let session_paths = discover_session_repo_paths();
+    let empty = RegistryProject::default();
+    let proj = registry.projects.get(&slug).unwrap_or(&empty);
+    proj.repos
+        .iter()
+        .filter_map(|repo| {
+            let path = resolve_repo_path(repo, &session_paths)?;
+            Some(RepoPath {
+                repo: repo.clone(),
+                path: path.to_string_lossy().into_owned(),
+            })
+        })
+        .collect()
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1763,9 +1791,16 @@ fn main() {
     }));
     let events_state = EventsState(Arc::clone(&events_inner));
 
+    let dispatch_state  = dispatch::DispatchState::default();
+    let dispatch_claude = dispatch_state.claude_path.clone();
+
     tauri::Builder::default()
         .manage(events_state)
+        .manage(dispatch_state)
         .setup(move |app| {
+            // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
+            let path = dispatch::resolve_claude_path();
+            *dispatch_claude.lock().unwrap() = path;
             spawn_events_watcher(app.handle().clone(), Arc::clone(&events_inner));
             Ok(())
         })
@@ -1781,6 +1816,11 @@ fn main() {
             needs_you_count,
             git_metrics_rollup,
             working_tree_rollup,
+            get_project_paths,
+            dispatch::dispatch_run,
+            dispatch::list_runs,
+            dispatch::kill_run,
+            dispatch::take_over_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

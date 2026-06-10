@@ -130,3 +130,27 @@ export interface ProjectWorkingTree {
 export interface WorkingTreeRollup {
   by_project: ProjectWorkingTree[];
 }
+
+export interface RunRecord {
+  runId: string;
+  projectPath: string;
+  effectiveCwd: string;
+  prompt: string;
+  status: "running" | "done" | "failed" | "killed";
+  startedAt: string;
+  finishedAt: string | null;
+  usedWorktree: boolean;
+  sessionId: string | null;
+  permissionMode: string;
+}
+
+export interface RunEvent {
+  runId: string;
+  kind: "line" | "stderr" | "status";
+  payload: string;
+}
+
+export interface RepoPath {
+  repo: string;
+  path: string;
+}

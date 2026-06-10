@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronLeft, FileText } from "lucide-react";
-import { ProjectDetail as PD, SessionMeta, GitMetricsRollup, ProjectGitMetrics, WorkingTreeRollup, ProjectWorkingTree } from "../types";
+import { ProjectDetail as PD, SessionMeta, GitMetricsRollup, ProjectGitMetrics, WorkingTreeRollup, ProjectWorkingTree, RunRecord, RepoPath } from "../types";
 import { relativeTime, fmtNet } from "../lib/relativeTime";
 import { MarkdownView } from "../components/MarkdownView";
 import { SessionRow } from "../components/SessionRow";
+import { DispatchPanel } from "../components/DispatchPanel";
 
-type Tab = "overview" | "ideas" | "notes" | "sessions";
+type Tab = "overview" | "ideas" | "notes" | "sessions" | "dispatch";
 
 export function ProjectDetail() {
   const { slug } = useParams<{ slug: string }>();
@@ -20,6 +21,8 @@ export function ProjectDetail() {
   const [projSessions, setProjSessions] = useState<SessionMeta[] | null>(null);
   const [gitMetrics, setGitMetrics] = useState<ProjectGitMetrics | null | undefined>(undefined);
   const [workingTree, setWorkingTree] = useState<ProjectWorkingTree | null | undefined>(undefined);
+  const [dispatchPaths, setDispatchPaths] = useState<RepoPath[] | null>(null);
+  const [projectRuns, setProjectRuns] = useState<RunRecord[] | null>(null);
 
   useEffect(() => {
     if (!slug) return;
@@ -32,6 +35,8 @@ export function ProjectDetail() {
     setProjSessions(null);
     setGitMetrics(undefined);
     setWorkingTree(undefined);
+    setDispatchPaths(null);
+    setProjectRuns(null);
     invoke<GitMetricsRollup>("git_metrics_rollup")
       .then((data) => {
         const found = data.by_project.find((m) => m.slug === slug) ?? null;
@@ -63,6 +68,22 @@ export function ProjectDetail() {
         .catch(() => setProjSessions([]));
     }
   }, [tab, slug, projSessions]);
+
+  useEffect(() => {
+    if (tab === "dispatch" && slug && dispatchPaths === null) {
+      invoke<RepoPath[]>("get_project_paths", { slug })
+        .then(setDispatchPaths)
+        .catch(() => setDispatchPaths([]));
+    }
+  }, [tab, slug, dispatchPaths]);
+
+  useEffect(() => {
+    if (tab === "dispatch" && dispatchPaths && dispatchPaths.length > 0 && projectRuns === null) {
+      invoke<RunRecord[]>("list_runs", { projectPath: dispatchPaths[0].path })
+        .then(setProjectRuns)
+        .catch(() => setProjectRuns([]));
+    }
+  }, [tab, dispatchPaths, projectRuns]);
 
   function openNote(filename: string) {
     if (!slug) return;
@@ -97,6 +118,7 @@ export function ProjectDetail() {
     { id: "ideas", label: "Ideas" },
     { id: "notes", label: `Notes${detail.notes_files.length ? ` (${detail.notes_files.length})` : ""}` },
     { id: "sessions", label: "Sessions" },
+    { id: "dispatch", label: "Dispatch" },
   ];
 
   return (
@@ -237,6 +259,51 @@ export function ProjectDetail() {
             </div>
           )
         )}
+
+        {tab === "dispatch" && (
+          <div className="max-w-2xl space-y-8">
+            {/* Dispatch form */}
+            <div>
+              <h2 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">
+                Dispatch a task
+              </h2>
+              {dispatchPaths === null ? (
+                <p className="text-xs text-zinc-500 animate-pulse">Resolving paths…</p>
+              ) : dispatchPaths.length === 0 ? (
+                <p className="text-xs text-zinc-600">
+                  No repos resolved for this project. Add repos to the registry.
+                </p>
+              ) : (
+                <>
+                  <p className="text-xs text-zinc-600 font-mono mb-3">
+                    {dispatchPaths[0].path}
+                  </p>
+                  <DispatchPanel projectPath={dispatchPaths[0].path} />
+                </>
+              )}
+            </div>
+
+            {/* Run history */}
+            {dispatchPaths && dispatchPaths.length > 0 && (
+              <div>
+                <h2 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">
+                  Run history
+                </h2>
+                {projectRuns === null ? (
+                  <p className="text-xs text-zinc-500 animate-pulse">Loading…</p>
+                ) : projectRuns.length === 0 ? (
+                  <p className="text-xs text-zinc-600">No runs yet.</p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {projectRuns.map((r) => (
+                      <RunHistoryRow key={r.runId} run={r} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -244,6 +311,31 @@ export function ProjectDetail() {
 
 function EmptyState({ message }: { message: string }) {
   return <p className="text-sm text-zinc-600">{message}</p>;
+}
+
+const RUN_STATUS_STYLE: Record<string, string> = {
+  running: "text-emerald-400",
+  done:    "text-zinc-500",
+  failed:  "text-rose-400",
+  killed:  "text-zinc-600",
+};
+
+function RunHistoryRow({ run }: { run: RunRecord }) {
+  const startSecs = Math.floor(new Date(run.startedAt).getTime() / 1000);
+  return (
+    <div className="flex items-center gap-3 px-3 py-2 rounded-lg border border-zinc-800/60 bg-zinc-900/30 text-xs">
+      <span className={`shrink-0 font-medium ${RUN_STATUS_STYLE[run.status] ?? "text-zinc-500"}`}>
+        {run.status}
+      </span>
+      <span className="flex-1 text-zinc-300 truncate min-w-0">
+        {run.prompt.slice(0, 90)}{run.prompt.length > 90 ? "…" : ""}
+      </span>
+      {run.usedWorktree && (
+        <span className="text-zinc-600 shrink-0">worktree</span>
+      )}
+      <span className="text-zinc-600 shrink-0">{relativeTime(startSecs)}</span>
+    </div>
+  );
 }
 
 const STATE_COLOR: Record<string, string> = {
