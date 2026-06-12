@@ -11,8 +11,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
   DockviewReact,
+  DockviewDefaultTab,
   DockviewReadyEvent,
   IDockviewPanelProps,
+  IDockviewPanelHeaderProps,
   DockviewApi,
 } from "dockview";
 import "dockview/dist/styles/dockview.css";
@@ -267,8 +269,8 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", borderTop: `2px solid ${meta.accent}`, boxSizing: "border-box" }}>
       {role !== "shell" && (
-        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 8px", background: meta.tint, borderBottom: "1px solid #18181b", flexShrink: 0 }}>
-          <span style={{ width: 7, height: 7, borderRadius: "50%", background: meta.accent, flexShrink: 0 }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "2px 6px", background: meta.tint, borderBottom: "1px solid #18181b", flexShrink: 0 }}>
+          <span style={{ width: 6, height: 6, borderRadius: "50%", background: meta.accent, flexShrink: 0 }} />
           <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: meta.accent }}>
             {meta.label}
           </span>
@@ -339,6 +341,66 @@ function LocalhostPane({ params, api }: IDockviewPanelProps<LocalhostParams>) {
   );
 }
 
+// ── Custom tab: double-click to maximize/restore ───────────────────────────
+
+function PanelTab(props: IDockviewPanelHeaderProps) {
+  function handleDoubleClick() {
+    if (props.api.isMaximized()) {
+      props.api.exitMaximized();
+    } else {
+      props.api.maximize();
+    }
+  }
+  return <DockviewDefaultTab {...props} onDoubleClick={handleDoubleClick} />;
+}
+
+// ── Even-out layout helper ─────────────────────────────────────────────────
+// Accesses the internal gridview directly to call BranchNode.resizeChild(),
+// which routes to splitview.resizeView() — the real in-place resize path.
+// fromJSON(reuseExistingPanels) ignores serialized sizes so it cannot be used.
+
+function evenOutPanes(api: DockviewApi) {
+  if (api.groups.length <= 1) return;
+
+  const gridview = (api as any).component?.gridview;
+  if (!gridview) return;
+
+  const root = (api.toJSON() as any)?.grid?.root;
+  if (!root) return;
+
+  // Walk the JSON tree top-down. For each branch node, get the matching
+  // BranchNode from gridview (by location = path of child indices from root)
+  // and redistribute its children to equal sizes via resizeChild().
+  // Top-down order is required: resizing an outer branch propagates new
+  // orthogonal sizes to inner branches proportionally, then we redistribute
+  // those inner branches' children on the next step.
+  function processNode(node: any, location: number[]) {
+    if (node.type !== 'branch') return;
+    const children: any[] = node.data ?? [];
+    const n = children.length;
+
+    if (n >= 2) {
+      try {
+        const [, branchNode] = gridview.getNode(location) as [any, any];
+        let total = 0;
+        for (let i = 0; i < n; i++) total += (branchNode.getChildSize(i) as number);
+        const each = Math.floor(total / n);
+        // Set children 0..N-2 to equal size; N-1 absorbs the rounding remainder.
+        for (let i = 0; i < n - 1; i++) {
+          branchNode.resizeChild(i, each);
+        }
+      } catch {
+        // getNode can throw for stale locations; skip silently
+      }
+    }
+
+    // Recurse into child branches AFTER resizing (top-down order)
+    children.forEach((child: any, i: number) => processNode(child, [...location, i]));
+  }
+
+  processNode(root, []);
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 function slugToTitle(slug: string) {
@@ -364,6 +426,7 @@ type GridKind = "2across" | "3across" | "2x2" | "conductor";
 interface DockAreaHandle {
   addPane(type: PaneType, slug: string | null): void;
   buildGrid(kind: GridKind, slug: string | null): void;
+  evenOut(): void;
 }
 
 interface DockAreaProps {
@@ -465,6 +528,14 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
         console.error("[DockArea] buildGrid failed:", err);
       }
     },
+    evenOut() {
+      if (!apiRef.current) return;
+      try {
+        evenOutPanes(apiRef.current);
+      } catch (err) {
+        console.error("[DockArea] evenOut failed:", err);
+      }
+    },
   }));
 
   function handleReady(event: DockviewReadyEvent) {
@@ -494,6 +565,7 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
         className="h-full dockview-theme-abyss"
         onReady={handleReady}
         components={DOCK_COMPONENTS}
+        defaultTabComponent={PanelTab}
       />
     </SaveTrigger.Provider>
   );
@@ -635,7 +707,7 @@ function CreateWorkspaceForm({ projects, onCreate, onCancel }: CreateFormProps) 
 
 // ── Grid preset dropdown ───────────────────────────────────────────────────
 
-function GridMenu({ onPick }: { onPick: (kind: GridKind) => void }) {
+function GridMenu({ onPick, onEvenOut }: { onPick: (kind: GridKind) => void; onEvenOut: () => void }) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -670,6 +742,14 @@ function GridMenu({ onPick }: { onPick: (kind: GridKind) => void }) {
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1.5 w-60 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl py-1 z-50">
+          <button
+            onClick={() => { onEvenOut(); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <Layout size={13} className="shrink-0 text-zinc-400" />
+            Even out panes
+          </button>
+          <div className="my-1 border-t border-zinc-700" />
           {item("Conductor: orchestrator + 2 executors", "conductor", "#6366f1")}
           <div className="my-1 border-t border-zinc-700" />
           {item("2 terminals across", "2across")}
@@ -955,6 +1035,11 @@ export function WorkspacePage() {
     dockRefs.current[activeId]?.buildGrid(kind, slug);
   }
 
+  function handleEvenOut() {
+    if (!activeId) return;
+    dockRefs.current[activeId]?.evenOut();
+  }
+
   const activeWorkspace = workspaces.find(w => w.id === activeId) ?? null;
 
   if (!loaded) {
@@ -992,7 +1077,7 @@ export function WorkspacePage() {
         </div>
         {activeWorkspace && (
           <div className="pl-3 shrink-0 flex items-center gap-2">
-            <GridMenu onPick={handleBuildGrid} />
+            <GridMenu onPick={handleBuildGrid} onEvenOut={handleEvenOut} />
             <AddPaneMenu onAdd={handleAddPane} />
           </div>
         )}
