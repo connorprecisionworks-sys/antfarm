@@ -158,15 +158,25 @@ interface SlashCommand {
 function SkillsMenu({ paneId }: { paneId: string }) {
   const [open, setOpen] = useState(false);
   const [commands, setCommands] = useState<SlashCommand[] | null>(null);
+  const [query, setQuery] = useState("");
   const [pos, setPos] = useState({ top: 0, left: 0 });
   const btnRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     invoke<SlashCommand[]>("list_slash_commands")
       .then(cmds => setCommands(cmds))
       .catch(() => setCommands([]));
   }, []);
+
+  // Autofocus search and reset query each time the popover opens
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      requestAnimationFrame(() => searchRef.current?.focus());
+    }
+  }, [open]);
 
   function openMenu() {
     if (btnRef.current) {
@@ -183,16 +193,32 @@ function SkillsMenu({ paneId }: { paneId: string }) {
       if (btnRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       setOpen(false);
     }
+    function onEscape(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
     document.addEventListener("mousedown", onOutside);
-    return () => document.removeEventListener("mousedown", onOutside);
+    document.addEventListener("keydown", onEscape);
+    return () => {
+      document.removeEventListener("mousedown", onOutside);
+      document.removeEventListener("keydown", onEscape);
+    };
   }, [open]);
 
-  function runSkill(name: string) {
-    invoke("write_pty", { paneId, data: `/${name}\n` }).catch(() => {});
+  // Insert the command with a trailing space so the user can add args before pressing Enter
+  function insertSkill(name: string) {
+    invoke("write_pty", { paneId, data: `/${name} ` }).catch(() => {});
     setOpen(false);
   }
 
-  const SHIP_NOTE = "Opens PRs — not wired here";
+  const SHIP_NOTE = "Opens PRs — not available in this flow";
+
+  const q = query.trim().toLowerCase();
+  const filtered = commands
+    ? commands.filter(cmd => {
+        if (!q) return true;
+        return cmd.name.toLowerCase().includes(q) || cmd.description.toLowerCase().includes(q);
+      })
+    : [];
 
   const dropdown = open && createPortal(
     <div
@@ -202,53 +228,89 @@ function SkillsMenu({ paneId }: { paneId: string }) {
         top: pos.top,
         left: pos.left,
         zIndex: 9999,
-        background: "#27272a",
+        width: 340,
+        background: "#1c1c1e",
         border: "1px solid #3f3f46",
-        borderRadius: 8,
-        boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-        padding: "4px 0",
-        minWidth: 240,
-        maxHeight: 320,
-        overflowY: "auto",
+        borderRadius: 10,
+        boxShadow: "0 12px 40px rgba(0,0,0,0.6)",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
       }}
     >
-      {!commands || commands.length === 0 ? (
-        <div style={{ padding: "8px 12px", fontSize: 11, color: "#71717a" }}>
-          {commands === null ? "Loading…" : "No skills found"}
-        </div>
-      ) : (
-        commands.map(cmd => {
-          const isShip = cmd.name === "ship";
-          return (
-            <button
-              key={cmd.name}
-              disabled={isShip}
-              onClick={() => { if (!isShip) runSkill(cmd.name); }}
-              style={{
-                display: "block",
-                width: "100%",
-                textAlign: "left",
-                padding: "5px 12px",
-                background: "transparent",
-                border: "none",
-                cursor: isShip ? "not-allowed" : "pointer",
-                opacity: isShip ? 0.45 : 1,
-              }}
-              className="hover:bg-zinc-700"
-              title={isShip ? SHIP_NOTE : cmd.description}
-            >
-              <div style={{ fontSize: 11, color: "#e4e4e7", fontFamily: "monospace" }}>
-                /{cmd.name}
-              </div>
-              {(cmd.description || isShip) && (
-                <div style={{ fontSize: 10, color: "#71717a", marginTop: 1, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {isShip ? SHIP_NOTE : cmd.description}
+      {/* Search input */}
+      <div style={{ padding: "8px 10px", borderBottom: "1px solid #2d2d30", flexShrink: 0 }}>
+        <input
+          ref={searchRef}
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          placeholder="Search skills…"
+          style={{
+            width: "100%",
+            background: "#27272a",
+            border: "1px solid #3f3f46",
+            borderRadius: 6,
+            padding: "5px 10px",
+            fontSize: 12,
+            color: "#e4e4e7",
+            outline: "none",
+            boxSizing: "border-box",
+          }}
+        />
+      </div>
+
+      {/* Skill list */}
+      <div style={{ overflowY: "auto", maxHeight: 360 }}>
+        {commands === null ? (
+          <div style={{ padding: "10px 12px", fontSize: 11, color: "#52525b" }}>Loading…</div>
+        ) : filtered.length === 0 ? (
+          <div style={{ padding: "10px 12px", fontSize: 11, color: "#52525b" }}>
+            {q ? "No matches" : "No skills found"}
+          </div>
+        ) : (
+          filtered.map(cmd => {
+            const isShip = cmd.name === "ship";
+            const desc = isShip ? SHIP_NOTE : cmd.description;
+            return (
+              <button
+                key={cmd.name}
+                disabled={isShip}
+                onClick={() => { if (!isShip) insertSkill(cmd.name); }}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  textAlign: "left",
+                  padding: "7px 12px",
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: "1px solid #27272a",
+                  cursor: isShip ? "not-allowed" : "pointer",
+                  opacity: isShip ? 0.4 : 1,
+                }}
+                className="hover:bg-zinc-800"
+              >
+                <div style={{ fontSize: 12, color: "#e4e4e7", fontFamily: "monospace", fontWeight: 600 }}>
+                  /{cmd.name}
                 </div>
-              )}
-            </button>
-          );
-        })
-      )}
+                {desc && (
+                  <div style={{
+                    fontSize: 11,
+                    color: "#71717a",
+                    marginTop: 2,
+                    lineHeight: 1.4,
+                    display: "-webkit-box",
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: "vertical",
+                    overflow: "hidden",
+                  } as React.CSSProperties}>
+                    {desc}
+                  </div>
+                )}
+              </button>
+            );
+          })
+        )}
+      </div>
     </div>,
     document.body
   );
@@ -258,7 +320,7 @@ function SkillsMenu({ paneId }: { paneId: string }) {
       <button
         ref={btnRef}
         onClick={openMenu}
-        title="Run a skill in this pane"
+        title="Browse and insert a skill"
         style={{
           marginLeft: "auto",
           display: "flex",
