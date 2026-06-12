@@ -146,7 +146,16 @@ function ProjectInfoPane({ params }: IDockviewPanelProps<InfoParams>) {
 
 // ── Terminal pane ──────────────────────────────────────────────────────────
 
-interface TerminalParams { project_slug: string | null }
+type PaneRole = "shell" | "orchestrator" | "executor";
+
+interface TerminalParams { project_slug: string | null; role?: PaneRole }
+
+// Visual identity per role so it's obvious which pane plans vs which execute.
+const ROLE_META: Record<PaneRole, { label: string; accent: string; tint: string }> = {
+  orchestrator: { label: "Orchestrator", accent: "#6366f1", tint: "rgba(99,102,241,0.12)" },
+  executor:     { label: "Executor",     accent: "#10b981", tint: "rgba(16,185,129,0.10)" },
+  shell:        { label: "Terminal",     accent: "#3f3f46", tint: "transparent" },
+};
 
 const XTERM_THEME = {
   background:    "#0a0a0b",
@@ -233,6 +242,7 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
           cwd,
           cols: Math.max(1, term.cols),
           rows: Math.max(1, term.rows),
+          kind: params.role ?? "shell",
         }).catch(err => {
           if (mounted) term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
         });
@@ -248,13 +258,29 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
       invoke("kill_pty", { paneId }).catch(() => {});
       term.dispose();
     };
-  }, [paneId, params.project_slug]);
+  }, [paneId, params.project_slug, params.role]);
+
+  const role: PaneRole = params.role ?? "shell";
+  const meta = ROLE_META[role];
 
   return (
-    <div
-      ref={containerRef}
-      style={{ width: "100%", height: "100%", overflow: "hidden", padding: "4px", boxSizing: "border-box" }}
-    />
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", borderTop: `2px solid ${meta.accent}`, boxSizing: "border-box" }}>
+      {role !== "shell" && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 8px", background: meta.tint, borderBottom: "1px solid #18181b", flexShrink: 0 }}>
+          <span style={{ width: 7, height: 7, borderRadius: "50%", background: meta.accent, flexShrink: 0 }} />
+          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: meta.accent }}>
+            {meta.label}
+          </span>
+          {role === "orchestrator" && (
+            <span style={{ fontSize: 10, color: "#71717a" }}>plans and reviews, has brain memory</span>
+          )}
+        </div>
+      )}
+      <div
+        ref={containerRef}
+        style={{ flex: 1, minHeight: 0, overflow: "hidden", padding: "4px", boxSizing: "border-box" }}
+      />
+    </div>
   );
 }
 
@@ -266,8 +292,12 @@ const DOCK_COMPONENTS = {
 
 // ── DockArea ───────────────────────────────────────────────────────────────
 
+type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor";
+type GridKind = "2across" | "3across" | "2x2" | "conductor";
+
 interface DockAreaHandle {
-  addPane(type: "web" | "project_info" | "terminal", slug: string | null): void;
+  addPane(type: PaneType, slug: string | null): void;
+  buildGrid(kind: GridKind, slug: string | null): void;
 }
 
 interface DockAreaProps {
@@ -281,7 +311,7 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
 ) {
   const apiRef = useRef<DockviewApi | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingPanesRef = useRef<Array<{ type: "web" | "project_info" | "terminal"; slug: string | null }>>([]);
+  const pendingPanesRef = useRef<Array<{ type: PaneType; slug: string | null }>>([]);
   const onLayoutChangeRef = useRef(onLayoutChange);
   useEffect(() => { onLayoutChangeRef.current = onLayoutChange; }, [onLayoutChange]);
 
@@ -294,14 +324,49 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
     }, 500);
   }, []);
 
-  function doAddPanel(api: DockviewApi, type: "web" | "project_info" | "terminal", slug: string | null) {
+  function doAddPanel(api: DockviewApi, type: PaneType, slug: string | null) {
     const id = crypto.randomUUID();
+    // New panes TILE to the right of the last pane (a split), never stack as a
+    // hidden tab in the active group. Omit position when the dock is empty.
+    const existing = api.panels;
+    const position = existing.length > 0
+      ? { referencePanel: existing[existing.length - 1].id, direction: "right" as const }
+      : undefined;
     if (type === "web") {
-      api.addPanel({ id, component: "web", params: { url: "" } as WebParams, title: "Web" });
+      api.addPanel({ id, component: "web", params: { url: "" } as WebParams, title: "Web", position });
     } else if (type === "project_info") {
-      api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info" });
+      api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info", position });
     } else {
-      api.addPanel({ id, component: "terminal", params: { project_slug: slug } as TerminalParams, title: "Terminal" });
+      const role: PaneRole = type === "orchestrator" ? "orchestrator" : type === "executor" ? "executor" : "shell";
+      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
+    }
+  }
+
+  // Lay out tiled panes as a grid (no manual dragging needed).
+  function buildGridLayout(api: DockviewApi, kind: GridKind, slug: string | null) {
+    api.clear();
+    const add = (role: PaneRole, position?: { referencePanel: string; direction: "right" | "below" }) => {
+      const id = crypto.randomUUID();
+      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
+      return id;
+    };
+    if (kind === "conductor") {
+      // Orchestrator on the left, two executors stacked on the right.
+      const o = add("orchestrator");
+      const e1 = add("executor", { referencePanel: o, direction: "right" });
+      add("executor", { referencePanel: e1, direction: "below" });
+      return;
+    }
+    const id1 = add("shell");
+    if (kind === "2across") {
+      add("shell", { referencePanel: id1, direction: "right" });
+    } else if (kind === "3across") {
+      const id2 = add("shell", { referencePanel: id1, direction: "right" });
+      add("shell", { referencePanel: id2, direction: "right" });
+    } else {
+      const id2 = add("shell", { referencePanel: id1, direction: "right" });
+      add("shell", { referencePanel: id1, direction: "below" });
+      add("shell", { referencePanel: id2, direction: "below" });
     }
   }
 
@@ -316,6 +381,14 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
         doAddPanel(apiRef.current, type, slug);
       } catch (err) {
         console.error("[DockArea] addPanel failed:", err);
+      }
+    },
+    buildGrid(kind, slug) {
+      if (!apiRef.current) return;
+      try {
+        buildGridLayout(apiRef.current, kind, slug);
+      } catch (err) {
+        console.error("[DockArea] buildGrid failed:", err);
       }
     },
   }));
@@ -486,9 +559,57 @@ function CreateWorkspaceForm({ projects, onCreate, onCancel }: CreateFormProps) 
   );
 }
 
+// ── Grid preset dropdown ───────────────────────────────────────────────────
+
+function GridMenu({ onPick }: { onPick: (kind: GridKind) => void }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onOutside(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onOutside);
+    return () => document.removeEventListener("mousedown", onOutside);
+  }, [open]);
+
+  const item = (label: string, kind: GridKind, accent?: string) => (
+    <button
+      onClick={() => { onPick(kind); setOpen(false); }}
+      className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+    >
+      <Layout size={13} className="shrink-0" style={accent ? { color: accent } : undefined} />
+      {label}
+    </button>
+  );
+
+  return (
+    <div ref={menuRef} className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200 bg-zinc-800/60 hover:bg-zinc-700 px-3 h-7 rounded-md transition-colors"
+      >
+        <Layout size={12} />
+        Grid
+        <ChevronDown size={11} className={`transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1.5 w-60 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl py-1 z-50">
+          {item("Conductor: orchestrator + 2 executors", "conductor", "#6366f1")}
+          <div className="my-1 border-t border-zinc-700" />
+          {item("2 terminals across", "2across")}
+          {item("3 terminals across", "3across")}
+          {item("2x2 grid (4 terminals)", "2x2")}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Add pane dropdown ──────────────────────────────────────────────────────
 
-function AddPaneMenu({ onAdd }: { onAdd: (type: "web" | "project_info" | "terminal") => void }) {
+function AddPaneMenu({ onAdd }: { onAdd: (type: PaneType) => void }) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -515,7 +636,29 @@ function AddPaneMenu({ onAdd }: { onAdd: (type: "web" | "project_info" | "termin
         />
       </button>
       {open && (
-        <div className="absolute right-0 top-full mt-1.5 w-44 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl py-1 z-50">
+        <div className="absolute right-0 top-full mt-1.5 w-52 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl py-1 z-50">
+          <button
+            onClick={() => { onAdd("orchestrator"); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <SquareTerminal size={13} className="shrink-0" style={{ color: "#6366f1" }} />
+            Orchestrator
+          </button>
+          <button
+            onClick={() => { onAdd("executor"); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <SquareTerminal size={13} className="shrink-0" style={{ color: "#10b981" }} />
+            Executor (Claude Code)
+          </button>
+          <div className="my-1 border-t border-zinc-700" />
+          <button
+            onClick={() => { onAdd("terminal"); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <SquareTerminal size={13} className="text-zinc-500 shrink-0" />
+            Terminal (shell)
+          </button>
           <button
             onClick={() => { onAdd("web"); setOpen(false); }}
             className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
@@ -529,13 +672,6 @@ function AddPaneMenu({ onAdd }: { onAdd: (type: "web" | "project_info" | "termin
           >
             <BookOpen size={13} className="text-zinc-500 shrink-0" />
             Project Info
-          </button>
-          <button
-            onClick={() => { onAdd("terminal"); setOpen(false); }}
-            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-          >
-            <SquareTerminal size={13} className="text-zinc-500 shrink-0" />
-            Terminal
           </button>
         </div>
       )}
@@ -613,7 +749,7 @@ export function WorkspacePage() {
     persist(updated);
   }
 
-  function handleAddPane(type: "web" | "project_info" | "terminal") {
+  function handleAddPane(type: PaneType) {
     try {
       const ws = workspaces.find(w => w.id === activeId) ?? null;
       const slug = ws?.project_slug ?? null;
@@ -625,6 +761,12 @@ export function WorkspacePage() {
     } catch (err) {
       console.error("[WorkspacePage] handleAddPane failed:", err);
     }
+  }
+
+  function handleBuildGrid(kind: GridKind) {
+    const ws = workspaces.find(w => w.id === activeId) ?? null;
+    const slug = ws?.project_slug ?? null;
+    dockRef.current?.buildGrid(kind, slug);
   }
 
   const activeWorkspace = workspaces.find(w => w.id === activeId) ?? null;
@@ -639,27 +781,32 @@ export function WorkspacePage() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {/* Tab bar */}
-      <div className="flex items-center gap-0.5 px-2 border-b border-zinc-800 bg-zinc-900/50 shrink-0 h-11 overflow-x-auto">
-        {workspaces.map(ws => (
-          <WorkspaceTab
-            key={ws.id}
-            ws={ws}
-            isActive={ws.id === activeId}
-            onActivate={() => setActiveId(ws.id)}
-            onRename={name => renameWorkspace(ws.id, name)}
-            onClose={() => closeWorkspace(ws.id)}
-          />
-        ))}
-        <button
-          onClick={() => setIsCreating(true)}
-          title="New workspace"
-          className="flex items-center justify-center w-7 h-7 text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors shrink-0 ml-1"
-        >
-          <Plus size={14} />
-        </button>
+      {/* Tab bar — outer row does NOT clip; only the tab strip scrolls.
+          The Add pane dropdown lives OUTSIDE the scroll container so it
+          isn't clipped by overflow (that clipping was hiding the menu). */}
+      <div className="flex items-center gap-0.5 px-2 border-b border-zinc-800 bg-zinc-900/50 shrink-0 h-11">
+        <div className="flex items-center gap-0.5 overflow-x-auto min-w-0 flex-1">
+          {workspaces.map(ws => (
+            <WorkspaceTab
+              key={ws.id}
+              ws={ws}
+              isActive={ws.id === activeId}
+              onActivate={() => setActiveId(ws.id)}
+              onRename={name => renameWorkspace(ws.id, name)}
+              onClose={() => closeWorkspace(ws.id)}
+            />
+          ))}
+          <button
+            onClick={() => setIsCreating(true)}
+            title="New workspace"
+            className="flex items-center justify-center w-7 h-7 text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors shrink-0 ml-1"
+          >
+            <Plus size={14} />
+          </button>
+        </div>
         {activeWorkspace && (
-          <div className="ml-auto pl-3 shrink-0">
+          <div className="pl-3 shrink-0 flex items-center gap-2">
+            <GridMenu onPick={handleBuildGrid} />
             <AddPaneMenu onAdd={handleAddPane} />
           </div>
         )}

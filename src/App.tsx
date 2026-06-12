@@ -6,7 +6,6 @@ import { ProjectDetail } from "./pages/ProjectDetail";
 import { Sessions } from "./pages/Sessions";
 import { Usage } from "./pages/Usage";
 import { Settings } from "./pages/Settings";
-import { WorkspacePage } from "./pages/Workspace";
 
 export default function App() {
   return (
@@ -18,7 +17,7 @@ export default function App() {
           <Route path="projects/:slug" element={<ProjectDetail />} />
           <Route path="sessions" element={<Sessions />} />
           <Route path="usage" element={<Usage />} />
-          <Route path="workspace" element={<WorkspacePage />} />
+          <Route path="workspace" element={null} />
           <Route path="settings" element={<Settings />} />
         </Route>
       </Routes>

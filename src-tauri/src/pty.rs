@@ -19,12 +19,20 @@ impl Default for PtyState {
     }
 }
 
+/// CD_claude brain directory — the orchestrator boots with read access to this
+/// so it carries cross-project memory, not just the current repo.
+fn brain_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    format!("{}/Desktop/CD_claude", home)
+}
+
 #[tauri::command]
 pub fn spawn_pty(
     pane_id: String,
     cwd: String,
     cols: u16,
     rows: u16,
+    kind: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, PtyState>,
 ) -> Result<(), String> {
@@ -52,13 +60,34 @@ pub fn spawn_pty(
         std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
     };
 
-    // Build shell command using the user's login shell
+    // Build the command. Plain shell = interactive login-capable shell.
+    // Orchestrator / executor = launch `claude` through a login shell (so PATH
+    // and tools resolve) via `exec`, so claude owns the PTY directly.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("LANG", "en_US.UTF-8");
     cmd.cwd(&cwd_resolved);
+
+    match kind.as_deref() {
+        Some("orchestrator") => {
+            let claude = crate::dispatch::resolve_claude_path();
+            let brain = brain_dir();
+            // Orchestrator: Opus 4.8 (the planner), + cross-project brain via --add-dir.
+            cmd.args([
+                "-lc",
+                &format!("exec \"{}\" --add-dir \"{}\" --model claude-opus-4-8", claude, brain),
+            ]);
+        }
+        Some("executor") => {
+            let claude = crate::dispatch::resolve_claude_path();
+            // Executor: Sonnet 4.6 (cheap volume execution).
+            cmd.args(["-lc", &format!("exec \"{}\" --model claude-sonnet-4-6", claude)]);
+        }
+        // "shell" or None — plain interactive shell, unchanged behavior.
+        _ => {}
+    }
 
     // Spawn child; slave is still held in pair until we destructure below
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
