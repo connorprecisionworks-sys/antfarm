@@ -1814,6 +1814,57 @@ fn get_project_paths(slug: String) -> Vec<RepoPath> {
         .collect()
 }
 
+// ── Slash commands / Skills discovery ────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct SlashCommand {
+    name: String,
+    description: String,
+}
+
+/// Extract a scalar value from YAML frontmatter (between leading `---\n` delimiters).
+/// Handles unquoted and double-quoted values. Returns None if field absent.
+fn parse_frontmatter_field(content: &str, field: &str) -> Option<String> {
+    let after_open = content.strip_prefix("---\n")?;
+    let end = after_open.find("\n---")?;
+    let fm = &after_open[..end];
+    let prefix = format!("{}:", field);
+    for line in fm.lines() {
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            let val = rest.trim().trim_matches('"').to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Scan ~/.claude/skills/ for skill directories and return (name, description) pairs.
+/// Each skill directory must contain a SKILL.md with YAML frontmatter.
+/// Returns an empty list rather than erroring if the directory is absent.
+#[tauri::command]
+fn list_slash_commands() -> Vec<SlashCommand> {
+    let skills_dir = home_dir().join(".claude/skills");
+    let Ok(rd) = fs::read_dir(&skills_dir) else { return vec![]; };
+    let mut cmds: Vec<SlashCommand> = rd
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let content = fs::read_to_string(path.join("SKILL.md")).ok()?;
+            let description = parse_frontmatter_field(&content, "description")
+                .unwrap_or_default();
+            Some(SlashCommand { name, description })
+        })
+        .collect();
+    cmds.sort_by(|a, b| a.name.cmp(&b.name));
+    cmds
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1871,6 +1922,7 @@ fn main() {
             pty::write_pty,
             pty::resize_pty,
             pty::kill_pty,
+            list_slash_commands,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -7,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -21,7 +22,7 @@ import "dockview/dist/styles/dockview.css";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Monitor, Plus, RotateCcw, SquareTerminal, X } from "lucide-react";
+import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Monitor, Plus, RotateCcw, SquareTerminal, X, Zap } from "lucide-react";
 import { GitMetricsRollup, Project, ProjectDetail as PD, RepoPath, SessionMeta, Settings, UsageRollup, WorkspaceEntry } from "../types";
 import { MarkdownView } from "../components/MarkdownView";
 import { fmtDollars, fmtTokens } from "../lib/relativeTime";
@@ -144,6 +145,141 @@ function ProjectInfoPane({ params }: IDockviewPanelProps<InfoParams>) {
         <p className="text-xs text-zinc-700">No README or ideas found.</p>
       )}
     </div>
+  );
+}
+
+// ── Skills / slash-command menu ────────────────────────────────────────────
+
+interface SlashCommand {
+  name: string;
+  description: string;
+}
+
+function SkillsMenu({ paneId }: { paneId: string }) {
+  const [open, setOpen] = useState(false);
+  const [commands, setCommands] = useState<SlashCommand[] | null>(null);
+  const [pos, setPos] = useState({ top: 0, left: 0 });
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    invoke<SlashCommand[]>("list_slash_commands")
+      .then(cmds => setCommands(cmds))
+      .catch(() => setCommands([]));
+  }, []);
+
+  function openMenu() {
+    if (btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      setPos({ top: rect.bottom + 4, left: rect.left });
+    }
+    setOpen(o => !o);
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    function onOutside(e: MouseEvent) {
+      const target = e.target as Node;
+      if (btnRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
+    }
+    document.addEventListener("mousedown", onOutside);
+    return () => document.removeEventListener("mousedown", onOutside);
+  }, [open]);
+
+  function runSkill(name: string) {
+    invoke("write_pty", { paneId, data: `/${name}\n` }).catch(() => {});
+    setOpen(false);
+  }
+
+  const SHIP_NOTE = "Opens PRs — not wired here";
+
+  const dropdown = open && createPortal(
+    <div
+      ref={menuRef}
+      style={{
+        position: "fixed",
+        top: pos.top,
+        left: pos.left,
+        zIndex: 9999,
+        background: "#27272a",
+        border: "1px solid #3f3f46",
+        borderRadius: 8,
+        boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+        padding: "4px 0",
+        minWidth: 240,
+        maxHeight: 320,
+        overflowY: "auto",
+      }}
+    >
+      {!commands || commands.length === 0 ? (
+        <div style={{ padding: "8px 12px", fontSize: 11, color: "#71717a" }}>
+          {commands === null ? "Loading…" : "No skills found"}
+        </div>
+      ) : (
+        commands.map(cmd => {
+          const isShip = cmd.name === "ship";
+          return (
+            <button
+              key={cmd.name}
+              disabled={isShip}
+              onClick={() => { if (!isShip) runSkill(cmd.name); }}
+              style={{
+                display: "block",
+                width: "100%",
+                textAlign: "left",
+                padding: "5px 12px",
+                background: "transparent",
+                border: "none",
+                cursor: isShip ? "not-allowed" : "pointer",
+                opacity: isShip ? 0.45 : 1,
+              }}
+              className="hover:bg-zinc-700"
+              title={isShip ? SHIP_NOTE : cmd.description}
+            >
+              <div style={{ fontSize: 11, color: "#e4e4e7", fontFamily: "monospace" }}>
+                /{cmd.name}
+              </div>
+              {(cmd.description || isShip) && (
+                <div style={{ fontSize: 10, color: "#71717a", marginTop: 1, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {isShip ? SHIP_NOTE : cmd.description}
+                </div>
+              )}
+            </button>
+          );
+        })
+      )}
+    </div>,
+    document.body
+  );
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        onClick={openMenu}
+        title="Run a skill in this pane"
+        style={{
+          marginLeft: "auto",
+          display: "flex",
+          alignItems: "center",
+          gap: 3,
+          fontSize: 10,
+          color: open ? "#a1a1aa" : "#71717a",
+          background: "transparent",
+          border: "1px solid #3f3f46",
+          borderRadius: 4,
+          padding: "1px 6px",
+          cursor: "pointer",
+          flexShrink: 0,
+        }}
+      >
+        <Zap size={9} />
+        Skills
+        <ChevronDown size={8} style={{ transform: open ? "rotate(180deg)" : undefined, transition: "transform 0.15s" }} />
+      </button>
+      {dropdown}
+    </>
   );
 }
 
@@ -277,6 +413,7 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
           {role === "orchestrator" && (
             <span style={{ fontSize: 10, color: "#71717a" }}>plans and reviews, has brain memory</span>
           )}
+          <SkillsMenu paneId={paneId} />
         </div>
       )}
       <div
