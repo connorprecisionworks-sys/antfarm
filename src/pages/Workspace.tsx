@@ -19,7 +19,7 @@ import "dockview/dist/styles/dockview.css";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Plus, RefreshCw, SquareTerminal, X } from "lucide-react";
+import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Plus, SquareTerminal, X } from "lucide-react";
 import { GitMetricsRollup, Project, ProjectDetail as PD, RepoPath, SessionMeta, Settings, UsageRollup, WorkspaceEntry } from "../types";
 import { MarkdownView } from "../components/MarkdownView";
 import { fmtDollars, fmtTokens } from "../lib/relativeTime";
@@ -285,221 +285,25 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
   );
 }
 
-// ── Block panes (read-only dashboard widgets) ──────────────────────────────
-
-interface BlockParams {}
+// ── Shared helpers ──────────────────────────────────────────────────────────
 
 function slugToTitle(slug: string) {
   return slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function BlockShell({
-  title,
-  icon,
-  onRefresh,
-  children,
-}: {
-  title: string;
-  icon: React.ReactNode;
-  onRefresh?: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex flex-col h-full bg-[#0a0a0b]">
-      <div className="flex items-center justify-between gap-2 px-3 h-9 border-b border-zinc-800 bg-[#111113] shrink-0">
-        <div className="flex items-center gap-1.5">
-          <span className="text-zinc-600">{icon}</span>
-          <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">{title}</span>
-        </div>
-        {onRefresh && (
-          <button onClick={onRefresh} className="text-zinc-600 hover:text-zinc-300 transition-colors p-0.5 rounded">
-            <RefreshCw size={11} />
-          </button>
-        )}
-      </div>
-      <div className="flex-1 overflow-y-auto p-3 min-h-0">{children}</div>
-    </div>
-  );
-}
-
-// ── Usage block ─────────────────────────────────────────────────────────────
-
-function UsageBlock(_: IDockviewPanelProps<BlockParams>) {
-  const [status, setStatus] = useState<"loading" | "error" | "ok">("loading");
-  const [rollup, setRollup] = useState<UsageRollup | null>(null);
-  const [settings, setSettings] = useState<Settings | null>(null);
-
-  function load() {
-    Promise.all([
-      invoke<UsageRollup>("usage_rollup"),
-      invoke<Settings>("get_settings"),
-    ])
-      .then(([r, s]) => { setRollup(r); setSettings(s); setStatus("ok"); })
-      .catch(() => setStatus("error"));
-  }
-
-  useEffect(() => {
-    load();
-    const id = setInterval(load, 30_000);
-    return () => clearInterval(id);
-  }, []);
-
-  const capPct = settings && settings.weekly_cap_tokens > 0 && rollup
-    ? Math.min(100, (rollup.week.total_tokens / settings.weekly_cap_tokens) * 100)
-    : 0;
-
-  return (
-    <BlockShell title="Usage" icon={<BarChart2 size={12} />} onRefresh={load}>
-      {status === "loading" && <p className="text-xs text-zinc-600 animate-pulse">Loading…</p>}
-      {status === "error" && <p className="text-xs text-zinc-600">Unavailable</p>}
-      {status === "ok" && rollup && settings && (
-        <div className="space-y-2">
-          <div className="flex items-baseline justify-between">
-            <span className="text-sm font-semibold text-zinc-200">{fmtTokens(rollup.week.total_tokens)}</span>
-            <span className="text-xs text-zinc-400">{fmtDollars(rollup.week.est_dollars)} est.</span>
-          </div>
-          {settings.weekly_cap_tokens > 0 ? (
-            <>
-              <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-indigo-500 rounded-full transition-all"
-                  style={{ width: `${capPct}%` }}
-                />
-              </div>
-              <p className="text-[11px] text-zinc-600">
-                {capPct.toFixed(1)}% of cap
-                {" · "}
-                {rollup.week.days_until_reset === 0 ? "resets today" : `resets in ${rollup.week.days_until_reset}d`}
-              </p>
-            </>
-          ) : (
-            <p className="text-[11px] text-zinc-600">No cap set</p>
-          )}
-        </div>
-      )}
-    </BlockShell>
-  );
-}
-
-// ── Needs-attention block ────────────────────────────────────────────────────
-
-function NeedsAttentionBlock(_: IDockviewPanelProps<BlockParams>) {
-  const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
-
-  function load() {
-    invoke<SessionMeta[]>("list_sessions")
-      .then(setSessions)
-      .catch(() => setSessions(null));
-  }
-
-  useEffect(() => {
-    load();
-    let unlisten: UnlistenFn | null = null;
-    listen("antfarm-events-updated", load).then(fn => { unlisten = fn; });
-    const id = setInterval(load, 30_000);
-    return () => { clearInterval(id); unlisten?.(); };
-  }, []);
-
-  const active = (sessions ?? [])
-    .filter(s => s.status === "running" || s.status === "needs_permission" || s.status === "waiting")
-    .sort((a, b) => (b.attention ? 1 : 0) - (a.attention ? 1 : 0));
-
-  return (
-    <BlockShell title="Needs Attention" icon={<Bell size={12} />} onRefresh={load}>
-      {sessions === null && <p className="text-xs text-zinc-600 animate-pulse">Loading…</p>}
-      {sessions !== null && active.length === 0 && (
-        <p className="text-xs text-zinc-600">No active sessions</p>
-      )}
-      {sessions !== null && active.length > 0 && (
-        <div className="space-y-1">
-          {active.map(s => (
-            <div
-              key={s.id}
-              className={[
-                "flex items-center gap-2 px-2 py-1.5 rounded-md",
-                s.attention ? "bg-amber-500/10 border border-amber-500/20" : "bg-zinc-800/40",
-              ].join(" ")}
-            >
-              <span className={["w-1.5 h-1.5 rounded-full shrink-0", s.attention ? "bg-amber-400" : "bg-emerald-400"].join(" ")} />
-              <span className="text-xs text-zinc-300 truncate flex-1 min-w-0">
-                {s.project_slug ? slugToTitle(s.project_slug) : "Unfiled"}
-              </span>
-              <span className={["text-[10px] shrink-0", s.attention ? "text-amber-400" : "text-emerald-400"].join(" ")}>
-                {s.status === "needs_permission" ? "needs permission" : s.status}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </BlockShell>
-  );
-}
-
-// ── Activity block ───────────────────────────────────────────────────────────
-
-function ActivityBlock(_: IDockviewPanelProps<BlockParams>) {
-  const [status, setStatus] = useState<"loading" | "error" | "ok">("loading");
-  const [data, setData] = useState<GitMetricsRollup | null>(null);
-
-  function load() {
-    invoke<GitMetricsRollup>("git_metrics_rollup")
-      .then(d => { setData(d); setStatus("ok"); })
-      .catch(() => setStatus("error"));
-  }
-
-  useEffect(() => {
-    load();
-    const id = setInterval(load, 30_000);
-    return () => clearInterval(id);
-  }, []);
-
-  const projects = data
-    ? data.by_project.filter(p => !p.no_data && p.week.commits > 0)
-        .sort((a, b) => b.week.commits - a.week.commits)
-    : [];
-
-  return (
-    <BlockShell title="Activity" icon={<Activity size={12} />} onRefresh={load}>
-      {status === "loading" && <p className="text-xs text-zinc-600 animate-pulse">Loading…</p>}
-      {status === "error" && <p className="text-xs text-zinc-600">Unavailable</p>}
-      {status === "ok" && projects.length === 0 && (
-        <p className="text-xs text-zinc-600">No commits this week</p>
-      )}
-      {status === "ok" && projects.length > 0 && (
-        <div className="space-y-2.5">
-          {projects.map(p => (
-            <div key={p.slug} className="space-y-0.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-zinc-300 truncate flex-1 min-w-0">{slugToTitle(p.slug)}</span>
-                <span className="text-[11px] text-zinc-500 shrink-0">{p.week.commits}c</span>
-              </div>
-              <div className="flex items-center gap-2 text-[10px]">
-                <span className="text-emerald-500">+{p.week.lines_added.toLocaleString()}</span>
-                <span className="text-red-400">−{p.week.lines_removed.toLocaleString()}</span>
-                {p.last_commit_subject && (
-                  <span className="text-zinc-600 truncate flex-1 min-w-0">{p.last_commit_subject}</span>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </BlockShell>
-  );
+function fmtLines(n: number) {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
 const DOCK_COMPONENTS = {
   web: WebPane,
   project_info: ProjectInfoPane,
   terminal: TerminalPane,
-  usage_block: UsageBlock,
-  needs_attention_block: NeedsAttentionBlock,
-  activity_block: ActivityBlock,
 } as const;
 
 // ── DockArea ───────────────────────────────────────────────────────────────
 
-type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor" | "usage_block" | "needs_attention_block" | "activity_block";
+type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor";
 type GridKind = "2across" | "3across" | "2x2" | "conductor";
 
 interface DockAreaHandle {
@@ -511,6 +315,8 @@ interface DockAreaProps {
   workspace: WorkspaceEntry;
   onLayoutChange: (json: string) => void;
 }
+
+const TERM_MIN = { minimumWidth: 320, minimumHeight: 160 } as const;
 
 const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   { workspace, onLayoutChange },
@@ -543,30 +349,26 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       api.addPanel({ id, component: "web", params: { url: "" } as WebParams, title: "Web", position });
     } else if (type === "project_info") {
       api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info", position });
-    } else if (type === "usage_block") {
-      api.addPanel({ id, component: "usage_block", params: {} as BlockParams, title: "Usage", position });
-    } else if (type === "needs_attention_block") {
-      api.addPanel({ id, component: "needs_attention_block", params: {} as BlockParams, title: "Needs Attention", position });
-    } else if (type === "activity_block") {
-      api.addPanel({ id, component: "activity_block", params: {} as BlockParams, title: "Activity", position });
     } else {
       const role: PaneRole = type === "orchestrator" ? "orchestrator" : type === "executor" ? "executor" : "shell";
-      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
+      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, ...TERM_MIN });
     }
   }
 
   // Lay out tiled panes as a grid (no manual dragging needed).
   function buildGridLayout(api: DockviewApi, kind: GridKind, slug: string | null) {
+    const totalWidth = api.width || 800;
     api.clear();
-    const add = (role: PaneRole, position?: { referencePanel: string; direction: "right" | "below" }) => {
+    const add = (role: PaneRole, position?: { referencePanel: string; direction: "right" | "below" }, initialWidth?: number) => {
       const id = crypto.randomUUID();
-      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
+      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, initialWidth, ...TERM_MIN });
       return id;
     };
     if (kind === "conductor") {
-      // Orchestrator on the left, two executors stacked on the right.
-      const o = add("orchestrator");
-      const e1 = add("executor", { referencePanel: o, direction: "right" });
+      // Orchestrator gets ~50% width; two executors split the other half.
+      const half = Math.round(totalWidth * 0.5);
+      const o = add("orchestrator", undefined, half);
+      const e1 = add("executor", { referencePanel: o, direction: "right" }, half);
       add("executor", { referencePanel: e1, direction: "below" });
       return;
     }
@@ -886,31 +688,115 @@ function AddPaneMenu({ onAdd }: { onAdd: (type: PaneType) => void }) {
             <BookOpen size={13} className="text-zinc-500 shrink-0" />
             Project Info
           </button>
-          <div className="my-1 border-t border-zinc-700" />
-          <p className="px-3 pb-1 pt-0.5 text-[10px] font-semibold text-zinc-600 uppercase tracking-wider">Blocks</p>
-          <button
-            onClick={() => { onAdd("usage_block"); setOpen(false); }}
-            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-          >
-            <BarChart2 size={13} className="text-zinc-500 shrink-0" />
-            Usage
-          </button>
-          <button
-            onClick={() => { onAdd("needs_attention_block"); setOpen(false); }}
-            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-          >
-            <Bell size={13} className="text-zinc-500 shrink-0" />
-            Needs Attention
-          </button>
-          <button
-            onClick={() => { onAdd("activity_block"); setOpen(false); }}
-            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
-          >
-            <Activity size={13} className="text-zinc-500 shrink-0" />
-            Activity
-          </button>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Workspace HUD ──────────────────────────────────────────────────────────
+
+function WorkspaceHud() {
+  const [rollup, setRollup] = useState<UsageRollup | null>(null);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
+  const [gitData, setGitData] = useState<GitMetricsRollup | null>(null);
+
+  function loadUsage() {
+    Promise.all([invoke<UsageRollup>("usage_rollup"), invoke<Settings>("get_settings")])
+      .then(([r, s]) => { setRollup(r); setSettings(s); })
+      .catch(() => {});
+  }
+  function loadSessions() {
+    invoke<SessionMeta[]>("list_sessions").then(setSessions).catch(() => {});
+  }
+  function loadGit() {
+    invoke<GitMetricsRollup>("git_metrics_rollup").then(setGitData).catch(() => {});
+  }
+
+  useEffect(() => {
+    loadUsage();
+    loadSessions();
+    loadGit();
+    const ids = [setInterval(loadUsage, 30_000), setInterval(loadSessions, 30_000), setInterval(loadGit, 30_000)];
+    let unlisten: UnlistenFn | null = null;
+    listen("antfarm-events-updated", loadSessions).then(fn => { unlisten = fn; });
+    return () => { ids.forEach(clearInterval); unlisten?.(); };
+  }, []);
+
+  const capPct = settings && settings.weekly_cap_tokens > 0 && rollup
+    ? Math.min(100, (rollup.week.total_tokens / settings.weekly_cap_tokens) * 100)
+    : 0;
+
+  const attentionSessions = sessions?.filter(s => s.attention) ?? [];
+  const activeSessions = sessions?.filter(s => s.status === "running" || s.status === "needs_permission" || s.status === "waiting") ?? [];
+  const hasAttention = attentionSessions.length > 0;
+
+  const topProject = gitData?.by_project
+    .filter(p => !p.no_data && p.week.commits > 0)
+    .sort((a, b) => b.week.commits - a.week.commits)[0] ?? null;
+
+  const divider = <div className="w-px h-4 bg-zinc-800 shrink-0 mx-2" />;
+
+  return (
+    <div className="flex items-center h-10 px-3 border-b border-zinc-800 bg-[#0d0d0f] shrink-0 overflow-hidden">
+
+      {/* ── Usage ── */}
+      <div className="flex items-center gap-2 shrink-0">
+        <BarChart2 size={11} className="text-zinc-600 shrink-0" />
+        {rollup && settings ? (
+          <>
+            <span className="text-xs text-zinc-300 tabular-nums font-medium">{fmtTokens(rollup.week.total_tokens)}</span>
+            <span className="text-[11px] text-zinc-500 tabular-nums">{fmtDollars(rollup.week.est_dollars)}</span>
+            {settings.weekly_cap_tokens > 0 && (
+              <div className="flex items-center gap-1.5">
+                <div className="w-14 h-[3px] bg-zinc-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-500 rounded-full transition-all"
+                    style={{ width: `${capPct}%` }}
+                  />
+                </div>
+                <span className="text-[10px] text-zinc-600 tabular-nums">{capPct.toFixed(0)}%</span>
+              </div>
+            )}
+          </>
+        ) : (
+          <span className="text-[11px] text-zinc-700">—</span>
+        )}
+      </div>
+
+      {divider}
+
+      {/* ── Needs attention ── */}
+      <div className={["flex items-center gap-1.5 shrink-0", hasAttention ? "text-amber-400" : "text-zinc-500"].join(" ")}>
+        <Bell size={11} className="shrink-0" />
+        {sessions !== null ? (
+          <span className="text-[11px] tabular-nums">
+            {hasAttention
+              ? `${attentionSessions.length} needs you`
+              : activeSessions.length > 0
+                ? `${activeSessions.length} running`
+                : "quiet"}
+          </span>
+        ) : (
+          <span className="text-[11px]">—</span>
+        )}
+      </div>
+
+      {divider}
+
+      {/* ── Activity (most active project) — can truncate ── */}
+      <div className="flex items-center gap-1.5 min-w-0 overflow-hidden">
+        <Activity size={11} className="text-zinc-600 shrink-0" />
+        {topProject ? (
+          <span className="text-[11px] text-zinc-400 truncate tabular-nums">
+            {slugToTitle(topProject.slug)}&nbsp;{topProject.week.commits}c&nbsp;+{fmtLines(topProject.week.lines_added)}
+          </span>
+        ) : (
+          <span className="text-[11px] text-zinc-700">—</span>
+        )}
+      </div>
+
     </div>
   );
 }
@@ -1045,6 +931,9 @@ export function WorkspacePage() {
           </div>
         )}
       </div>
+
+      {/* HUD — always visible when a workspace is active */}
+      {activeWorkspace && <WorkspaceHud />}
 
       {/* New workspace form */}
       {isCreating && (
