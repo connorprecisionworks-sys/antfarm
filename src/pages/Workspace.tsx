@@ -687,10 +687,7 @@ export function WorkspacePage() {
   const [isCreating, setIsCreating] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const dockRef = useRef<DockAreaHandle>(null);
-  const activeIdRef = useRef<string | null>(null);
-
-  useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
+  const dockRefs = useRef<Record<string, DockAreaHandle | null>>({});
 
   useEffect(() => {
     invoke<WorkspaceEntry[]>("load_workspaces")
@@ -711,11 +708,9 @@ export function WorkspacePage() {
   }
 
   // Layout changes come from the debounced dockview listener
-  const handleLayoutChange = useCallback((layoutJson: string) => {
-    const id = activeIdRef.current;
-    if (!id) return;
+  const handleLayoutChange = useCallback((wsId: string, layoutJson: string) => {
     setWorkspaces(prev => {
-      const updated = prev.map(w => w.id === id ? { ...w, layout_json: layoutJson } : w);
+      const updated = prev.map(w => w.id === wsId ? { ...w, layout_json: layoutJson } : w);
       invoke("save_workspaces", { workspaces: updated }).catch(console.error);
       return updated;
     });
@@ -750,23 +745,26 @@ export function WorkspacePage() {
   }
 
   function handleAddPane(type: PaneType) {
+    if (!activeId) return;
     try {
       const ws = workspaces.find(w => w.id === activeId) ?? null;
       const slug = ws?.project_slug ?? null;
-      if (!dockRef.current) {
+      const ref = dockRefs.current[activeId];
+      if (!ref) {
         console.error("[WorkspacePage] addPane: DockArea ref not ready");
         return;
       }
-      dockRef.current.addPane(type, slug);
+      ref.addPane(type, slug);
     } catch (err) {
       console.error("[WorkspacePage] handleAddPane failed:", err);
     }
   }
 
   function handleBuildGrid(kind: GridKind) {
+    if (!activeId) return;
     const ws = workspaces.find(w => w.id === activeId) ?? null;
     const slug = ws?.project_slug ?? null;
-    dockRef.current?.buildGrid(kind, slug);
+    dockRefs.current[activeId]?.buildGrid(kind, slug);
   }
 
   const activeWorkspace = workspaces.find(w => w.id === activeId) ?? null;
@@ -839,17 +837,20 @@ export function WorkspacePage() {
         </div>
       )}
 
-      {/* Dock area — key remounts dockview when switching workspaces */}
-      {activeWorkspace && (
-        <div className="flex-1 min-h-0 overflow-hidden">
+      {/* Dock areas — one per workspace, visibility-toggled so PTYs stay alive */}
+      {workspaces.map(ws => (
+        <div
+          key={ws.id}
+          className="flex-1 min-h-0 overflow-hidden"
+          style={{ display: ws.id === activeId ? undefined : "none" }}
+        >
           <DockArea
-            key={activeWorkspace.id}
-            ref={dockRef}
-            workspace={activeWorkspace}
-            onLayoutChange={handleLayoutChange}
+            ref={el => { dockRefs.current[ws.id] = el; }}
+            workspace={ws}
+            onLayoutChange={json => handleLayoutChange(ws.id, json)}
           />
         </div>
-      )}
+      ))}
     </div>
   );
 }
