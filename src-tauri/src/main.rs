@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dispatch;
+mod pty;
 
 use chrono::{Datelike, Local, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use notify::{RecommendedWatcher, Watcher, RecursiveMode, Config as NotifyConfig};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -1824,14 +1825,27 @@ fn main() {
     let dispatch_state  = dispatch::DispatchState::default();
     let dispatch_claude = dispatch_state.claude_path.clone();
 
+    let pty_state = pty::PtyState::default();
+    let pty_map   = Arc::clone(&pty_state.0);
+
     tauri::Builder::default()
         .manage(events_state)
         .manage(dispatch_state)
+        .manage(pty_state)
         .setup(move |app| {
             // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
             let path = dispatch::resolve_claude_path();
             *dispatch_claude.lock().unwrap() = path;
             spawn_events_watcher(app.handle().clone(), Arc::clone(&events_inner));
+            // Kill all PTYs when the main window closes, to avoid zombie shell processes.
+            if let Some(win) = app.get_webview_window("main") {
+                let pty_map_close = Arc::clone(&pty_map);
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        pty::kill_all(&pty_map_close);
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1853,6 +1867,10 @@ fn main() {
             dispatch::take_over_run,
             load_workspaces,
             save_workspaces,
+            pty::spawn_pty,
+            pty::write_pty,
+            pty::resize_pty,
+            pty::kill_pty,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

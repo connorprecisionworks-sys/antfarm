@@ -8,6 +8,7 @@ import React, {
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
   DockviewReact,
   DockviewReadyEvent,
@@ -15,8 +16,11 @@ import {
   DockviewApi,
 } from "dockview";
 import "dockview/dist/styles/dockview.css";
-import { BookOpen, ChevronDown, Globe, Layout, Plus, X } from "lucide-react";
-import { Project, ProjectDetail as PD, WorkspaceEntry } from "../types";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
+import { BookOpen, ChevronDown, Globe, Layout, Plus, SquareTerminal, X } from "lucide-react";
+import { Project, ProjectDetail as PD, RepoPath, WorkspaceEntry } from "../types";
 import { MarkdownView } from "../components/MarkdownView";
 
 // ── YouTube URL → embed URL ────────────────────────────────────────────────
@@ -140,15 +144,118 @@ function ProjectInfoPane({ params }: IDockviewPanelProps<InfoParams>) {
   );
 }
 
+// ── Terminal pane ──────────────────────────────────────────────────────────
+
+interface TerminalParams { cwd: string }
+
+const XTERM_THEME = {
+  background:    "#0a0a0b",
+  foreground:    "#e4e4e7",
+  cursor:        "#a1a1aa",
+  cursorAccent:  "#0a0a0b",
+  selectionBackground: "rgba(99,102,241,0.3)",
+  black:         "#18181b",  brightBlack:   "#3f3f46",
+  red:           "#f87171",  brightRed:     "#fb923c",
+  green:         "#4ade80",  brightGreen:   "#86efac",
+  yellow:        "#facc15",  brightYellow:  "#fde047",
+  blue:          "#60a5fa",  brightBlue:    "#93c5fd",
+  magenta:       "#c084fc",  brightMagenta: "#d8b4fe",
+  cyan:          "#22d3ee",  brightCyan:    "#67e8f9",
+  white:         "#e4e4e7",  brightWhite:   "#f4f4f5",
+};
+
+function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
+  const paneId = api.id;
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const term = new Terminal({
+      fontFamily: '"Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, monospace',
+      fontSize: 13,
+      lineHeight: 1.2,
+      theme: XTERM_THEME,
+      cursorBlink: true,
+      scrollback: 5000,
+      allowTransparency: false,
+    });
+
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(el);
+
+    // Fit after DOM settles so xterm measures the real container size
+    requestAnimationFrame(() => {
+      fit.fit();
+      invoke<void>("spawn_pty", {
+        paneId,
+        cwd: params.cwd ?? "",
+        cols: Math.max(1, term.cols),
+        rows: Math.max(1, term.rows),
+      }).catch(err => {
+        term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
+      });
+    });
+
+    // Keystroke → PTY stdin
+    term.onData(data => {
+      invoke("write_pty", { paneId, data }).catch(() => {});
+    });
+
+    // PTY stdout → xterm (base64-encoded bytes)
+    let unlisten: UnlistenFn | null = null;
+    let mounted = true;
+    listen<string>(`pty-output-${paneId}`, event => {
+      const b64 = event.payload;
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      term.write(bytes);
+    }).then(fn => {
+      if (mounted) {
+        unlisten = fn;
+      } else {
+        fn(); // already unmounted — immediately unlisten
+      }
+    });
+
+    // Resize observer → fit + resize PTY
+    const ro = new ResizeObserver(() => {
+      fit.fit();
+      invoke("resize_pty", { paneId, cols: Math.max(1, term.cols), rows: Math.max(1, term.rows) })
+        .catch(() => {});
+    });
+    ro.observe(el);
+
+    return () => {
+      mounted = false;
+      ro.disconnect();
+      unlisten?.();
+      invoke("kill_pty", { paneId }).catch(() => {});
+      term.dispose();
+    };
+  }, [paneId, params.cwd]); // remount if paneId or cwd changes
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ width: "100%", height: "100%", overflow: "hidden", padding: "4px", boxSizing: "border-box" }}
+    />
+  );
+}
+
 const DOCK_COMPONENTS = {
   web: WebPane,
   project_info: ProjectInfoPane,
+  terminal: TerminalPane,
 } as const;
 
 // ── DockArea ───────────────────────────────────────────────────────────────
 
 interface DockAreaHandle {
-  addPane(type: "web" | "project_info", slug: string | null): void;
+  addPane(type: "web" | "project_info" | "terminal", slug: string | null, cwd?: string): void;
 }
 
 interface DockAreaProps {
@@ -175,7 +282,7 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   }, []);
 
   useImperativeHandle(ref, () => ({
-    addPane(type, slug) {
+    addPane(type, slug, cwd = "") {
       if (!apiRef.current) return;
       const id = crypto.randomUUID();
       if (type === "web") {
@@ -185,12 +292,19 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
           params: { url: "" } as WebParams,
           title: "Web",
         });
-      } else {
+      } else if (type === "project_info") {
         apiRef.current.addPanel({
           id,
           component: "project_info",
           params: { project_slug: slug } as InfoParams,
           title: "Project Info",
+        });
+      } else {
+        apiRef.current.addPanel({
+          id,
+          component: "terminal",
+          params: { cwd } as TerminalParams,
+          title: "Terminal",
         });
       }
     },
@@ -359,7 +473,7 @@ function CreateWorkspaceForm({ projects, onCreate, onCancel }: CreateFormProps) 
 
 // ── Add pane dropdown ──────────────────────────────────────────────────────
 
-function AddPaneMenu({ onAdd }: { onAdd: (type: "web" | "project_info") => void }) {
+function AddPaneMenu({ onAdd }: { onAdd: (type: "web" | "project_info" | "terminal") => void }) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -400,6 +514,13 @@ function AddPaneMenu({ onAdd }: { onAdd: (type: "web" | "project_info") => void 
           >
             <BookOpen size={13} className="text-zinc-500 shrink-0" />
             Project Info
+          </button>
+          <button
+            onClick={() => { onAdd("terminal"); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <SquareTerminal size={13} className="text-zinc-500 shrink-0" />
+            Terminal
           </button>
         </div>
       )}
@@ -477,9 +598,20 @@ export function WorkspacePage() {
     persist(updated);
   }
 
-  function handleAddPane(type: "web" | "project_info") {
+  async function handleAddPane(type: "web" | "project_info" | "terminal") {
     const ws = workspaces.find(w => w.id === activeId);
-    dockRef.current?.addPane(type, ws?.project_slug ?? null);
+    if (type === "terminal") {
+      let cwd = "";
+      if (ws?.project_slug) {
+        try {
+          const paths = await invoke<RepoPath[]>("get_project_paths", { slug: ws.project_slug });
+          cwd = paths[0]?.path ?? "";
+        } catch { /* fallback to HOME in Rust */ }
+      }
+      dockRef.current?.addPane("terminal", null, cwd);
+    } else {
+      dockRef.current?.addPane(type, ws?.project_slug ?? null);
+    }
   }
 
   const activeWorkspace = workspaces.find(w => w.id === activeId) ?? null;
