@@ -316,7 +316,7 @@ interface DockAreaProps {
   onLayoutChange: (json: string) => void;
 }
 
-const TERM_MIN = { minimumWidth: 320, minimumHeight: 160 } as const;
+const TERM_CONSTRAINTS = { minimumWidth: 320, minimumHeight: 160 } as const;
 
 const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   { workspace, onLayoutChange },
@@ -351,7 +351,8 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info", position });
     } else {
       const role: PaneRole = type === "orchestrator" ? "orchestrator" : type === "executor" ? "executor" : "shell";
-      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, ...TERM_MIN });
+      const panel = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
+      panel.api.setConstraints(TERM_CONSTRAINTS);
     }
   }
 
@@ -361,7 +362,8 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
     api.clear();
     const add = (role: PaneRole, position?: { referencePanel: string; direction: "right" | "below" }, initialWidth?: number) => {
       const id = crypto.randomUUID();
-      api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, initialWidth, ...TERM_MIN });
+      const panel = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, initialWidth });
+      panel.api.setConstraints(TERM_CONSTRAINTS);
       return id;
     };
     if (kind === "conductor") {
