@@ -146,7 +146,7 @@ function ProjectInfoPane({ params }: IDockviewPanelProps<InfoParams>) {
 
 // ── Terminal pane ──────────────────────────────────────────────────────────
 
-interface TerminalParams { cwd: string }
+interface TerminalParams { project_slug: string | null }
 
 const XTERM_THEME = {
   background:    "#0a0a0b",
@@ -186,18 +186,8 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
     term.loadAddon(fit);
     term.open(el);
 
-    // Fit after DOM settles so xterm measures the real container size
-    requestAnimationFrame(() => {
-      fit.fit();
-      invoke<void>("spawn_pty", {
-        paneId,
-        cwd: params.cwd ?? "",
-        cols: Math.max(1, term.cols),
-        rows: Math.max(1, term.rows),
-      }).catch(err => {
-        term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
-      });
-    });
+    let unlisten: UnlistenFn | null = null;
+    let mounted = true;
 
     // Keystroke → PTY stdin
     term.onData(data => {
@@ -205,8 +195,6 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
     });
 
     // PTY stdout → xterm (base64-encoded bytes)
-    let unlisten: UnlistenFn | null = null;
-    let mounted = true;
     listen<string>(`pty-output-${paneId}`, event => {
       const b64 = event.payload;
       const binary = atob(b64);
@@ -214,11 +202,8 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       term.write(bytes);
     }).then(fn => {
-      if (mounted) {
-        unlisten = fn;
-      } else {
-        fn(); // already unmounted — immediately unlisten
-      }
+      if (mounted) unlisten = fn;
+      else fn();
     });
 
     // Resize observer → fit + resize PTY
@@ -229,6 +214,33 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
     });
     ro.observe(el);
 
+    // Resolve cwd from project_slug (if any), then spawn PTY.
+    // Panel is already visible — async cwd resolution never blocks panel creation.
+    async function startPty() {
+      let cwd = "";
+      if (params.project_slug) {
+        try {
+          const paths = await invoke<RepoPath[]>("get_project_paths", { slug: params.project_slug });
+          cwd = paths[0]?.path ?? "";
+        } catch { /* Rust spawn_pty falls back to $HOME */ }
+      }
+      if (!mounted) return;
+      requestAnimationFrame(() => {
+        if (!mounted) return;
+        fit.fit();
+        invoke<void>("spawn_pty", {
+          paneId,
+          cwd,
+          cols: Math.max(1, term.cols),
+          rows: Math.max(1, term.rows),
+        }).catch(err => {
+          if (mounted) term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
+        });
+      });
+    }
+
+    startPty();
+
     return () => {
       mounted = false;
       ro.disconnect();
@@ -236,7 +248,7 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
       invoke("kill_pty", { paneId }).catch(() => {});
       term.dispose();
     };
-  }, [paneId, params.cwd]); // remount if paneId or cwd changes
+  }, [paneId, params.project_slug]);
 
   return (
     <div
@@ -255,7 +267,7 @@ const DOCK_COMPONENTS = {
 // ── DockArea ───────────────────────────────────────────────────────────────
 
 interface DockAreaHandle {
-  addPane(type: "web" | "project_info" | "terminal", slug: string | null, cwd?: string): void;
+  addPane(type: "web" | "project_info" | "terminal", slug: string | null): void;
 }
 
 interface DockAreaProps {
@@ -269,6 +281,7 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
 ) {
   const apiRef = useRef<DockviewApi | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingPanesRef = useRef<Array<{ type: "web" | "project_info" | "terminal"; slug: string | null }>>([]);
   const onLayoutChangeRef = useRef(onLayoutChange);
   useEffect(() => { onLayoutChangeRef.current = onLayoutChange; }, [onLayoutChange]);
 
@@ -281,31 +294,28 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
     }, 500);
   }, []);
 
+  function doAddPanel(api: DockviewApi, type: "web" | "project_info" | "terminal", slug: string | null) {
+    const id = crypto.randomUUID();
+    if (type === "web") {
+      api.addPanel({ id, component: "web", params: { url: "" } as WebParams, title: "Web" });
+    } else if (type === "project_info") {
+      api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info" });
+    } else {
+      api.addPanel({ id, component: "terminal", params: { project_slug: slug } as TerminalParams, title: "Terminal" });
+    }
+  }
+
   useImperativeHandle(ref, () => ({
-    addPane(type, slug, cwd = "") {
-      if (!apiRef.current) return;
-      const id = crypto.randomUUID();
-      if (type === "web") {
-        apiRef.current.addPanel({
-          id,
-          component: "web",
-          params: { url: "" } as WebParams,
-          title: "Web",
-        });
-      } else if (type === "project_info") {
-        apiRef.current.addPanel({
-          id,
-          component: "project_info",
-          params: { project_slug: slug } as InfoParams,
-          title: "Project Info",
-        });
-      } else {
-        apiRef.current.addPanel({
-          id,
-          component: "terminal",
-          params: { cwd } as TerminalParams,
-          title: "Terminal",
-        });
+    addPane(type, slug) {
+      if (!apiRef.current) {
+        // onReady hasn't fired yet (useEffect timing) — queue for immediate dispatch
+        pendingPanesRef.current.push({ type, slug });
+        return;
+      }
+      try {
+        doAddPanel(apiRef.current, type, slug);
+      } catch (err) {
+        console.error("[DockArea] addPanel failed:", err);
       }
     },
   }));
@@ -320,6 +330,11 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       }
     }
     event.api.onDidLayoutChange(() => scheduleSave());
+    // Flush any panels that were queued before onReady fired
+    const pending = pendingPanesRef.current.splice(0);
+    for (const p of pending) {
+      try { doAddPanel(event.api, p.type, p.slug); } catch { /* skip */ }
+    }
   }
 
   useEffect(() => () => {
@@ -598,19 +613,17 @@ export function WorkspacePage() {
     persist(updated);
   }
 
-  async function handleAddPane(type: "web" | "project_info" | "terminal") {
-    const ws = workspaces.find(w => w.id === activeId);
-    if (type === "terminal") {
-      let cwd = "";
-      if (ws?.project_slug) {
-        try {
-          const paths = await invoke<RepoPath[]>("get_project_paths", { slug: ws.project_slug });
-          cwd = paths[0]?.path ?? "";
-        } catch { /* fallback to HOME in Rust */ }
+  function handleAddPane(type: "web" | "project_info" | "terminal") {
+    try {
+      const ws = workspaces.find(w => w.id === activeId) ?? null;
+      const slug = ws?.project_slug ?? null;
+      if (!dockRef.current) {
+        console.error("[WorkspacePage] addPane: DockArea ref not ready");
+        return;
       }
-      dockRef.current?.addPane("terminal", null, cwd);
-    } else {
-      dockRef.current?.addPane(type, ws?.project_slug ?? null);
+      dockRef.current.addPane(type, slug);
+    } catch (err) {
+      console.error("[WorkspacePage] handleAddPane failed:", err);
     }
   }
 
@@ -681,7 +694,7 @@ export function WorkspacePage() {
 
       {/* Dock area — key remounts dockview when switching workspaces */}
       {activeWorkspace && (
-        <div className="flex-1 min-h-0">
+        <div className="flex-1 min-h-0 overflow-hidden">
           <DockArea
             key={activeWorkspace.id}
             ref={dockRef}
