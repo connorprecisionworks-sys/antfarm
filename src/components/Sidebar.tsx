@@ -8,6 +8,7 @@ import {
   BarChart2,
   Settings,
   Hexagon,
+  PanelLeft,
 } from "lucide-react";
 
 const NAV = [
@@ -15,6 +16,7 @@ const NAV = [
   { to: "/projects", label: "Projects", icon: Layers, end: false },
   { to: "/sessions", label: "Sessions", icon: Activity, end: false },
   { to: "/usage", label: "Usage", icon: BarChart2, end: false },
+  { to: "/workspace", label: "Workspace", icon: PanelLeft, end: false },
   { to: "/settings", label: "Settings", icon: Settings, end: false },
 ];
 

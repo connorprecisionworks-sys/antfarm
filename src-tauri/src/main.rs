@@ -1757,6 +1757,36 @@ fn git_metrics_rollup() -> GitMetricsRollup {
     }
 }
 
+// ── Workspace persistence ─────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct WorkspaceEntry {
+    id: String,
+    name: String,
+    project_slug: Option<String>,
+    layout_json: Option<String>,
+}
+
+fn workspaces_path() -> PathBuf {
+    app_data_dir().join("workspaces.json")
+}
+
+#[tauri::command]
+fn load_workspaces() -> Vec<WorkspaceEntry> {
+    match fs::read_to_string(workspaces_path()) {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Err(_) => vec![],
+    }
+}
+
+#[tauri::command]
+fn save_workspaces(workspaces: Vec<WorkspaceEntry>) -> Result<(), String> {
+    let dir = app_data_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&workspaces).map_err(|e| e.to_string())?;
+    fs::write(workspaces_path(), json).map_err(|e| e.to_string())
+}
+
 // ── Project path resolution for dispatch ─────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1821,6 +1851,8 @@ fn main() {
             dispatch::list_runs,
             dispatch::kill_run,
             dispatch::take_over_run,
+            load_workspaces,
+            save_workspaces,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -154,3 +154,10 @@ export interface RepoPath {
   repo: string;
   path: string;
 }
+
+export interface WorkspaceEntry {
+  id: string;
+  name: string;
+  project_slug: string | null;
+  layout_json: string | null;
+}
