@@ -19,7 +19,7 @@ import "dockview/dist/styles/dockview.css";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Plus, SquareTerminal, X } from "lucide-react";
+import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Monitor, Plus, RotateCcw, SquareTerminal, X } from "lucide-react";
 import { GitMetricsRollup, Project, ProjectDetail as PD, RepoPath, SessionMeta, Settings, UsageRollup, WorkspaceEntry } from "../types";
 import { MarkdownView } from "../components/MarkdownView";
 import { fmtDollars, fmtTokens } from "../lib/relativeTime";
@@ -285,6 +285,60 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
   );
 }
 
+// ── Localhost Preview pane ─────────────────────────────────────────────────
+
+interface LocalhostParams { port: number }
+
+function LocalhostPane({ params, api }: IDockviewPanelProps<LocalhostParams>) {
+  const save = useContext(SaveTrigger);
+  const [portInput, setPortInput] = useState(String(params.port ?? 5173));
+  const [port, setPort] = useState(params.port ?? 5173);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  function commitPort(raw: string) {
+    const n = parseInt(raw, 10);
+    if (!isNaN(n) && n >= 1 && n <= 65535) {
+      setPort(n);
+      setPortInput(String(n));
+      api.updateParameters({ port: n } as LocalhostParams);
+      save();
+    } else {
+      setPortInput(String(port));
+    }
+  }
+
+  return (
+    <div className="flex flex-col h-full bg-[#0a0a0b]">
+      <div className="flex items-center gap-2 px-3 h-9 border-b border-zinc-800 bg-[#111113] shrink-0">
+        <Monitor size={12} className="text-zinc-600 shrink-0" />
+        <span className="text-xs text-zinc-600 shrink-0">localhost:</span>
+        <input
+          value={portInput}
+          onChange={e => setPortInput(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") { (e.target as HTMLInputElement).blur(); commitPort(portInput); } }}
+          onBlur={() => commitPort(portInput)}
+          className="w-14 bg-transparent text-xs text-zinc-300 outline-none tabular-nums"
+        />
+        <span className="text-xs text-zinc-700 truncate flex-1 min-w-0 select-none">
+          http://localhost:{port}
+        </span>
+        <button
+          onClick={() => setReloadKey(k => k + 1)}
+          title="Reload"
+          className="text-zinc-600 hover:text-zinc-300 hover:bg-zinc-700 p-1 rounded transition-colors shrink-0"
+        >
+          <RotateCcw size={11} />
+        </button>
+      </div>
+      <iframe
+        key={`${port}-${reloadKey}`}
+        src={`http://localhost:${port}`}
+        className="flex-1 w-full border-0"
+      />
+    </div>
+  );
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 function slugToTitle(slug: string) {
@@ -299,11 +353,12 @@ const DOCK_COMPONENTS = {
   web: WebPane,
   project_info: ProjectInfoPane,
   terminal: TerminalPane,
+  localhost: LocalhostPane,
 } as const;
 
 // ── DockArea ───────────────────────────────────────────────────────────────
 
-type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor";
+type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor" | "localhost";
 type GridKind = "2across" | "3across" | "2x2" | "conductor";
 
 interface DockAreaHandle {
@@ -349,6 +404,8 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       api.addPanel({ id, component: "web", params: { url: "" } as WebParams, title: "Web", position });
     } else if (type === "project_info") {
       api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info", position });
+    } else if (type === "localhost") {
+      api.addPanel({ id, component: "localhost", params: { port: 5173 } as LocalhostParams, title: "Preview", position });
     } else {
       const role: PaneRole = type === "orchestrator" ? "orchestrator" : type === "executor" ? "executor" : "shell";
       const panel = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
@@ -689,6 +746,13 @@ function AddPaneMenu({ onAdd }: { onAdd: (type: PaneType) => void }) {
           >
             <BookOpen size={13} className="text-zinc-500 shrink-0" />
             Project Info
+          </button>
+          <button
+            onClick={() => { onAdd("localhost"); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <Monitor size={13} className="text-zinc-500 shrink-0" />
+            Localhost Preview
           </button>
         </div>
       )}
