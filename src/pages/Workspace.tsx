@@ -1137,9 +1137,323 @@ function WorkspaceHud() {
   );
 }
 
+// ── Harness types ─────────────────────────────────────────────────────────────
+
+interface HStepState {
+  stepId: string;
+  status: string;
+  attempts: number;
+  costUsd: number;
+  sessionId?: string;
+  acceptOutputTail?: string;
+  permissionDenials: number;
+}
+
+interface HRunState {
+  runId: string;
+  status: string;
+  worktree: string;
+  branch: string;
+  baseCommit: string;
+  costUsd: number;
+  steps: HStepState[];
+}
+
+interface HPlanState {
+  planId: string;
+  status: string;
+  costUsd: number;
+  runs: HRunState[];
+}
+
+interface RunEntry {
+  planId: string;
+  run: HRunState;
+  sortKey: number;
+}
+
+const RUN_STATUS_CHIP: Record<string, { bg: string; fg: string; label: string }> = {
+  queued:      { bg: "#27272a", fg: "#a1a1aa", label: "queued" },
+  pending:     { bg: "#27272a", fg: "#a1a1aa", label: "pending" },
+  running:     { bg: "#3730a3", fg: "#a5b4fc", label: "running" },
+  done:        { bg: "#14532d", fg: "#86efac", label: "done" },
+  failed:      { bg: "#7f1d1d", fg: "#fca5a5", label: "failed" },
+  blocked:     { bg: "#78350f", fg: "#fcd34d", label: "blocked" },
+  approved:    { bg: "#14532d", fg: "#86efac", label: "approved" },
+  flagged:     { bg: "#78350f", fg: "#fcd34d", label: "flagged" },
+  merged:      { bg: "#14532d", fg: "#6ee7b7", label: "merged" },
+  rejected:    { bg: "#27272a", fg: "#71717a", label: "rejected" },
+  interrupted: { bg: "#27272a", fg: "#71717a", label: "interrupted" },
+  conflict:    { bg: "#7f1d1d", fg: "#fca5a5", label: "conflict" },
+  accepted:    { bg: "#14532d", fg: "#6ee7b7", label: "accepted" },
+  budget_skip: { bg: "#78350f", fg: "#fcd34d", label: "budget skip" },
+};
+
+function HStatusChip({ status }: { status: string }) {
+  const c = RUN_STATUS_CHIP[status] ?? {
+    bg: "#27272a", fg: "#71717a",
+    label: status.replace(/_/g, " ").replace(/^setup_failed.*/, "setup failed"),
+  };
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center",
+      padding: "1px 7px", borderRadius: 99,
+      fontSize: 10, fontWeight: 600, letterSpacing: "0.03em",
+      background: c.bg, color: c.fg,
+      textTransform: "uppercase" as const, whiteSpace: "nowrap" as const,
+    }}>
+      {c.label}
+    </span>
+  );
+}
+
+// ── Agents view ────────────────────────────────────────────────────────────────
+
+function AgentsView() {
+  const [plans, setPlans] = useState<HPlanState[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [diffState, setDiffState] = useState<{ planId: string; runId: string; content: string } | null>(null);
+  const [staleWorktrees, setStaleWorktrees] = useState<string[]>([]);
+  const [msgs, setMsgs] = useState<Record<string, { text: string; error: boolean }>>({});
+
+  async function refresh() {
+    try {
+      const [ps, sw] = await Promise.all([
+        invoke<HPlanState[]>("list_plan_states"),
+        invoke<string[]>("list_stale_worktrees", { days: 7 }),
+      ]);
+      setPlans(ps);
+      setStaleWorktrees(sw);
+    } catch {
+      // tolerate
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    const interval = setInterval(refresh, 5_000);
+    let unlisten: UnlistenFn | null = null;
+    listen("antfarm-harness-event", () => refresh()).then(fn => { unlisten = fn; });
+    return () => { clearInterval(interval); unlisten?.(); };
+  }, []);
+
+  function planSortKey(planId: string): number {
+    const m = planId.match(/(\d+)$/);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  const entries: RunEntry[] = plans
+    .flatMap(p => p.runs.map(r => ({ planId: p.planId, run: r, sortKey: planSortKey(p.planId) })))
+    .sort((a, b) => b.sortKey - a.sortKey);
+
+  function setMsg(runId: string, text: string, error: boolean) {
+    setMsgs(prev => ({ ...prev, [runId]: { text, error } }));
+  }
+
+  async function handleDiff(planId: string, runId: string) {
+    try {
+      const diff = await invoke<string>("harness_run_diff", { planId, runId });
+      setDiffState({ planId, runId, content: diff });
+    } catch (e) {
+      setMsg(runId, String(e), true);
+    }
+  }
+
+  async function handleMerge(planId: string, runId: string) {
+    try {
+      const result = await invoke<string>("accept_run", { planId, runId });
+      setMsg(runId, result === "merged" ? "Merged to main" : result, false);
+      refresh();
+    } catch (e) {
+      setMsg(runId, String(e), true);
+    }
+  }
+
+  async function handleToss(planId: string, runId: string) {
+    if (!window.confirm(`Toss run "${runId}"? Removes worktree and branch.`)) return;
+    try {
+      await invoke("reject_run", { planId, runId });
+      setDiffState(prev => (prev?.planId === planId && prev?.runId === runId) ? null : prev);
+      refresh();
+    } catch (e) {
+      setMsg(runId, String(e), true);
+    }
+  }
+
+  async function handleTakeOver(planId: string, runId: string) {
+    try {
+      await invoke("take_over_overnight_run", { planId, runId });
+    } catch (e) {
+      setMsg(runId, String(e), true);
+    }
+  }
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0 overflow-hidden" style={{ background: "#0a0a0b" }}>
+      <div className="flex items-center gap-3 px-4 h-10 border-b border-zinc-800 shrink-0" style={{ background: "#0d0d0f" }}>
+        <Monitor size={13} className="text-zinc-500" />
+        <span className="text-xs font-semibold text-zinc-300">Agent Runs</span>
+        <span className="text-[11px] text-zinc-600">
+          {entries.length} run{entries.length !== 1 ? "s" : ""} across {plans.length} plan{plans.length !== 1 ? "s" : ""}
+        </span>
+        {loading && <span className="text-[10px] text-zinc-700 animate-pulse ml-auto">loading…</span>}
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {!loading && entries.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-64 gap-3">
+            <Activity size={32} className="text-zinc-800" />
+            <p className="text-sm text-zinc-500">No agent runs yet</p>
+            <p className="text-xs text-zinc-700">Arm a night plan to start</p>
+          </div>
+        ) : (
+          <div className="p-4 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))" }}>
+            {entries.map(({ planId, run }) => {
+              const greenSteps = run.steps.filter(s => s.status === "green").length;
+              const totalSteps = run.steps.length;
+              const costStr = run.costUsd > 0.0001 ? `$${run.costUsd.toFixed(4)}` : "—";
+              const branchShort = run.branch ? run.branch.replace(/^antfarm\//, "") : "";
+              const isDiffOpen = diffState?.planId === planId && diffState?.runId === run.runId;
+              const msg = msgs[run.runId];
+              const hasWt = !!run.worktree;
+              const hasSession = run.steps.some(s => s.sessionId);
+              const reviewable = ["done", "failed", "interrupted", "conflict"].includes(run.status);
+              const showDiff = hasWt && (reviewable || run.status === "accepted");
+              const showMerge = run.status === "done" && hasWt;
+              const showToss = hasWt && reviewable;
+              const showTakeOver = reviewable && hasSession;
+
+              return (
+                <div
+                  key={`${planId}:${run.runId}`}
+                  className="rounded-xl p-3 flex flex-col gap-2.5"
+                  style={{
+                    border: `1px solid ${isDiffOpen ? "#52525b" : "#27272a"}`,
+                    background: isDiffOpen ? "#1c1c1e" : "#111113",
+                    transition: "border-color 0.15s, background 0.15s",
+                  }}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium text-zinc-200 font-mono truncate">{run.runId}</p>
+                      <p className="text-[10px] text-zinc-600 mt-0.5 truncate">{planId}</p>
+                    </div>
+                    <HStatusChip status={run.status} />
+                  </div>
+
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {totalSteps > 0 && (
+                      <span className="text-[11px]">
+                        <span className="text-emerald-400 font-medium tabular-nums">{greenSteps}</span>
+                        <span className="text-zinc-600 tabular-nums">/{totalSteps}</span>
+                        <span className="text-zinc-600 ml-0.5">green</span>
+                      </span>
+                    )}
+                    <span className="text-[11px] text-zinc-500 tabular-nums">{costStr}</span>
+                    {branchShort && (
+                      <span className="text-[10px] text-zinc-700 font-mono truncate">{branchShort}</span>
+                    )}
+                  </div>
+
+                  {msg && (
+                    <div
+                      className="text-[11px] px-2.5 py-1.5 rounded-lg"
+                      style={{ background: msg.error ? "#450a0a" : "#052e16", color: msg.error ? "#fca5a5" : "#86efac" }}
+                    >
+                      {msg.text}
+                    </div>
+                  )}
+
+                  {(showDiff || showMerge || showToss || showTakeOver) && (
+                    <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
+                      {showDiff && (
+                        <button
+                          onClick={() => isDiffOpen ? setDiffState(null) : handleDiff(planId, run.runId)}
+                          className="text-[11px] px-2.5 py-1 rounded-md transition-colors"
+                          style={{ background: isDiffOpen ? "#3f3f46" : "#27272a", color: isDiffOpen ? "#e4e4e7" : "#a1a1aa" }}
+                        >
+                          {isDiffOpen ? "Hide diff" : "Diff"}
+                        </button>
+                      )}
+                      {showMerge && (
+                        <button
+                          onClick={() => handleMerge(planId, run.runId)}
+                          className="text-[11px] px-2.5 py-1 rounded-md transition-colors hover:opacity-80"
+                          style={{ background: "#14532d", color: "#86efac" }}
+                        >
+                          Merge
+                        </button>
+                      )}
+                      {showToss && (
+                        <button
+                          onClick={() => handleToss(planId, run.runId)}
+                          className="text-[11px] px-2.5 py-1 rounded-md transition-colors hover:bg-rose-950 hover:text-rose-300"
+                          style={{ background: "#27272a", color: "#71717a" }}
+                        >
+                          Toss
+                        </button>
+                      )}
+                      {showTakeOver && (
+                        <button
+                          onClick={() => handleTakeOver(planId, run.runId)}
+                          className="text-[11px] px-2.5 py-1 rounded-md transition-colors hover:bg-indigo-950 hover:text-indigo-300"
+                          style={{ background: "#27272a", color: "#71717a" }}
+                        >
+                          Take over
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {staleWorktrees.length > 0 && (
+          <div className="px-4 pb-6">
+            <p className="text-[11px] font-semibold text-zinc-600 uppercase tracking-wider mb-2">Stale worktrees (&gt;7 days)</p>
+            <div className="flex flex-col gap-1">
+              {staleWorktrees.map(wt => (
+                <div key={wt} className="text-[10px] text-zinc-600 font-mono px-3 py-1.5 rounded-md" style={{ background: "#18181b", border: "1px solid #27272a" }}>
+                  {wt}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {diffState && (
+        <div className="shrink-0 border-t border-zinc-700 flex flex-col" style={{ height: "42%", background: "#0d0d0f" }}>
+          <div className="flex items-center gap-3 px-4 h-9 border-b border-zinc-800 shrink-0">
+            <span className="text-[11px] font-medium text-zinc-400 font-mono">{diffState.runId}</span>
+            <span className="text-[10px] text-zinc-600 font-mono">{diffState.planId}</span>
+            <span className="ml-auto flex items-center gap-2">
+              <span className="text-[10px] text-zinc-700">read-only</span>
+              <button onClick={() => setDiffState(null)} className="text-zinc-600 hover:text-zinc-300 transition-colors p-0.5 rounded">
+                <X size={12} />
+              </button>
+            </span>
+          </div>
+          <pre className="flex-1 overflow-auto p-4 text-[11px] font-mono leading-relaxed whitespace-pre" style={{ color: "#a1a1aa" }}>
+            {diffState.content || "No diff available — worktree may have been removed."}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main Workspace page ────────────────────────────────────────────────────
 
 export function WorkspacePage() {
+  const [mode, setMode] = useState<"live" | "agents">(() => {
+    const saved = localStorage.getItem("antfarm-workspace-mode");
+    return saved === "agents" ? "agents" : "live";
+  });
   const [workspaces, setWorkspaces] = useState<WorkspaceEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -1163,6 +1477,11 @@ export function WorkspacePage() {
 
   function persist(ws: WorkspaceEntry[]) {
     invoke("save_workspaces", { workspaces: ws }).catch(console.error);
+  }
+
+  function switchMode(m: "live" | "agents") {
+    setMode(m);
+    localStorage.setItem("antfarm-workspace-mode", m);
   }
 
   // Layout changes come from the debounced dockview listener
@@ -1242,82 +1561,104 @@ export function WorkspacePage() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {/* Tab bar — outer row does NOT clip; only the tab strip scrolls.
-          The Add pane dropdown lives OUTSIDE the scroll container so it
-          isn't clipped by overflow (that clipping was hiding the menu). */}
-      <div className="flex items-center gap-0.5 px-2 border-b border-zinc-800 bg-zinc-900/50 shrink-0 h-11">
-        <div className="flex items-center gap-0.5 overflow-x-auto min-w-0 flex-1">
-          {workspaces.map(ws => (
-            <WorkspaceTab
-              key={ws.id}
-              ws={ws}
-              isActive={ws.id === activeId}
-              onActivate={() => setActiveId(ws.id)}
-              onRename={name => renameWorkspace(ws.id, name)}
-              onClose={() => closeWorkspace(ws.id)}
-            />
-          ))}
+      {/* Mode toggle — very top */}
+      <div className="flex items-center gap-0.5 px-2.5 h-8 border-b border-zinc-800/80 bg-zinc-950 shrink-0">
+        {(["live", "agents"] as const).map(m => (
           <button
-            onClick={() => setIsCreating(true)}
-            title="New workspace"
-            className="flex items-center justify-center w-7 h-7 text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors shrink-0 ml-1"
+            key={m}
+            onClick={() => switchMode(m)}
+            className={[
+              "px-3 h-5 rounded text-[11px] font-medium transition-colors",
+              mode === m ? "bg-zinc-700 text-zinc-100" : "text-zinc-500 hover:text-zinc-300",
+            ].join(" ")}
           >
-            <Plus size={14} />
+            {m === "live" ? "Live" : "Agents"}
           </button>
-        </div>
-        {activeWorkspace && (
-          <div className="pl-3 shrink-0 flex items-center gap-2">
-            <OpenLocalhostButton wsId={activeWorkspace.id} />
-            <GridMenu onPick={handleBuildGrid} onEvenOut={handleEvenOut} />
-            <AddPaneMenu onAdd={handleAddPane} />
-          </div>
-        )}
+        ))}
       </div>
 
-      {/* HUD — always visible when a workspace is active */}
-      {activeWorkspace && <WorkspaceHud />}
-
-      {/* New workspace form */}
-      {isCreating && (
-        <CreateWorkspaceForm
-          projects={projects}
-          onCreate={createWorkspace}
-          onCancel={() => setIsCreating(false)}
-        />
-      )}
-
-      {/* Empty state */}
-      {!activeWorkspace && !isCreating && (
-        <div className="flex flex-col flex-1 items-center justify-center gap-4">
-          <Layout size={36} className="text-zinc-800" />
-          <div className="text-center">
-            <p className="text-sm text-zinc-400 mb-1">No workspaces yet</p>
-            <p className="text-xs text-zinc-600">Create one to arrange panes for your projects</p>
+      {mode === "agents" ? (
+        <AgentsView />
+      ) : (
+        <>
+          {/* Tab bar — outer row does NOT clip; only the tab strip scrolls.
+              The Add pane dropdown lives OUTSIDE the scroll container so it
+              isn't clipped by overflow (that clipping was hiding the menu). */}
+          <div className="flex items-center gap-0.5 px-2 border-b border-zinc-800 bg-zinc-900/50 shrink-0 h-11">
+            <div className="flex items-center gap-0.5 overflow-x-auto min-w-0 flex-1">
+              {workspaces.map(ws => (
+                <WorkspaceTab
+                  key={ws.id}
+                  ws={ws}
+                  isActive={ws.id === activeId}
+                  onActivate={() => setActiveId(ws.id)}
+                  onRename={name => renameWorkspace(ws.id, name)}
+                  onClose={() => closeWorkspace(ws.id)}
+                />
+              ))}
+              <button
+                onClick={() => setIsCreating(true)}
+                title="New workspace"
+                className="flex items-center justify-center w-7 h-7 text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors shrink-0 ml-1"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+            {activeWorkspace && (
+              <div className="pl-3 shrink-0 flex items-center gap-2">
+                <OpenLocalhostButton wsId={activeWorkspace.id} />
+                <GridMenu onPick={handleBuildGrid} onEvenOut={handleEvenOut} />
+                <AddPaneMenu onAdd={handleAddPane} />
+              </div>
+            )}
           </div>
-          <button
-            onClick={() => setIsCreating(true)}
-            className="flex items-center gap-2 text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg transition-colors"
-          >
-            <Plus size={13} />
-            New Workspace
-          </button>
-        </div>
-      )}
 
-      {/* Dock areas — one per workspace, visibility-toggled so PTYs stay alive */}
-      {workspaces.map(ws => (
-        <div
-          key={ws.id}
-          className="flex-1 min-h-0 overflow-hidden"
-          style={{ display: ws.id === activeId ? undefined : "none" }}
-        >
-          <DockArea
-            ref={el => { dockRefs.current[ws.id] = el; }}
-            workspace={ws}
-            onLayoutChange={json => handleLayoutChange(ws.id, json)}
-          />
-        </div>
-      ))}
+          {/* HUD — always visible when a workspace is active */}
+          {activeWorkspace && <WorkspaceHud />}
+
+          {/* New workspace form */}
+          {isCreating && (
+            <CreateWorkspaceForm
+              projects={projects}
+              onCreate={createWorkspace}
+              onCancel={() => setIsCreating(false)}
+            />
+          )}
+
+          {/* Empty state */}
+          {!activeWorkspace && !isCreating && (
+            <div className="flex flex-col flex-1 items-center justify-center gap-4">
+              <Layout size={36} className="text-zinc-800" />
+              <div className="text-center">
+                <p className="text-sm text-zinc-400 mb-1">No workspaces yet</p>
+                <p className="text-xs text-zinc-600">Create one to arrange panes for your projects</p>
+              </div>
+              <button
+                onClick={() => setIsCreating(true)}
+                className="flex items-center gap-2 text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg transition-colors"
+              >
+                <Plus size={13} />
+                New Workspace
+              </button>
+            </div>
+          )}
+
+          {/* Dock areas — one per workspace, visibility-toggled so PTYs stay alive */}
+          {workspaces.map(ws => (
+            <div
+              key={ws.id}
+              className="flex-1 min-h-0 overflow-hidden"
+              style={{ display: ws.id === activeId ? undefined : "none" }}
+            >
+              <DockArea
+                ref={el => { dockRefs.current[ws.id] = el; }}
+                workspace={ws}
+                onLayoutChange={json => handleLayoutChange(ws.id, json)}
+              />
+            </div>
+          ))}
+        </>
+      )}
     </div>
   );
 }
