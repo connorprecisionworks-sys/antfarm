@@ -87,6 +87,8 @@ pub struct StepState {
     pub permission_denials: u32,
     #[serde(default)]
     pub prompt: String,
+    #[serde(default)]
+    pub model_used: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -112,6 +114,29 @@ pub struct PlanState {
     pub status: String,  // armed|running|done|aborted|budget_stop
     pub cost_usd: f64,
     pub runs: Vec<RunState>,
+}
+
+// ── Model tier escalation ─────────────────────────────────────────────────────
+
+const HAIKU:  &str = "claude-haiku-4-5-20251001";
+const SONNET: &str = "claude-sonnet-4-6";
+const OPUS:   &str = "claude-opus-4-8";
+
+fn tier_of(model: &str) -> usize {
+    let m = model.to_lowercase();
+    if m.contains("haiku")  { 0 }
+    else if m.contains("sonnet") { 1 }
+    else if m.contains("opus")   { 2 }
+    else { 1 }
+}
+
+fn model_for_tier(i: usize) -> &'static str {
+    match i { 0 => HAIKU, 1 => SONNET, _ => OPUS }
+}
+
+/// attempt is 1-indexed: attempt 1 = base model, each retry bumps one tier, capped at Opus.
+fn escalated_model(base: &str, attempt: u32) -> String {
+    model_for_tier((tier_of(base) + (attempt as usize - 1)).min(2)).to_string()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -523,14 +548,19 @@ fn execute_run(
         }
 
         let max_attempts = step.max_attempts.unwrap_or(defaults.max_attempts);
+        let base_model = step.model.as_deref().unwrap_or(&defaults.model);
         let mut fail_output: Option<String> = None;
 
         for attempt in 1..=max_attempts {
             rs.steps[si].attempts = attempt;
+            let model = escalated_model(base_model, attempt);
+            if attempt > 1 && model != escalated_model(base_model, attempt - 1) {
+                eprintln!("antfarm harness: step {} attempt {} escalated to {}", step.id, attempt, model);
+            }
             let prompt = build_step_prompt(run, step, i, &wt, &prev_tail, fail_output.as_deref());
             let outcome = run_step_process(
                 app, claude, &wt, &prompt,
-                step.model.as_deref().unwrap_or(&defaults.model),
+                &model,
                 &defaults.permission_mode,
                 Duration::from_secs(defaults.max_wall_minutes * 60),
                 Duration::from_secs(defaults.silence_minutes * 60),
@@ -540,6 +570,7 @@ fn execute_run(
 
             // PID captured immediately after spawn; persist to state.
             rs.steps[si].pid = outcome.pid;
+            rs.steps[si].model_used = model.clone();
             rs.steps[si].session_id = outcome.session_id.clone()
                 .or_else(|| rs.steps[si].session_id.clone());
             rs.steps[si].permission_denials += outcome.permission_denials;
@@ -961,6 +992,48 @@ pub fn dev_test_parallel(app: AppHandle, state: State<'_, HarnessState>,
     state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
     execute_plan(app, claude, plan, state.aborts.clone());
     Ok(format!("parallel plan started — plan_id={plan_id}"))
+}
+
+/// Phase C live verification: haiku base model, accept="false", max_attempts=2.
+/// Expected: attempt 1 runs haiku and fails accept, attempt 2 escalates to sonnet
+/// and fails accept, step ends "failed", StepState.model_used = "claude-sonnet-4-6".
+#[tauri::command]
+pub fn dev_test_escalation(app: AppHandle, state: State<'_, HarnessState>,
+                            dispatch: State<'_, crate::dispatch::DispatchState>)
+                            -> Result<String, String> {
+    let antfarm = home().join("Desktop/antfarm").to_string_lossy().into_owned();
+    let (plan_id, run_id) = dev_plan_id_and_run_id("escalation");
+    let plan = NightPlan {
+        plan_id: plan_id.clone(),
+        armed: true,
+        budgets: Budgets { per_step_usd: 1.0, per_run_usd: 5.0, per_night_usd: 10.0 },
+        defaults: PlanDefaults {
+            model: HAIKU.into(),
+            max_wall_minutes: 5,
+            silence_minutes: 2,
+            max_attempts: 2,
+            permission_mode: "dontAsk".into(),
+        },
+        max_parallel: 1,
+        runs: vec![RunSpec {
+            run_id: run_id.clone(),
+            project_path: antfarm,
+            goal: "Model tier escalation verification".into(),
+            setup: Some("true".into()),
+            on_fail: None,
+            steps: vec![StepSpec {
+                id: "escalation-step".into(),
+                prompt: "Reply with OK. Do not edit any files.".into(),
+                accept: "false".into(),   // always fails → triggers retry + escalation
+                max_attempts: Some(2),
+                model: None,              // inherits defaults.model = haiku
+            }],
+        }],
+    };
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
+    execute_plan(app, claude, plan, state.aborts.clone());
+    Ok(format!("escalation plan started — plan_id={plan_id} run_id={run_id}"))
 }
 
 // ── Small lookups ─────────────────────────────────────────────────────────────

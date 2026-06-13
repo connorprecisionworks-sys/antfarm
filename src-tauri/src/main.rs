@@ -1936,6 +1936,7 @@ fn main() {
             harness::dev_test_3step_fail,
             harness::dev_test_budget_gate,
             harness::dev_test_parallel,
+            harness::dev_test_escalation,
             load_workspaces,
             save_workspaces,
             pty::spawn_pty,
