@@ -4,3 +4,6 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 *.log
+
+# harness worktrees (created by antfarm overnight harness)
+.antfarm-worktrees/
