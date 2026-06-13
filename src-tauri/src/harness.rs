@@ -81,6 +81,8 @@ pub struct StepState {
     pub pid: Option<u32>,
     pub accept_output_tail: Option<String>,
     pub permission_denials: u32,
+    #[serde(default)]
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -93,6 +95,10 @@ pub struct RunState {
     pub base_commit: String,
     pub cost_usd: f64,
     pub steps: Vec<StepState>,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -290,6 +296,74 @@ fn reset_to_checkpoint(worktree: &str) {
     git(worktree, &["clean", "-fd"]).ok();
 }
 
+fn summarize_run(claude: &str, worktree: &str, base_commit: &str, goal: &str) -> (String, f64) {
+    let diff = match git(worktree, &["diff", &format!("{base_commit}...HEAD")]) {
+        Ok(d) => d,
+        Err(_) => return (String::new(), 0.0),
+    };
+    if diff.trim().is_empty() {
+        return (String::new(), 0.0);
+    }
+    let diff_capped = if diff.len() > 40_000 {
+        format!("{}\n... (diff truncated at 40k chars)", &diff[..40_000])
+    } else {
+        diff
+    };
+    let prompt = format!(
+        "Goal of this work: {goal}\n\nHere is the full diff:\n{diff_capped}\n\n\
+         In ONE short paragraph (3-5 sentences), plainly explain what was changed and what it \
+         contributes to the project, and whether it appears to accomplish the goal. \
+         No preamble, no lists, just the paragraph."
+    );
+    let mut child = match Command::new(claude)
+        .args(["-p", &prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "dontAsk",
+               "--model", "claude-sonnet-4-6"])
+        .current_dir(worktree)
+        .stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return (String::new(), 0.0),
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => { child.kill().ok(); return (String::new(), 0.0); }
+    };
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+    let started = Instant::now();
+    let max_wall = Duration::from_secs(120);
+    let mut result_text = String::new();
+    let mut cost = 0.0_f64;
+    loop {
+        if started.elapsed() > max_wall {
+            child.kill().ok();
+            break;
+        }
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(line) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                        result_text = v.get("result").and_then(|r| r.as_str())
+                            .unwrap_or("").trim().to_string();
+                        cost = v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    child.wait().ok();
+    (result_text, cost)
+}
+
 // ── Crash recovery ────────────────────────────────────────────────────────────
 
 /// Called once at startup. Any plan/run/step left "running" on disk is an
@@ -362,7 +436,9 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
 
             let mut rs = RunState {
                 run_id: run.run_id.clone(), status: "running".into(),
-                worktree: wt.clone(), branch, base_commit: base, ..Default::default()
+                worktree: wt.clone(), branch, base_commit: base,
+                goal: run.goal.clone(),
+                ..Default::default()
             };
             save_state_with(&mut st, &rs);
 
@@ -373,7 +449,9 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
                 // Push the step as "running" before the attempt loop so a crash
                 // during execution leaves an honest status in state.json.
                 rs.steps.push(StepState {
-                    step_id: step.id.clone(), status: "running".into(), ..Default::default()
+                    step_id: step.id.clone(), status: "running".into(),
+                    prompt: step.prompt.clone(),
+                    ..Default::default()
                 });
                 let si = rs.steps.len() - 1;
 
@@ -439,6 +517,13 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
                 save_state_with(&mut st, &rs);
             }
 
+            let any_green = rs.steps.iter().any(|s| s.status == "green");
+            if any_green && !rs.base_commit.is_empty() {
+                let (summ, summ_cost) = summarize_run(&claude, &rs.worktree, &rs.base_commit, &run.goal);
+                rs.summary = summ;
+                rs.cost_usd += summ_cost;
+                st.cost_usd += summ_cost;
+            }
             rs.status = if run_failed { "failed".into() } else { "done".into() };
             save_state_with(&mut st, &rs);
         }
@@ -560,6 +645,18 @@ pub fn list_stale_worktrees(days: u64) -> Result<Vec<String>, String> {
         }
     }
     Ok(stale)
+}
+
+#[tauri::command]
+pub fn harness_run_summary(plan_id: String, run_id: String) -> Result<String, String> {
+    let rs = find_run(&plan_id, &run_id)?;
+    if rs.worktree.is_empty() || rs.base_commit.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(git(&rs.worktree, &["diff", "--stat", &format!("{}...HEAD", rs.base_commit)])
+        .unwrap_or_default()
+        .trim()
+        .to_string())
 }
 
 // ── Dev verification commands ─────────────────────────────────────────────────

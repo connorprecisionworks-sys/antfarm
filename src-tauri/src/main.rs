@@ -1931,6 +1931,7 @@ fn main() {
             harness::reject_run,
             harness::take_over_overnight_run,
             harness::list_stale_worktrees,
+            harness::harness_run_summary,
             harness::dev_test_harness,
             harness::dev_test_3step_fail,
             harness::dev_test_budget_gate,

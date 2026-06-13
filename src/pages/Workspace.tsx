@@ -1147,6 +1147,7 @@ interface HStepState {
   sessionId?: string;
   acceptOutputTail?: string;
   permissionDenials: number;
+  prompt: string;
 }
 
 interface HRunState {
@@ -1157,6 +1158,8 @@ interface HRunState {
   baseCommit: string;
   costUsd: number;
   steps: HStepState[];
+  goal: string;
+  summary: string;
 }
 
 interface HPlanState {
@@ -1215,6 +1218,7 @@ function AgentsView() {
   const [diffState, setDiffState] = useState<{ planId: string; runId: string; content: string } | null>(null);
   const [staleWorktrees, setStaleWorktrees] = useState<string[]>([]);
   const [msgs, setMsgs] = useState<Record<string, { text: string; error: boolean }>>({});
+  const [stats, setStats] = useState<Record<string, string>>({});
 
   async function refresh() {
     try {
@@ -1224,6 +1228,19 @@ function AgentsView() {
       ]);
       setPlans(ps);
       setStaleWorktrees(sw);
+      const newStats: Record<string, string> = {};
+      await Promise.allSettled(
+        ps.flatMap(p => p.runs
+          .filter(r => r.worktree && ["done", "failed", "interrupted", "conflict", "accepted"].includes(r.status))
+          .map(async r => {
+            try {
+              const stat = await invoke<string>("harness_run_summary", { planId: p.planId, runId: r.runId });
+              if (stat) newStats[`${p.planId}:${r.runId}`] = stat;
+            } catch { /* ignore */ }
+          })
+        )
+      );
+      setStats(newStats);
     } catch {
       // tolerate
     } finally {
@@ -1311,10 +1328,7 @@ function AgentsView() {
         ) : (
           <div className="p-4 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))" }}>
             {entries.map(({ planId, run }) => {
-              const greenSteps = run.steps.filter(s => s.status === "green").length;
-              const totalSteps = run.steps.length;
               const costStr = run.costUsd > 0.0001 ? `$${run.costUsd.toFixed(4)}` : "—";
-              const branchShort = run.branch ? run.branch.replace(/^antfarm\//, "") : "";
               const isDiffOpen = diffState?.planId === planId && diffState?.runId === run.runId;
               const msg = msgs[run.runId];
               const hasWt = !!run.worktree;
@@ -1324,36 +1338,50 @@ function AgentsView() {
               const showMerge = run.status === "done" && hasWt;
               const showToss = hasWt && reviewable;
               const showTakeOver = reviewable && hasSession;
+              const statKey = `${planId}:${run.runId}`;
+              const statRaw = stats[statKey];
+              const statLine = statRaw
+                ? (statRaw.split('\n').filter((l: string) => l.trim()).pop() ?? "")
+                : null;
 
               return (
                 <div
-                  key={`${planId}:${run.runId}`}
-                  className="rounded-xl p-3 flex flex-col gap-2.5"
+                  key={statKey}
+                  className="rounded-xl p-4 flex flex-col gap-3"
                   style={{
                     border: `1px solid ${isDiffOpen ? "#52525b" : "#27272a"}`,
                     background: isDiffOpen ? "#1c1c1e" : "#111113",
                     transition: "border-color 0.15s, background 0.15s",
                   }}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="text-xs font-medium text-zinc-200 font-mono truncate">{run.runId}</p>
-                      <p className="text-[10px] text-zinc-600 mt-0.5 truncate">{planId}</p>
-                    </div>
+                  {/* Goal — headline */}
+                  {run.goal ? (
+                    <p className="text-[13px] font-semibold text-zinc-100 leading-snug">{run.goal}</p>
+                  ) : (
+                    <p className="text-[13px] text-zinc-600 italic">Untitled run</p>
+                  )}
+
+                  {/* Summary paragraph */}
+                  {run.summary ? (
+                    <p className="text-[12px] text-zinc-400 leading-relaxed">{run.summary}</p>
+                  ) : (
+                    <p className="text-[11px] text-zinc-700 italic">No summary yet</p>
+                  )}
+
+                  {/* Stat · chip · cost */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {statLine && (
+                      <span className="text-[10px] text-zinc-600 font-mono">{statLine}</span>
+                    )}
                     <HStatusChip status={run.status} />
+                    <span className="text-[11px] text-zinc-500 tabular-nums">{costStr}</span>
                   </div>
 
-                  <div className="flex items-center gap-3 flex-wrap">
-                    {totalSteps > 0 && (
-                      <span className="text-[11px]">
-                        <span className="text-emerald-400 font-medium tabular-nums">{greenSteps}</span>
-                        <span className="text-zinc-600 tabular-nums">/{totalSteps}</span>
-                        <span className="text-zinc-600 ml-0.5">green</span>
-                      </span>
-                    )}
-                    <span className="text-[11px] text-zinc-500 tabular-nums">{costStr}</span>
-                    {branchShort && (
-                      <span className="text-[10px] text-zinc-700 font-mono truncate">{branchShort}</span>
+                  {/* run_id + branch — de-emphasized */}
+                  <div className="flex items-center gap-2 flex-wrap -mt-1">
+                    <span className="text-[10px] text-zinc-700 font-mono">{run.runId}</span>
+                    {run.branch && (
+                      <span className="text-[10px] text-zinc-800 font-mono">{run.branch.replace(/^antfarm\//, "")}</span>
                     )}
                   </div>
 
@@ -1367,7 +1395,7 @@ function AgentsView() {
                   )}
 
                   {(showDiff || showMerge || showToss || showTakeOver) && (
-                    <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
+                    <div className="flex items-center gap-1.5 flex-wrap">
                       {showDiff && (
                         <button
                           onClick={() => isDiffOpen ? setDiffState(null) : handleDiff(planId, run.runId)}
