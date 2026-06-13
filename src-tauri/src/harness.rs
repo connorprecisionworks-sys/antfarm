@@ -6,7 +6,7 @@
 //     loop); reconcile_orphans() sweeps "running" entries on fresh startup.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -59,12 +59,16 @@ pub struct PlanDefaults {
     pub permission_mode: String,
 }
 
+fn default_max_parallel() -> u32 { 3 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NightPlan {
     pub plan_id: String,
     pub armed: bool,
     pub budgets: Budgets,
     pub defaults: PlanDefaults,
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: u32,
     pub runs: Vec<RunSpec>,
 }
 
@@ -426,136 +430,232 @@ pub fn reconcile_orphans() {
 
 // ── The night executor ────────────────────────────────────────────────────────
 
+fn execute_run(
+    app: &AppHandle,
+    claude: &str,
+    run: &RunSpec,
+    budgets: &Budgets,
+    defaults: &PlanDefaults,
+    shared: &Arc<Mutex<PlanState>>,
+    git_lock: &Arc<Mutex<()>>,
+    aborts: &Arc<Mutex<HashMap<String, bool>>>,
+    plan_id: &str,
+) {
+    // Night budget gate: if already at/over budget, mark budget_skip and return.
+    {
+        let mut guard = shared.lock().unwrap();
+        if guard.cost_usd >= budgets.per_night_usd {
+            guard.runs.push(RunState {
+                run_id: run.run_id.clone(), status: "budget_skip".into(), ..Default::default()
+            });
+            save_state(&*guard);
+            return;
+        }
+    }
+
+    let slug = Path::new(&run.project_path).file_name()
+        .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+
+    // Serialize worktree creation — concurrent `git worktree add` races on .git metadata.
+    let worktree_result = {
+        let _git = git_lock.lock().unwrap();
+        create_worktree(&run.project_path, &run.run_id)
+            .and_then(|r| { write_allowlist(&r.0, &slug)?; Ok(r) })
+    };
+    let (wt, branch, base) = match worktree_result {
+        Ok(r) => r,
+        Err(e) => {
+            let mut guard = shared.lock().unwrap();
+            guard.runs.push(RunState {
+                run_id: run.run_id.clone(),
+                status: format!("setup_failed: {e}"),
+                ..Default::default()
+            });
+            save_state(&*guard);
+            return;
+        }
+    };
+
+    if let Some(setup) = &run.setup { run_accept(&wt, setup); }
+
+    let mut rs = RunState {
+        run_id: run.run_id.clone(), status: "running".into(),
+        worktree: wt.clone(), branch, base_commit: base,
+        goal: run.goal.clone(),
+        ..Default::default()
+    };
+    {
+        let mut guard = shared.lock().unwrap();
+        save_state_with(&mut guard, &rs);
+    }
+
+    let mut prev_tail = String::from("(first step)");
+    let mut run_failed = false;
+
+    for (i, step) in run.steps.iter().enumerate() {
+        // Push the step as "running" before the attempt loop so a crash
+        // during execution leaves an honest status in state.json.
+        rs.steps.push(StepState {
+            step_id: step.id.clone(), status: "running".into(),
+            prompt: step.prompt.clone(),
+            ..Default::default()
+        });
+        let si = rs.steps.len() - 1;
+
+        if run_failed && run.on_fail.as_deref().unwrap_or("stop_run") == "stop_run" {
+            rs.steps[si].status = "skipped".into();
+            let mut guard = shared.lock().unwrap();
+            save_state_with(&mut guard, &rs);
+            continue;
+        }
+
+        let night_over = shared.lock().unwrap().cost_usd >= budgets.per_night_usd;
+        if night_over || rs.cost_usd >= budgets.per_run_usd {
+            rs.steps[si].status = "budget_skip".into();
+            let mut guard = shared.lock().unwrap();
+            save_state_with(&mut guard, &rs);
+            continue;
+        }
+
+        {
+            let mut guard = shared.lock().unwrap();
+            save_state_with(&mut guard, &rs);  // step visible as "running" on disk
+        }
+
+        let max_attempts = step.max_attempts.unwrap_or(defaults.max_attempts);
+        let mut fail_output: Option<String> = None;
+
+        for attempt in 1..=max_attempts {
+            rs.steps[si].attempts = attempt;
+            let prompt = build_step_prompt(run, step, i, &wt, &prev_tail, fail_output.as_deref());
+            let outcome = run_step_process(
+                app, claude, &wt, &prompt,
+                step.model.as_deref().unwrap_or(&defaults.model),
+                &defaults.permission_mode,
+                Duration::from_secs(defaults.max_wall_minutes * 60),
+                Duration::from_secs(defaults.silence_minutes * 60),
+                budgets.per_step_usd,
+                aborts, plan_id,
+            ).unwrap_or_default();
+
+            // PID captured immediately after spawn; persist to state.
+            rs.steps[si].pid = outcome.pid;
+            rs.steps[si].session_id = outcome.session_id.clone()
+                .or_else(|| rs.steps[si].session_id.clone());
+            rs.steps[si].permission_denials += outcome.permission_denials;
+
+            // Cost: update local per-run counter, then lock to add night delta + save.
+            rs.steps[si].cost_usd += outcome.cost_usd;
+            rs.cost_usd += outcome.cost_usd;
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.cost_usd += outcome.cost_usd;
+                save_state_with(&mut guard, &rs);
+            }
+
+            if let Some(reason) = outcome.killed_reason {
+                rs.steps[si].status = reason; run_failed = true; break;
+            }
+
+            let (passed, tail) = run_accept(&wt, &step.accept);
+            rs.steps[si].accept_output_tail = Some(tail.clone());
+            if passed {
+                checkpoint(&wt, &step.id);
+                rs.steps[si].status = "green".into();
+                prev_tail = outcome.result_tail;
+                break;
+            }
+            if outcome.permission_denials > 0 {
+                rs.steps[si].status = "blocked".into(); run_failed = true; break;
+            }
+            reset_to_checkpoint(&wt);
+            fail_output = Some(tail);
+            if attempt == max_attempts {
+                rs.steps[si].status = "failed".into(); run_failed = true;
+            }
+        }
+        {
+            let mut guard = shared.lock().unwrap();
+            save_state_with(&mut guard, &rs);
+        }
+    }
+
+    let any_green = rs.steps.iter().any(|s| s.status == "green");
+    if any_green && !rs.base_commit.is_empty() {
+        let (summ, summ_cost) = summarize_run(claude, &rs.worktree, &rs.base_commit, &run.goal);
+        rs.summary = summ;
+        rs.cost_usd += summ_cost;
+        let mut guard = shared.lock().unwrap();
+        guard.cost_usd += summ_cost;
+        // fall through — final status save below captures everything
+    }
+    rs.status = if run_failed { "failed".into() } else { "done".into() };
+    {
+        let mut guard = shared.lock().unwrap();
+        save_state_with(&mut guard, &rs);
+    }
+}
+
 pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
                     aborts: Arc<Mutex<HashMap<String, bool>>>) {
     std::thread::spawn(move || {
-        let mut st = PlanState {
-            plan_id: plan.plan_id.clone(), status: "running".into(),
+        let plan_id = plan.plan_id.clone();
+        let budgets = plan.budgets;
+        let defaults = plan.defaults;
+        let max_parallel = plan.max_parallel.max(1) as usize;
+        let queue: Arc<Mutex<VecDeque<RunSpec>>> =
+            Arc::new(Mutex::new(plan.runs.into_iter().collect()));
+
+        let shared = Arc::new(Mutex::new(PlanState {
+            plan_id: plan_id.clone(), status: "running".into(),
             ..Default::default()
-        };
-        save_state(&st);
-        let caffeinate = Command::new("caffeinate").args(["-i", "-s"]).spawn().ok();
-
-        for run in &plan.runs {
-            if st.cost_usd >= plan.budgets.per_night_usd {
-                st.runs.push(RunState { run_id: run.run_id.clone(), status: "budget_skip".into(), ..Default::default() });
-                save_state(&st);
-                continue;
-            }
-            let slug = Path::new(&run.project_path).file_name()
-                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-
-            let (wt, branch, base) = match create_worktree(&run.project_path, &run.run_id)
-                .and_then(|r| { write_allowlist(&r.0, &slug)?; Ok(r) }) {
-                Ok(r) => r,
-                Err(e) => {
-                    st.runs.push(RunState { run_id: run.run_id.clone(), status: format!("setup_failed: {e}"), ..Default::default() });
-                    save_state(&st);
-                    continue;
-                }
-            };
-            if let Some(setup) = &run.setup { run_accept(&wt, setup); }
-
-            let mut rs = RunState {
-                run_id: run.run_id.clone(), status: "running".into(),
-                worktree: wt.clone(), branch, base_commit: base,
-                goal: run.goal.clone(),
-                ..Default::default()
-            };
-            save_state_with(&mut st, &rs);
-
-            let mut prev_tail = String::from("(first step)");
-            let mut run_failed = false;
-
-            for (i, step) in run.steps.iter().enumerate() {
-                // Push the step as "running" before the attempt loop so a crash
-                // during execution leaves an honest status in state.json.
-                rs.steps.push(StepState {
-                    step_id: step.id.clone(), status: "running".into(),
-                    prompt: step.prompt.clone(),
-                    ..Default::default()
-                });
-                let si = rs.steps.len() - 1;
-
-                if run_failed && run.on_fail.as_deref().unwrap_or("stop_run") == "stop_run" {
-                    rs.steps[si].status = "skipped".into();
-                    save_state_with(&mut st, &rs);
-                    continue;
-                }
-                if st.cost_usd >= plan.budgets.per_night_usd || rs.cost_usd >= plan.budgets.per_run_usd {
-                    rs.steps[si].status = "budget_skip".into();
-                    save_state_with(&mut st, &rs);
-                    continue;
-                }
-
-                save_state_with(&mut st, &rs);  // step visible as "running" on disk
-
-                let max_attempts = step.max_attempts.unwrap_or(plan.defaults.max_attempts);
-                let mut fail_output: Option<String> = None;
-
-                for attempt in 1..=max_attempts {
-                    rs.steps[si].attempts = attempt;
-                    let prompt = build_step_prompt(run, step, i, &wt, &prev_tail, fail_output.as_deref());
-                    let outcome = run_step_process(
-                        &app, &claude, &wt, &prompt,
-                        step.model.as_deref().unwrap_or(&plan.defaults.model),
-                        &plan.defaults.permission_mode,
-                        Duration::from_secs(plan.defaults.max_wall_minutes * 60),
-                        Duration::from_secs(plan.defaults.silence_minutes * 60),
-                        plan.budgets.per_step_usd,
-                        &aborts, &plan.plan_id,
-                    ).unwrap_or_default();
-
-                    // PID captured in outcome immediately after spawn; persist it.
-                    rs.steps[si].pid = outcome.pid;
-                    rs.steps[si].cost_usd += outcome.cost_usd;
-                    rs.cost_usd += outcome.cost_usd;
-                    st.cost_usd += outcome.cost_usd;
-                    rs.steps[si].session_id = outcome.session_id.clone()
-                        .or_else(|| rs.steps[si].session_id.clone());
-                    rs.steps[si].permission_denials += outcome.permission_denials;
-
-                    if let Some(reason) = outcome.killed_reason {
-                        rs.steps[si].status = reason; run_failed = true; break;
-                    }
-
-                    let (passed, tail) = run_accept(&wt, &step.accept);
-                    rs.steps[si].accept_output_tail = Some(tail.clone());
-                    if passed {
-                        checkpoint(&wt, &step.id);
-                        rs.steps[si].status = "green".into();
-                        prev_tail = outcome.result_tail;
-                        break;
-                    }
-                    if outcome.permission_denials > 0 {
-                        rs.steps[si].status = "blocked".into(); run_failed = true; break;
-                    }
-                    reset_to_checkpoint(&wt);
-                    fail_output = Some(tail);
-                    if attempt == max_attempts {
-                        rs.steps[si].status = "failed".into(); run_failed = true;
-                    }
-                }
-                save_state_with(&mut st, &rs);
-            }
-
-            let any_green = rs.steps.iter().any(|s| s.status == "green");
-            if any_green && !rs.base_commit.is_empty() {
-                let (summ, summ_cost) = summarize_run(&claude, &rs.worktree, &rs.base_commit, &run.goal);
-                rs.summary = summ;
-                rs.cost_usd += summ_cost;
-                st.cost_usd += summ_cost;
-            }
-            rs.status = if run_failed { "failed".into() } else { "done".into() };
-            save_state_with(&mut st, &rs);
+        }));
+        {
+            let guard = shared.lock().unwrap();
+            save_state(&*guard);
         }
 
-        st.status = if *aborts.lock().unwrap().get(&plan.plan_id).unwrap_or(&false)
-            { "aborted".into() } else { "done".into() };
-        save_state(&st);
+        let caffeinate = Command::new("caffeinate").args(["-i", "-s"]).spawn().ok();
+        let git_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        let mut handles = Vec::with_capacity(max_parallel);
+        for _ in 0..max_parallel {
+            let app = app.clone();
+            let claude = claude.clone();
+            let budgets = budgets.clone();
+            let defaults = defaults.clone();
+            let shared = shared.clone();
+            let git_lock = git_lock.clone();
+            let aborts = aborts.clone();
+            let plan_id = plan_id.clone();
+            let queue = queue.clone();
+
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    let run = { queue.lock().unwrap().pop_front() };
+                    match run {
+                        None => break,
+                        Some(run) => execute_run(
+                            &app, &claude, &run, &budgets, &defaults,
+                            &shared, &git_lock, &aborts, &plan_id,
+                        ),
+                    }
+                }
+            }));
+        }
+
+        for h in handles { h.join().ok(); }
+
+        let aborted = *aborts.lock().unwrap().get(&plan_id).unwrap_or(&false);
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.status = if aborted { "aborted".into() } else { "done".into() };
+            save_state(&*guard);
+        }
+
         if let Some(mut c) = caffeinate { c.kill().ok(); }
         app.emit("antfarm-harness-event", serde_json::json!({
-            "planId": plan.plan_id, "kind": "plan_done"
+            "planId": plan_id, "kind": "plan_done"
         })).ok();
     });
 }
@@ -724,6 +824,7 @@ pub fn dev_test_3step_fail(app: AppHandle, state: State<'_, HarnessState>,
         armed: true,
         budgets: Budgets { per_step_usd: 0.50, per_run_usd: 2.0, per_night_usd: 5.0 },
         defaults: haiku_defaults(),
+        max_parallel: 1,
         runs: vec![RunSpec {
             run_id: run_id.clone(),
             project_path: antfarm,
@@ -759,6 +860,7 @@ pub fn dev_test_budget_gate(app: AppHandle, state: State<'_, HarnessState>,
         // After step 1 completes, st.cost_usd > 0.00001 so step 2 gets budget_skip.
         budgets: Budgets { per_step_usd: 1.0, per_run_usd: 1.0, per_night_usd: 0.00001 },
         defaults: haiku_defaults(),
+        max_parallel: 1,
         runs: vec![RunSpec {
             run_id: run_id.clone(),
             project_path: antfarm,
@@ -789,6 +891,7 @@ pub fn dev_test_harness(app: AppHandle, state: State<'_, HarnessState>,
         plan_id: plan_id.clone(),
         armed: true,
         budgets: Budgets { per_step_usd: 2.0, per_run_usd: 5.0, per_night_usd: 10.0 },
+        max_parallel: 1,
         defaults: PlanDefaults {
             model: "claude-sonnet-4-6".into(),
             max_wall_minutes: 15,
@@ -816,6 +919,48 @@ pub fn dev_test_harness(app: AppHandle, state: State<'_, HarnessState>,
     state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
     execute_plan(app, claude, plan, state.aborts.clone());
     Ok(format!("H1 plan started — plan_id={plan_id} run_id={run_id}"))
+}
+
+/// Phase B live verification: max_parallel:2 with two independent trivial runs.
+/// Invoke from devtools: __TAURI__.core.invoke("dev_test_parallel")
+/// Expected: both runs show "running" simultaneously in the Agents view.
+#[tauri::command]
+pub fn dev_test_parallel(app: AppHandle, state: State<'_, HarnessState>,
+                          dispatch: State<'_, crate::dispatch::DispatchState>)
+                          -> Result<String, String> {
+    let antfarm = home().join("Desktop/antfarm").to_string_lossy().into_owned();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let plan_id = format!("dev-parallel-{ts}");
+    let plan = NightPlan {
+        plan_id: plan_id.clone(),
+        armed: true,
+        budgets: Budgets { per_step_usd: 0.50, per_run_usd: 2.0, per_night_usd: 5.0 },
+        defaults: haiku_defaults(),
+        max_parallel: 2,
+        runs: vec![
+            RunSpec {
+                run_id: format!("run-par-a-{ts}"),
+                project_path: antfarm.clone(),
+                goal: "Parallel run A — Phase B concurrency verification".into(),
+                setup: Some("true".into()),
+                on_fail: None,
+                steps: vec![trivial_step("step-a1", "true", 1)],
+            },
+            RunSpec {
+                run_id: format!("run-par-b-{ts}"),
+                project_path: antfarm,
+                goal: "Parallel run B — Phase B concurrency verification".into(),
+                setup: Some("true".into()),
+                on_fail: None,
+                steps: vec![trivial_step("step-b1", "true", 1)],
+            },
+        ],
+    };
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
+    execute_plan(app, claude, plan, state.aborts.clone());
+    Ok(format!("parallel plan started — plan_id={plan_id}"))
 }
 
 // ── Small lookups ─────────────────────────────────────────────────────────────
