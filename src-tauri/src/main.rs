@@ -1880,6 +1880,7 @@ fn main() {
     let pty_map   = Arc::clone(&pty_state.0);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(events_state)
         .manage(dispatch_state)
         .manage(pty_state)
