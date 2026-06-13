@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dispatch;
+mod harness;
 mod pty;
 
 use chrono::{Datelike, Local, Timelike, Weekday};
@@ -1876,6 +1877,8 @@ fn main() {
     let dispatch_state  = dispatch::DispatchState::default();
     let dispatch_claude = dispatch_state.claude_path.clone();
 
+    let harness_state = harness::HarnessState::default();
+
     let pty_state = pty::PtyState::default();
     let pty_map   = Arc::clone(&pty_state.0);
 
@@ -1883,6 +1886,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(events_state)
         .manage(dispatch_state)
+        .manage(harness_state)
         .manage(pty_state)
         .setup(move |app| {
             // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
@@ -1917,6 +1921,15 @@ fn main() {
             dispatch::list_runs,
             dispatch::kill_run,
             dispatch::take_over_run,
+            harness::arm_night_plan,
+            harness::abort_night_plan,
+            harness::list_plan_states,
+            harness::harness_run_diff,
+            harness::accept_run,
+            harness::reject_run,
+            harness::take_over_overnight_run,
+            harness::list_stale_worktrees,
+            harness::dev_test_harness,
             load_workspaces,
             save_workspaces,
             pty::spawn_pty,

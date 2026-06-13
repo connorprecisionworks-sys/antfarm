@@ -303,27 +303,17 @@ pub fn kill_run(state: State<'_, DispatchState>, run_id: String) -> Result<(), S
     }
 }
 
-#[tauri::command]
-pub fn take_over_run(run_id: String) -> Result<(), String> {
-    let rec: RunRecord = std::fs::read_to_string(runs_dir().join(format!("{run_id}.json")))
-        .map_err(|e| format!("run not found: {e}"))
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
-
-    let sid = rec.session_id
-        .ok_or_else(|| "session_id not yet captured for this run".to_string())?;
-
-    // Open macOS Terminal at the run's cwd and resume the session.
-    // Feed via stdin to avoid shell-escaping the outer layer; AppleScript
-    // `quoted form of` handles spaces and special chars in the path.
+/// Open macOS Terminal at `cwd` and resume a claude session by `sid`.
+/// Shared by take_over_run (dispatch) and take_over_overnight_run (harness).
+pub fn open_terminal_resume(cwd: &str, sid: &str) -> Result<(), String> {
     let script = format!(
         "tell application \"Terminal\"\n\
          do script (\"cd \" & quoted form of {cwd:?} & \" && claude --resume {sid}\")\n\
          activate\n\
          end tell",
-        cwd = rec.effective_cwd,
+        cwd = cwd,
         sid = sid,
     );
-
     use std::io::Write;
     let mut child = Command::new("osascript")
         .stdin(Stdio::piped())
@@ -333,4 +323,14 @@ pub fn take_over_run(run_id: String) -> Result<(), String> {
         w.write_all(script.as_bytes()).ok();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn take_over_run(run_id: String) -> Result<(), String> {
+    let rec: RunRecord = std::fs::read_to_string(runs_dir().join(format!("{run_id}.json")))
+        .map_err(|e| format!("run not found: {e}"))
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
+    let sid = rec.session_id
+        .ok_or_else(|| "session_id not yet captured for this run".to_string())?;
+    open_terminal_resume(&rec.effective_cwd, &sid)
 }
