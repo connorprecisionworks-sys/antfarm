@@ -148,13 +148,35 @@ fn create_worktree(repo: &str, run_id: &str) -> Result<(String, String, String),
     Ok((wt, branch, base))
 }
 
+fn exclude_from_worktree_git(worktree: &str, pattern: &str) -> Result<(), String> {
+    let exclude_path = git(worktree, &["rev-parse", "--git-path", "info/exclude"])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("rev-parse --git-path info/exclude failed: {e}"))?;
+    let exclude_path = Path::new(&exclude_path);
+    if let Some(parent) = exclude_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let existing = std::fs::read_to_string(exclude_path).unwrap_or_default();
+    if existing.lines().any(|l| l == pattern) {
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(pattern);
+    content.push('\n');
+    std::fs::write(exclude_path, content).map_err(|e| e.to_string())
+}
+
 fn write_allowlist(worktree: &str, project_slug: &str) -> Result<(), String> {
     let src = home().join(format!(".antfarm/allowlists/{project_slug}.json"));
     let text = std::fs::read_to_string(&src)
         .map_err(|e| format!("allowlist missing for {project_slug}: {e} — refuse to run unattended without one"))?;
     let dir = Path::new(worktree).join(".claude");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("settings.json"), text).map_err(|e| e.to_string())
+    std::fs::write(dir.join("settings.json"), text).map_err(|e| e.to_string())?;
+    exclude_from_worktree_git(worktree, ".claude/settings.json")
 }
 
 fn build_step_prompt(run: &RunSpec, step: &StepSpec, idx: usize, worktree: &str,
