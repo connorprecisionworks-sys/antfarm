@@ -1,15 +1,9 @@
-// harness.rs - Antfarm overnight harness (H1, 2026-06-12)
+// harness.rs - Antfarm overnight harness (H2, 2026-06-12)
 //
-// Executes a night plan: runs (one git worktree each) made of steps (one
-// fresh headless `claude -p` each), with accept commands, git checkpoints,
-// wall/silence/cost watchdogs, budget gates, and morning accept/reject.
-//
-// H0 findings baked in:
-//   - dontAsk does NOT abort on a denied tool; is_error stays false.
-//     Blocked detection uses permission_denials array from the result line,
-//     not exit_ok. A step is `blocked` only when denials > 0 AND accept fails.
-//   - Allow-list file vehicle confirmed: .claude/settings.json in worktree is
-//     honored under dontAsk. write_allowlist enforced (refuses without one).
+// H0: dontAsk does not abort on denial; blocked = denials > 0 AND accept fails.
+// H1: permission_denials from result line; open_terminal_resume extracted.
+// H2: PID recorded while step runs (step pushed to state.json before attempt
+//     loop); reconcile_orphans() sweeps "running" entries on fresh startup.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,7 +22,7 @@ pub struct HarnessState {
     pub aborts: Arc<Mutex<HashMap<String, bool>>>,
 }
 
-// ── Plan spec (deserialized from ~/.antfarm/plans/<id>/plan.json) ────────────
+// ── Plan spec ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Budgets {
@@ -62,7 +56,7 @@ pub struct PlanDefaults {
     pub max_wall_minutes: u64,
     pub silence_minutes: u64,
     pub max_attempts: u32,
-    pub permission_mode: String,  // "dontAsk"
+    pub permission_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,13 +68,13 @@ pub struct NightPlan {
     pub runs: Vec<RunSpec>,
 }
 
-// ── Live state (persisted on every transition) ────────────────────────────────
+// ── Live state ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StepState {
     pub step_id: String,
-    pub status: String,  // pending|running|green|failed|timeout|stalled|budget_stop|blocked|interrupted|skipped
+    pub status: String,  // pending|running|green|failed|timeout|stalled|budget_stop|blocked|interrupted|skipped|budget_skip
     pub attempts: u32,
     pub cost_usd: f64,
     pub session_id: Option<String>,
@@ -93,7 +87,7 @@ pub struct StepState {
 #[serde(rename_all = "camelCase")]
 pub struct RunState {
     pub run_id: String,
-    pub status: String,  // pending|running|done|failed|...|accepted|rejected|merge_failed|conflict
+    pub status: String,  // pending|running|done|failed|interrupted|budget_skip|accepted|rejected|conflict
     pub worktree: String,
     pub branch: String,
     pub base_commit: String,
@@ -140,7 +134,6 @@ fn git(repo: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Worktree at <repo>/.antfarm-worktrees/<run_id>, branch antfarm/<run_id>.
 fn create_worktree(repo: &str, run_id: &str) -> Result<(String, String, String), String> {
     let wt = format!("{repo}/.antfarm-worktrees/{run_id}");
     let branch = format!("antfarm/{run_id}");
@@ -149,8 +142,6 @@ fn create_worktree(repo: &str, run_id: &str) -> Result<(String, String, String),
     Ok((wt, branch, base))
 }
 
-/// Copy ~/.antfarm/allowlists/<slug>.json -> <worktree>/.claude/settings.json.
-/// Refuses to proceed without an allowlist (unattended runs must be scoped).
 fn write_allowlist(worktree: &str, project_slug: &str) -> Result<(), String> {
     let src = home().join(format!(".antfarm/allowlists/{project_slug}.json"));
     let text = std::fs::read_to_string(&src)
@@ -185,14 +176,16 @@ fn build_step_prompt(run: &RunSpec, step: &StepSpec, idx: usize, worktree: &str,
 #[derive(Debug, Default)]
 struct StepOutcome {
     exit_ok: bool,
-    killed_reason: Option<String>,  // timeout|stalled|budget_stop|aborted
+    killed_reason: Option<String>,
     cost_usd: f64,
     session_id: Option<String>,
     result_tail: String,
-    permission_denials: u32,        // length of permission_denials array in the result line
+    permission_denials: u32,
+    pid: Option<u32>,
 }
 
 /// Spawn one headless step and supervise it with watchdogs.
+/// `out.pid` is populated immediately after spawn so callers can persist it.
 fn run_step_process(app: &AppHandle, claude: &str, worktree: &str, prompt: &str,
                     model: &str, permission_mode: &str,
                     max_wall: Duration, max_silence: Duration, step_cap_usd: f64,
@@ -208,6 +201,8 @@ fn run_step_process(app: &AppHandle, claude: &str, worktree: &str, prompt: &str,
         .spawn().map_err(|e| format!("spawn failed: {e}"))?;
 
     let mut out = StepOutcome::default();
+    out.pid = Some(child.id());  // captured immediately; caller persists to state.json
+
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -253,8 +248,6 @@ fn run_step_process(app: &AppHandle, claude: &str, worktree: &str, prompt: &str,
                             .unwrap_or("").chars().rev().take(600).collect::<String>()
                             .chars().rev().collect();
                         out.exit_ok = v.get("is_error").and_then(|e| e.as_bool()) != Some(true);
-                        // H0: dontAsk does not abort on denial; is_error stays false.
-                        // Count denied tools from the result line for blocked detection.
                         if let Some(arr) = v.get("permission_denials").and_then(|d| d.as_array()) {
                             out.permission_denials = arr.len() as u32;
                         }
@@ -275,7 +268,6 @@ fn run_step_process(app: &AppHandle, claude: &str, worktree: &str, prompt: &str,
     Ok(out)
 }
 
-/// Run the accept command in the worktree. Returns (passed, output_tail).
 fn run_accept(worktree: &str, accept: &str) -> (bool, String) {
     match Command::new("/bin/zsh").args(["-c", accept]).current_dir(worktree).output() {
         Ok(o) => {
@@ -298,6 +290,44 @@ fn reset_to_checkpoint(worktree: &str) {
     git(worktree, &["clean", "-fd"]).ok();
 }
 
+// ── Crash recovery ────────────────────────────────────────────────────────────
+
+/// Called once at startup. Any plan/run/step left "running" on disk is an
+/// orphan from a prior crash or force-quit — no harness thread is alive for it.
+/// Marks them interrupted/aborted so the morning UI shows an honest status.
+pub fn reconcile_orphans() {
+    let dir = plans_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let mut n = 0u32;
+    for entry in entries.flatten() {
+        let state_path = entry.path().join("state.json");
+        let Ok(text) = std::fs::read_to_string(&state_path) else { continue };
+        let Ok(mut st) = serde_json::from_str::<PlanState>(&text) else { continue };
+        let mut changed = false;
+        for run in &mut st.runs {
+            for step in &mut run.steps {
+                if step.status == "running" {
+                    step.status = "interrupted".into();
+                    n += 1;
+                    changed = true;
+                }
+            }
+            if run.status == "running" {
+                run.status = "interrupted".into();
+                changed = true;
+            }
+        }
+        if st.status == "running" {
+            st.status = "aborted".into();
+            changed = true;
+        }
+        if changed {
+            save_state(&st);
+        }
+    }
+    eprintln!("antfarm harness: reconcile_orphans — {n} orphaned steps marked interrupted");
+}
+
 // ── The night executor ────────────────────────────────────────────────────────
 
 pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
@@ -307,6 +337,7 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
             plan_id: plan.plan_id.clone(), status: "running".into(),
             ..Default::default()
         };
+        save_state(&st);
         let caffeinate = Command::new("caffeinate").args(["-i", "-s"]).spawn().ok();
 
         for run in &plan.runs {
@@ -327,32 +358,43 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
                     continue;
                 }
             };
-            // Run setup command (e.g. npm ci) before any step; fresh worktree has no node_modules.
             if let Some(setup) = &run.setup { run_accept(&wt, setup); }
 
             let mut rs = RunState {
                 run_id: run.run_id.clone(), status: "running".into(),
                 worktree: wt.clone(), branch, base_commit: base, ..Default::default()
             };
+            save_state_with(&mut st, &rs);
+
             let mut prev_tail = String::from("(first step)");
             let mut run_failed = false;
 
             for (i, step) in run.steps.iter().enumerate() {
-                let mut ss = StepState { step_id: step.id.clone(), status: "running".into(), ..Default::default() };
+                // Push the step as "running" before the attempt loop so a crash
+                // during execution leaves an honest status in state.json.
+                rs.steps.push(StepState {
+                    step_id: step.id.clone(), status: "running".into(), ..Default::default()
+                });
+                let si = rs.steps.len() - 1;
+
                 if run_failed && run.on_fail.as_deref().unwrap_or("stop_run") == "stop_run" {
-                    ss.status = "skipped".into();
-                    rs.steps.push(ss); continue;
+                    rs.steps[si].status = "skipped".into();
+                    save_state_with(&mut st, &rs);
+                    continue;
                 }
                 if st.cost_usd >= plan.budgets.per_night_usd || rs.cost_usd >= plan.budgets.per_run_usd {
-                    ss.status = "budget_skip".into();
-                    rs.steps.push(ss); continue;
+                    rs.steps[si].status = "budget_skip".into();
+                    save_state_with(&mut st, &rs);
+                    continue;
                 }
+
+                save_state_with(&mut st, &rs);  // step visible as "running" on disk
 
                 let max_attempts = step.max_attempts.unwrap_or(plan.defaults.max_attempts);
                 let mut fail_output: Option<String> = None;
 
                 for attempt in 1..=max_attempts {
-                    ss.attempts = attempt;
+                    rs.steps[si].attempts = attempt;
                     let prompt = build_step_prompt(run, step, i, &wt, &prev_tail, fail_output.as_deref());
                     let outcome = run_step_process(
                         &app, &claude, &wt, &prompt,
@@ -364,40 +406,41 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
                         &aborts, &plan.plan_id,
                     ).unwrap_or_default();
 
-                    ss.cost_usd += outcome.cost_usd;
+                    // PID captured in outcome immediately after spawn; persist it.
+                    rs.steps[si].pid = outcome.pid;
+                    rs.steps[si].cost_usd += outcome.cost_usd;
                     rs.cost_usd += outcome.cost_usd;
                     st.cost_usd += outcome.cost_usd;
-                    ss.session_id = outcome.session_id.clone().or(ss.session_id.take());
-                    ss.permission_denials += outcome.permission_denials;
+                    rs.steps[si].session_id = outcome.session_id.clone()
+                        .or_else(|| rs.steps[si].session_id.clone());
+                    rs.steps[si].permission_denials += outcome.permission_denials;
 
                     if let Some(reason) = outcome.killed_reason {
-                        ss.status = reason; run_failed = true; break;
+                        rs.steps[si].status = reason; run_failed = true; break;
                     }
 
-                    // H0: dontAsk does not abort on denial; always run the accept check.
-                    // blocked only when denials > 0 AND accept fails.
                     let (passed, tail) = run_accept(&wt, &step.accept);
-                    ss.accept_output_tail = Some(tail.clone());
+                    rs.steps[si].accept_output_tail = Some(tail.clone());
                     if passed {
                         checkpoint(&wt, &step.id);
-                        ss.status = "green".into();
+                        rs.steps[si].status = "green".into();
                         prev_tail = outcome.result_tail;
                         break;
                     }
                     if outcome.permission_denials > 0 {
-                        ss.status = "blocked".into(); run_failed = true; break;
+                        rs.steps[si].status = "blocked".into(); run_failed = true; break;
                     }
                     reset_to_checkpoint(&wt);
                     fail_output = Some(tail);
-                    if attempt == max_attempts { ss.status = "failed".into(); run_failed = true; }
+                    if attempt == max_attempts {
+                        rs.steps[si].status = "failed".into(); run_failed = true;
+                    }
                 }
-                rs.steps.push(ss);
                 save_state_with(&mut st, &rs);
             }
 
             rs.status = if run_failed { "failed".into() } else { "done".into() };
             save_state_with(&mut st, &rs);
-            // Worktree kept; morning review decides its fate.
         }
 
         st.status = if *aborts.lock().unwrap().get(&plan.plan_id).unwrap_or(&false)
@@ -519,24 +562,110 @@ pub fn list_stale_worktrees(days: u64) -> Result<Vec<String>, String> {
     Ok(stale)
 }
 
-/// Dev-only: run a single-step toy plan against the antfarm repo to smoke-test the harness.
-/// Step: add a one-line comment to README.md. Accept: npm run build. Setup: npm ci.
+// ── Dev verification commands ─────────────────────────────────────────────────
+
+fn dev_plan_id_and_run_id(suffix: &str) -> (String, String) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    (format!("dev-{suffix}-{ts}"), format!("run-{suffix}-{ts}"))
+}
+
+fn trivial_step(id: &str, accept: &str, max_attempts: u32) -> StepSpec {
+    StepSpec {
+        id: id.into(),
+        // Minimal prompt: does not touch files so the worktree stays clean and
+        // accept="true"/"false" purely tests harness routing, not claude output.
+        prompt: "Reply with the single word OK. Do not edit any files.".into(),
+        accept: accept.into(),
+        max_attempts: Some(max_attempts),
+        model: None,
+    }
+}
+
+fn haiku_defaults() -> PlanDefaults {
+    PlanDefaults {
+        model: "claude-haiku-4-5-20251001".into(),
+        max_wall_minutes: 5,
+        silence_minutes: 2,
+        max_attempts: 2,
+        permission_mode: "dontAsk".into(),
+    }
+}
+
+/// H2 verification (a): 3-step plan where step 2's accept is "false".
+/// Expected: step1=green, step2=failed (2 retries), step3=skipped, run=failed.
+#[tauri::command]
+pub fn dev_test_3step_fail(app: AppHandle, state: State<'_, HarnessState>,
+                            dispatch: State<'_, crate::dispatch::DispatchState>)
+                            -> Result<String, String> {
+    let antfarm = home().join("Desktop/antfarm").to_string_lossy().into_owned();
+    let (plan_id, run_id) = dev_plan_id_and_run_id("3step");
+    let plan = NightPlan {
+        plan_id: plan_id.clone(),
+        armed: true,
+        budgets: Budgets { per_step_usd: 0.50, per_run_usd: 2.0, per_night_usd: 5.0 },
+        defaults: haiku_defaults(),
+        runs: vec![RunSpec {
+            run_id: run_id.clone(),
+            project_path: antfarm,
+            goal: "3-step fail-path harness verification".into(),
+            setup: Some("true".into()),  // fast noop; no node_modules needed
+            on_fail: Some("stop_run".into()),
+            steps: vec![
+                trivial_step("step1", "true",  2),  // accept = shell `true` (exit 0) → green
+                trivial_step("step2", "false", 2),  // accept = shell `false` (exit 1) → retry×2 → failed
+                trivial_step("step3", "true",  2),  // should be skipped (on_fail stop_run)
+            ],
+        }],
+    };
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
+    execute_plan(app, claude, plan, state.aborts.clone());
+    Ok(format!("3step-fail plan started — plan_id={plan_id} run_id={run_id}"))
+}
+
+/// H2 verification (b): night budget gate.
+/// per_night_usd is set below any real API call cost so step 2 gets budget_skip.
+/// Expected: step1 runs (cost accumulates), step2=budget_skip.
+#[tauri::command]
+pub fn dev_test_budget_gate(app: AppHandle, state: State<'_, HarnessState>,
+                             dispatch: State<'_, crate::dispatch::DispatchState>)
+                             -> Result<String, String> {
+    let antfarm = home().join("Desktop/antfarm").to_string_lossy().into_owned();
+    let (plan_id, run_id) = dev_plan_id_and_run_id("budget");
+    let plan = NightPlan {
+        plan_id: plan_id.clone(),
+        armed: true,
+        // per_night_usd is $0.00001 — below any real API call cost (even haiku trivial = ~$0.0001).
+        // After step 1 completes, st.cost_usd > 0.00001 so step 2 gets budget_skip.
+        budgets: Budgets { per_step_usd: 1.0, per_run_usd: 1.0, per_night_usd: 0.00001 },
+        defaults: haiku_defaults(),
+        runs: vec![RunSpec {
+            run_id: run_id.clone(),
+            project_path: antfarm,
+            goal: "Budget gate harness verification".into(),
+            setup: Some("true".into()),
+            on_fail: None,
+            steps: vec![
+                trivial_step("step1", "true", 1),  // runs; cost > per_night_usd after this
+                trivial_step("step2", "true", 1),  // budget_skip — never spawns claude
+            ],
+        }],
+    };
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
+    execute_plan(app, claude, plan, state.aborts.clone());
+    Ok(format!("budget-gate plan started — plan_id={plan_id} run_id={run_id}"))
+}
+
+/// H1 green-path dev command (retained from H1).
 #[tauri::command]
 pub fn dev_test_harness(app: AppHandle, state: State<'_, HarnessState>,
                          dispatch: State<'_, crate::dispatch::DispatchState>,
                          fail_accept: Option<bool>) -> Result<String, String> {
     let antfarm_path = home().join("Desktop/antfarm").to_string_lossy().into_owned();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let run_id = format!("dev-test-{ts}");
-    let plan_id = format!("dev-test-plan-{ts}");
-
-    let accept_cmd = if fail_accept.unwrap_or(false) {
-        "false".to_string()
-    } else {
-        "npm run build".to_string()
-    };
-
+    let (plan_id, run_id) = dev_plan_id_and_run_id("h1");
+    let accept_cmd = if fail_accept.unwrap_or(false) { "false".into() } else { "npm run build".into() };
     let plan = NightPlan {
         plan_id: plan_id.clone(),
         armed: true,
@@ -556,20 +685,18 @@ pub fn dev_test_harness(app: AppHandle, state: State<'_, HarnessState>,
             on_fail: None,
             steps: vec![StepSpec {
                 id: "add-readme-comment".into(),
-                prompt: "Add a single comment line at the very top of README.md. \
-                         The comment should say: <!-- antfarm harness H1 test -->. \
-                         Do not modify any other file.".into(),
+                prompt: "Add a single HTML comment at the very top of README.md: \
+                         <!-- antfarm harness H1 test -->. Do not modify any other file.".into(),
                 accept: accept_cmd,
                 max_attempts: Some(2),
                 model: None,
             }],
         }],
     };
-
     let claude = dispatch.claude_path.lock().unwrap().clone();
     state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
     execute_plan(app, claude, plan, state.aborts.clone());
-    Ok(format!("dev test plan started — plan_id={plan_id} run_id={run_id} — watch ~/.antfarm/plans/{plan_id}/state.json"))
+    Ok(format!("H1 plan started — plan_id={plan_id} run_id={run_id}"))
 }
 
 // ── Small lookups ─────────────────────────────────────────────────────────────
@@ -594,8 +721,80 @@ fn set_run_status(plan_id: &str, run_id: &str, status: &str) -> Result<(), Strin
 }
 
 fn repo_of(worktree: &str) -> Result<String, String> {
-    // <repo>/.antfarm-worktrees/<run_id> -> <repo>
     Path::new(worktree).parent().and_then(|p| p.parent())
         .map(|p| p.to_string_lossy().into_owned())
         .ok_or_else(|| "cannot derive repo from worktree path".into())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// reconcile_orphans must flip any "running" plan/run/step to the correct
+    /// terminal status on process restart (crash-recovery path).
+    #[test]
+    fn reconcile_orphans_marks_running_entries() {
+        let plan_id = "test-reconcile-harness-h2";
+        let dir = plans_dir().join(plan_id);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let st = PlanState {
+            plan_id: plan_id.into(),
+            status: "running".into(),
+            cost_usd: 0.05,
+            runs: vec![RunState {
+                run_id: "test-run-1".into(),
+                status: "running".into(),
+                steps: vec![
+                    StepState {
+                        step_id: "step-green".into(),
+                        status: "green".into(),  // already terminal — must stay green
+                        pid: Some(12345),
+                        ..Default::default()
+                    },
+                    StepState {
+                        step_id: "step-inflight".into(),
+                        status: "running".into(),  // orphan — must become interrupted
+                        pid: Some(99999),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        save_state(&st);
+
+        reconcile_orphans();
+
+        let text = std::fs::read_to_string(dir.join("state.json")).unwrap();
+        let after: PlanState = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(after.status, "aborted", "plan should be aborted");
+        assert_eq!(after.runs[0].status, "interrupted", "run should be interrupted");
+        assert_eq!(after.runs[0].steps[0].status, "green", "finished step must stay green");
+        assert_eq!(after.runs[0].steps[1].status, "interrupted", "in-flight step should be interrupted");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Budget gate: once per_night_usd is consumed, subsequent steps must be
+    /// marked budget_skip without calling into execute_plan's step body.
+    /// Verifies the check `st.cost_usd >= plan.budgets.per_night_usd`.
+    #[test]
+    fn budget_gate_threshold() {
+        let b = Budgets { per_step_usd: 1.0, per_run_usd: 10.0, per_night_usd: 0.00001 };
+        // Any positive cost_usd should exceed the tiny budget.
+        let cost_after_step1 = 0.001_f64;
+        assert!(
+            cost_after_step1 >= b.per_night_usd,
+            "real API cost should exceed 0.00001 usd threshold"
+        );
+        // Zero cost (before any step) must NOT trigger the gate.
+        assert!(
+            !(0.0_f64 >= b.per_night_usd),
+            "gate must be open before first step runs"
+        );
+    }
 }

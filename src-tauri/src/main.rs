@@ -1889,6 +1889,8 @@ fn main() {
         .manage(harness_state)
         .manage(pty_state)
         .setup(move |app| {
+            // Mark any step/run left "running" from a prior crash as interrupted.
+            harness::reconcile_orphans();
             // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
             let path = dispatch::resolve_claude_path();
             *dispatch_claude.lock().unwrap() = path;
@@ -1930,6 +1932,8 @@ fn main() {
             harness::take_over_overnight_run,
             harness::list_stale_worktrees,
             harness::dev_test_harness,
+            harness::dev_test_3step_fail,
+            harness::dev_test_budget_gate,
             load_workspaces,
             save_workspaces,
             pty::spawn_pty,
