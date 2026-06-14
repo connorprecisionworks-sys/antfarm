@@ -7,3 +7,5 @@ src-tauri/gen/
 
 # harness worktrees (created by antfarm overnight harness)
 .antfarm-worktrees/
+
+.claude/
