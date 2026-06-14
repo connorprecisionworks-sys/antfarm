@@ -1235,7 +1235,7 @@ function AgentsView() {
       const newStats: Record<string, string> = {};
       await Promise.allSettled(
         ps.flatMap(p => p.runs
-          .filter(r => r.worktree && ["done", "failed", "interrupted", "conflict", "accepted"].includes(r.status))
+          .filter(r => r.worktree && ["done", "failed", "interrupted", "conflict", "accepted", "approved", "flagged"].includes(r.status))
           .map(async r => {
             try {
               const stat = await invoke<string>("harness_run_summary", { planId: p.planId, runId: r.runId });
@@ -1340,9 +1340,9 @@ function AgentsView() {
               const msg = msgs[run.runId];
               const hasWt = !!run.worktree;
               const hasSession = run.steps.some(s => s.sessionId);
-              const reviewable = ["done", "failed", "interrupted", "conflict"].includes(run.status);
+              const reviewable = ["done", "failed", "interrupted", "conflict", "approved", "flagged"].includes(run.status);
               const showDiff = hasWt && (reviewable || run.status === "accepted");
-              const showMerge = run.status === "done" && hasWt;
+              const showMerge = hasWt && ["done", "approved", "flagged"].includes(run.status);
               const showToss = hasWt && reviewable;
               const showTakeOver = reviewable && hasSession;
               const statKey = `${planId}:${run.runId}`;
