@@ -131,6 +131,16 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     .cost { font-size: 11px; color: #71717a; font-variant-numeric: tabular-nums; }
     .run-id { font-size: 10px; color: #3f3f46; font-family: monospace; margin-top: 6px; }
     .empty { padding: 60px 24px; text-align: center; color: #52525b; font-size: 14px; }
+    .actions { display: flex; gap: 8px; margin-top: 10px; }
+    .btn {
+      flex: 1; padding: 9px 0; border: none; border-radius: 9px;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn-merge { background: #3730a3; color: #a5b4fc; }
+    .btn-merge:active { background: #312e81; }
+    .btn-toss { background: #27272a; color: #a1a1aa; }
+    .btn-toss:active { background: #3f3f46; }
 
     /* Diff overlay */
     #overlay {
@@ -229,11 +239,18 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         return;
       }
 
+      const DONE = new Set(['accepted', 'rejected', 'merged']);
       list.innerHTML = ENTRIES.map(({ run }, i) => {
         const label = run.status.replace(/_/g, ' ');
         const reviewBlock = run.reviewNotes
           ? `<div class="reviewer"><b>Reviewer:</b> ${esc(run.reviewNotes)}</div>`
           : '';
+        const actionable = run.worktree && !DONE.has(run.status);
+        const actionsBlock = actionable ? `
+          <div class="actions">
+            <button class="btn btn-merge" onclick="event.stopPropagation();mergeRun(${i})">Merge</button>
+            <button class="btn btn-toss" onclick="event.stopPropagation();tossRun(${i})">Toss</button>
+          </div>` : '';
         return `<div class="card" onclick="showDiff(${i})">
           <div class="goal">${esc(run.goal || 'Untitled run')}</div>
           ${run.summary ? `<div class="summary">${esc(run.summary)}</div>` : ''}
@@ -243,6 +260,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
             <span class="cost">${fmtCost(run.costUsd)}</span>
           </div>
           <div class="run-id">${esc(run.runId)}</div>
+          ${actionsBlock}
         </div>`;
       }).join('');
     }
@@ -284,6 +302,43 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
     function closeDiff() {
       document.getElementById('overlay').classList.remove('open');
+    }
+
+    // ── Actions ───────────────────────────────────────────────────────────
+    async function mergeRun(i) {
+      const { planId, run } = ENTRIES[i];
+      if (!window.confirm('Merge this run to main?')) return;
+      const url = '/api/merge?plan=' + encodeURIComponent(planId)
+                + '&run=' + encodeURIComponent(run.runId);
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + TOKEN }
+        });
+        const text = await r.text();
+        if (!r.ok) { alert(text); return; }
+        fetchRuns();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
+    async function tossRun(i) {
+      const { planId, run } = ENTRIES[i];
+      if (!window.confirm('Toss this run? This deletes its worktree and branch.')) return;
+      const url = '/api/toss?plan=' + encodeURIComponent(planId)
+                + '&run=' + encodeURIComponent(run.runId);
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + TOKEN }
+        });
+        const text = await r.text();
+        if (!r.ok) { alert(text); return; }
+        fetchRuns();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
     }
 
     fetchRuns();
@@ -349,6 +404,38 @@ pub fn start() {
                     let run = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::harness_run_summary(plan, run) {
                         Ok(s) => respond(request, 200, "text/plain; charset=utf-8", s),
+                        Err(e) => respond(request, 500, "text/plain", e),
+                    }
+                }
+                "/api/merge" => {
+                    if !auth {
+                        respond(request, 401, "text/plain", "401 Unauthorized".into());
+                        continue;
+                    }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
+                        continue;
+                    }
+                    let plan = query_param(&url, "plan").unwrap_or_default();
+                    let run = query_param(&url, "run").unwrap_or_default();
+                    match crate::harness::accept_run(plan, run) {
+                        Ok(msg) => respond(request, 200, "text/plain", msg),
+                        Err(e) => respond(request, 409, "text/plain", e),
+                    }
+                }
+                "/api/toss" => {
+                    if !auth {
+                        respond(request, 401, "text/plain", "401 Unauthorized".into());
+                        continue;
+                    }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
+                        continue;
+                    }
+                    let plan = query_param(&url, "plan").unwrap_or_default();
+                    let run = query_param(&url, "run").unwrap_or_default();
+                    match crate::harness::reject_run(plan, run) {
+                        Ok(()) => respond(request, 200, "text/plain", "tossed".into()),
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }
