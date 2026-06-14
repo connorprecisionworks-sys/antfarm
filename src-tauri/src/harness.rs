@@ -114,6 +114,8 @@ pub struct PlanState {
     pub status: String,  // armed|running|done|aborted|budget_stop
     pub cost_usd: f64,
     pub runs: Vec<RunState>,
+    #[serde(default)]
+    pub updated_at: u64,  // unix secs; always set from file mtime at read time, never trusted from disk
 }
 
 // ── Model tier escalation ─────────────────────────────────────────────────────
@@ -726,8 +728,17 @@ pub fn list_plan_states() -> Result<Vec<PlanState>, String> {
     let mut out = vec![];
     if let Ok(entries) = std::fs::read_dir(plans_dir()) {
         for e in entries.flatten() {
-            if let Ok(text) = std::fs::read_to_string(e.path().join("state.json")) {
-                if let Ok(st) = serde_json::from_str::<PlanState>(&text) { out.push(st); }
+            let state_path = e.path().join("state.json");
+            if let Ok(text) = std::fs::read_to_string(&state_path) {
+                if let Ok(mut st) = serde_json::from_str::<PlanState>(&text) {
+                    st.updated_at = std::fs::metadata(&state_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    out.push(st);
+                }
             }
         }
     }
@@ -1081,6 +1092,7 @@ mod tests {
             plan_id: plan_id.into(),
             status: "running".into(),
             cost_usd: 0.05,
+            updated_at: 0,
             runs: vec![RunState {
                 run_id: "test-run-1".into(),
                 status: "running".into(),

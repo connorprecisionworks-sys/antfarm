@@ -1167,6 +1167,7 @@ interface HPlanState {
   status: string;
   costUsd: number;
   runs: HRunState[];
+  updatedAt: number;
 }
 
 interface RunEntry {
@@ -1215,6 +1216,7 @@ function HStatusChip({ status }: { status: string }) {
 function AgentsView() {
   const [plans, setPlans] = useState<HPlanState[]>([]);
   const [loading, setLoading] = useState(true);
+  const [hideDev, setHideDev] = useState(true);
   const [diffState, setDiffState] = useState<{ planId: string; runId: string; content: string } | null>(null);
   const [staleWorktrees, setStaleWorktrees] = useState<string[]>([]);
   const [msgs, setMsgs] = useState<Record<string, { text: string; error: boolean }>>({});
@@ -1256,13 +1258,10 @@ function AgentsView() {
     return () => { clearInterval(interval); unlisten?.(); };
   }, []);
 
-  function planSortKey(planId: string): number {
-    const m = planId.match(/(\d+)$/);
-    return m ? parseInt(m[1], 10) : 0;
-  }
+  const visiblePlans = hideDev ? plans.filter(p => !p.planId.startsWith("dev-")) : plans;
 
-  const entries: RunEntry[] = plans
-    .flatMap(p => p.runs.map(r => ({ planId: p.planId, run: r, sortKey: planSortKey(p.planId) })))
+  const entries: RunEntry[] = visiblePlans
+    .flatMap(p => p.runs.map(r => ({ planId: p.planId, run: r, sortKey: p.updatedAt })))
     .sort((a, b) => b.sortKey - a.sortKey);
 
   function setMsg(runId: string, text: string, error: boolean) {
@@ -1313,9 +1312,15 @@ function AgentsView() {
         <Monitor size={13} className="text-zinc-500" />
         <span className="text-xs font-semibold text-zinc-300">Agent Runs</span>
         <span className="text-[11px] text-zinc-600">
-          {entries.length} run{entries.length !== 1 ? "s" : ""} across {plans.length} plan{plans.length !== 1 ? "s" : ""}
+          {entries.length} run{entries.length !== 1 ? "s" : ""} across {visiblePlans.length} plan{visiblePlans.length !== 1 ? "s" : ""}
         </span>
-        {loading && <span className="text-[10px] text-zinc-700 animate-pulse ml-auto">loading…</span>}
+        <button
+          onClick={() => setHideDev(h => !h)}
+          className="ml-auto text-[10px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 transition-colors"
+        >
+          {hideDev ? "Hide dev/test" : "Show all"}
+        </button>
+        {loading && <span className="text-[10px] text-zinc-700 animate-pulse">loading…</span>}
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto">
