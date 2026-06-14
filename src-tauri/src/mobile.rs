@@ -143,6 +143,40 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     .btn-toss { background: #27272a; color: #a1a1aa; }
     .btn-toss:active { background: #3f3f46; }
 
+    /* Author section */
+    #author-section { padding: 12px; border-top: 1px solid #27272a; }
+    #author-hdr { font-size: 11px; font-weight: 700; color: #52525b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+    .author-form { display: flex; flex-direction: column; gap: 8px; }
+    .author-form textarea {
+      background: #0d0d0f; border: 1px solid #3f3f46; border-radius: 9px;
+      color: #e4e4e7; font-size: 13px; padding: 10px 12px; resize: vertical;
+      font-family: inherit; outline: none; min-height: 72px;
+    }
+    .author-form textarea:focus { border-color: #6366f1; }
+    .author-form select, .author-form input[type="text"] {
+      background: #0d0d0f; border: 1px solid #3f3f46; border-radius: 9px;
+      color: #e4e4e7; font-size: 13px; padding: 9px 12px; outline: none; width: 100%;
+    }
+    .author-form select:focus, .author-form input[type="text"]:focus { border-color: #6366f1; }
+    .btn-generate {
+      background: #3730a3; color: #a5b4fc; border: none; border-radius: 9px;
+      padding: 11px 0; font-size: 13px; font-weight: 600; cursor: pointer;
+      width: 100%; -webkit-tap-highlight-color: transparent;
+    }
+    .btn-generate:active { background: #312e81; }
+    .btn-generate:disabled { background: #1c1c1e; color: #3f3f46; cursor: default; }
+    .author-result {
+      background: #111113; border: 1px solid #27272a; border-radius: 12px;
+      padding: 12px 14px; margin-top: 8px;
+    }
+    .author-errors { background: #450a0a; border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; }
+    .author-errors div { font-size: 11px; color: #fca5a5; }
+    .author-warnings { background: #1a1207; border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; }
+    .author-warnings div { font-size: 11px; color: #fcd34d; }
+    .author-run { border-top: 1px solid #27272a; padding-top: 8px; margin-top: 8px; }
+    .author-run-goal { font-size: 12px; font-weight: 600; color: #e4e4e7; margin-bottom: 3px; }
+    .author-run-meta { font-size: 10px; color: #52525b; font-family: monospace; }
+
     #plans-section { padding: 12px; border-top: 1px solid #27272a; }
     #plans-hdr { font-size: 11px; font-weight: 700; color: #52525b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
     .plan-card {
@@ -189,6 +223,19 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     <span id="status">connecting…</span>
   </div>
   <div id="list"></div>
+
+  <div id="author-section">
+    <div id="author-hdr">Author a plan</div>
+    <div class="author-form">
+      <textarea id="author-desc" placeholder="Describe what you want the agent to build…" rows="3"></textarea>
+      <select id="author-project">
+        <option value="">— pick project —</option>
+      </select>
+      <input type="text" id="author-path" placeholder="or paste a repo path">
+      <button class="btn-generate" id="btn-generate" onclick="generatePlan()" disabled>Generate plan</button>
+    </div>
+    <div id="author-result-area"></div>
+  </div>
 
   <div id="plans-section">
     <div id="plans-hdr">Start a run</div>
@@ -366,6 +413,116 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     fetchRuns();
     setInterval(fetchRuns, 5000);
 
+    // ── Author a plan ──────────────────────────────────────────────────────
+    async function fetchProjects() {
+      try {
+        const r = await fetch('/api/projects', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+        if (!r.ok) return;
+        const projs = await r.json();
+        const sel = document.getElementById('author-project');
+        projs.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.path;
+          opt.textContent = p.name;
+          sel.appendChild(opt);
+        });
+      } catch (e) { /* ignore */ }
+    }
+
+    function updateGenerateBtn() {
+      const desc = document.getElementById('author-desc').value.trim();
+      const proj = document.getElementById('author-project').value;
+      const path = document.getElementById('author-path').value.trim();
+      document.getElementById('btn-generate').disabled = !desc || (!proj && !path);
+    }
+
+    document.getElementById('author-desc').addEventListener('input', updateGenerateBtn);
+    document.getElementById('author-project').addEventListener('change', updateGenerateBtn);
+    document.getElementById('author-path').addEventListener('input', updateGenerateBtn);
+
+    async function generatePlan() {
+      const desc = document.getElementById('author-desc').value.trim();
+      const proj = document.getElementById('author-project').value;
+      const manualPath = document.getElementById('author-path').value.trim();
+      const projectPath = proj || manualPath;
+      if (!desc || !projectPath) return;
+
+      const btn = document.getElementById('btn-generate');
+      btn.disabled = true;
+      btn.textContent = 'Generating… (~30s)';
+      document.getElementById('author-result-area').innerHTML = '';
+
+      try {
+        const r = await fetch('/api/author', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ description: desc, projectPath }),
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          document.getElementById('author-result-area').innerHTML =
+            `<div class="author-result"><div class="author-errors"><div>${esc(text)}</div></div></div>`;
+          return;
+        }
+        renderAuthorResult(JSON.parse(text));
+      } catch (e) {
+        document.getElementById('author-result-area').innerHTML =
+          `<div class="author-result"><div class="author-errors"><div>${esc(e.message)}</div></div></div>`;
+      } finally {
+        btn.textContent = 'Generate plan';
+        updateGenerateBtn();
+      }
+    }
+
+    function renderAuthorResult(result) {
+      const v = result.validation;
+      const s = v.summary;
+      let html = '<div class="author-result">';
+      html += `<div style="font-size:11px;font-weight:600;color:#a1a1aa;margin-bottom:8px">${esc(s.planId)} · ${s.runCount} run${s.runCount !== 1 ? 's' : ''} · $${s.perNightUsd ? s.perNightUsd.toFixed(2) : '?'} night cap</div>`;
+      if (v.errors && v.errors.length) {
+        html += `<div class="author-errors">${v.errors.map(e => `<div>${esc(e)}</div>`).join('')}</div>`;
+      }
+      if (v.warnings && v.warnings.length) {
+        html += `<div class="author-warnings">${v.warnings.map(w => `<div>${esc(w)}</div>`).join('')}</div>`;
+      }
+      if (s.runs && s.runs.length) {
+        s.runs.forEach(run => {
+          html += `<div class="author-run"><div class="author-run-goal">${esc(run.goal)}</div><div class="author-run-meta">${esc(run.projectPath)}${run.pathExists ? (run.isGit ? ' · git' : ' · no git') : ' · ⚠ missing'}</div></div>`;
+        });
+      }
+      if (v.ok) {
+        const escapedPath = result.planPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        html += `<button class="btn-arm" style="margin-top:10px" onclick="armAuthoredPlan('${escapedPath}')">Arm &amp; start</button>`;
+      }
+      html += '</div>';
+      document.getElementById('author-result-area').innerHTML = html;
+    }
+
+    async function armAuthoredPlan(planPath) {
+      if (!window.confirm('Arm and start this plan?')) return;
+      try {
+        const r = await fetch('/api/arm', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: planPath }),
+        });
+        const text = await r.text();
+        if (!r.ok) { alert('Error: ' + text); return; }
+        document.getElementById('author-result-area').innerHTML = '';
+        document.getElementById('author-desc').value = '';
+        document.getElementById('author-project').selectedIndex = 0;
+        document.getElementById('author-path').value = '';
+        updateGenerateBtn();
+        alert('Armed! Plan started.');
+        fetchRuns();
+        fetchPlans();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
+    fetchProjects();
+
     async function fetchPlans() {
       try {
         const r = await fetch('/api/plans', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
@@ -502,6 +659,64 @@ pub fn start(app: tauri::AppHandle) {
                     let run = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::reject_run(plan, run) {
                         Ok(()) => respond(request, 200, "text/plain", "tossed".into()),
+                        Err(e) => respond(request, 500, "text/plain", e),
+                    }
+                }
+                "/api/projects" => {
+                    if !auth {
+                        respond(request, 401, "text/plain", "401 Unauthorized".into());
+                        continue;
+                    }
+                    let projects = crate::list_projects_pub();
+                    let mut result: Vec<serde_json::Value> = Vec::new();
+                    for proj in projects {
+                        let paths = crate::get_project_paths_pub(proj.slug.clone());
+                        if let Some(first) = paths.first() {
+                            result.push(serde_json::json!({
+                                "slug": proj.slug,
+                                "name": proj.name,
+                                "path": first.path,
+                            }));
+                        }
+                    }
+                    let json = serde_json::to_string(&result).unwrap_or_else(|_| "[]".into());
+                    respond(request, 200, "application/json", json);
+                }
+                "/api/author" => {
+                    if !auth {
+                        respond(request, 401, "text/plain", "401 Unauthorized".into());
+                        continue;
+                    }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
+                        continue;
+                    }
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+                    let description = parsed.as_ref()
+                        .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()))
+                        .filter(|s| !s.trim().is_empty());
+                    let project_path = parsed.as_ref()
+                        .and_then(|v| v.get("projectPath").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                        .filter(|s| !s.trim().is_empty());
+                    let (desc, proj_path) = match (description, project_path) {
+                        (Some(d), Some(p)) => (d, p),
+                        _ => {
+                            respond(request, 400, "text/plain", "missing description or projectPath".into());
+                            continue;
+                        }
+                    };
+                    let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
+                    let claude = dispatch.claude_path.lock().unwrap().clone();
+                    drop(dispatch);
+                    match crate::harness::author_plan_core(claude, desc, proj_path) {
+                        Ok(result) => {
+                            match serde_json::to_string(&result) {
+                                Ok(json) => respond(request, 200, "application/json", json),
+                                Err(e) => respond(request, 500, "text/plain", e.to_string()),
+                            }
+                        }
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }

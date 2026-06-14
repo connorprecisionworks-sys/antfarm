@@ -278,14 +278,14 @@ fn extract_status(readme: &Path) -> Option<String> {
 // ── Project list command ──────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Project {
-    slug: String,
-    name: String,
-    status: Option<String>,
-    last_activity: Option<u64>,
-    idea_count: usize,
-    decision_count: usize,
-    repos: Vec<String>,
+pub struct Project {
+    pub slug: String,
+    pub name: String,
+    pub status: Option<String>,
+    pub last_activity: Option<u64>,
+    pub idea_count: usize,
+    pub decision_count: usize,
+    pub repos: Vec<String>,
 }
 
 #[tauri::command]
@@ -1793,9 +1793,9 @@ fn save_workspaces(workspaces: Vec<WorkspaceEntry>) -> Result<(), String> {
 // ── Project path resolution for dispatch ─────────────────────────────────────
 
 #[derive(Serialize)]
-struct RepoPath {
-    repo: String,
-    path: String,
+pub struct RepoPath {
+    pub repo: String,
+    pub path: String,
 }
 
 #[tauri::command]
@@ -1815,6 +1815,9 @@ fn get_project_paths(slug: String) -> Vec<RepoPath> {
         })
         .collect()
 }
+
+pub fn list_projects_pub() -> Vec<Project> { list_projects() }
+pub fn get_project_paths_pub(slug: String) -> Vec<RepoPath> { get_project_paths(slug) }
 
 // ── Slash commands / Skills discovery ────────────────────────────────────────
 

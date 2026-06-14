@@ -1103,14 +1103,7 @@ Rules:
 - Split into multiple runs only when chunks are genuinely independent and could run in parallel; otherwise one run with ordered steps.
 Output ONLY the JSON object."#;
 
-#[tauri::command]
-pub fn author_plan(
-    _app: AppHandle,
-    dispatch: State<'_, crate::dispatch::DispatchState>,
-    description: String,
-    project_path: String,
-) -> Result<AuthorResult, String> {
-    let claude = dispatch.claude_path.lock().unwrap().clone();
+pub fn author_plan_core(claude: String, description: String, project_path: String) -> Result<AuthorResult, String> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1177,21 +1170,28 @@ pub fn author_plan(
         (Some(start), Some(end)) if end >= start => &stripped[start..=end],
         _ => return Err(format!("author_plan: no JSON object in Opus output; raw: {result_text}")),
     };
-    // Validate the JSON parses
     serde_json::from_str::<serde_json::Value>(json_slice)
         .map_err(|e| format!("author_plan: JSON parse failed ({e}); raw: {result_text}"))?;
 
-    // Write to disk
     let out_dir = plans_authored_dir();
     let plan_path = out_dir.join(format!("{plan_id}.json"));
     std::fs::write(&plan_path, json_slice)
         .map_err(|e| format!("write failed: {e}"))?;
     let plan_path_str = plan_path.to_string_lossy().into_owned();
 
-    // Validate
     let validation = validate_plan_file(plan_path_str.clone())?;
-
     Ok(AuthorResult { plan_path: plan_path_str, validation })
+}
+
+#[tauri::command]
+pub fn author_plan(
+    _app: AppHandle,
+    dispatch: State<'_, crate::dispatch::DispatchState>,
+    description: String,
+    project_path: String,
+) -> Result<AuthorResult, String> {
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    author_plan_core(claude, description, project_path)
 }
 
 #[tauri::command]
