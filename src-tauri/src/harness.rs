@@ -179,6 +179,10 @@ fn create_worktree(repo: &str, run_id: &str) -> Result<(String, String, String),
     let wt = format!("{repo}/.antfarm-worktrees/{run_id}");
     let branch = format!("antfarm/{run_id}");
     let base = git(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    // Clear any stale state from a prior run with the same id so re-runs never collide.
+    git(repo, &["worktree", "remove", "--force", &wt]).ok();
+    git(repo, &["worktree", "prune"]).ok();
+    git(repo, &["branch", "-D", &branch]).ok();
     git(repo, &["worktree", "add", &wt, "-b", &branch])?;
     Ok((wt, branch, base))
 }
@@ -912,7 +916,8 @@ pub fn accept_run(plan_id: String, run_id: String) -> Result<String, String> {
 pub fn reject_run(plan_id: String, run_id: String) -> Result<(), String> {
     let rs = find_run(&plan_id, &run_id)?;
     let repo = repo_of(&rs.worktree)?;
-    git(&repo, &["worktree", "remove", "--force", &rs.worktree])?;
+    git(&repo, &["worktree", "remove", "--force", &rs.worktree]).ok();
+    git(&repo, &["worktree", "prune"]).ok();
     git(&repo, &["branch", "-D", &rs.branch]).ok();
     set_run_status(&plan_id, &run_id, "rejected")
 }
