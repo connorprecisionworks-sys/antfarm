@@ -1944,6 +1944,7 @@ fn main() {
             harness::propose_plan,
             chat::load_chat,
             chat::send_chat_message,
+            chat::build_from_chat,
             chat::arm_chat_plan,
             harness::dev_test_harness,
             harness::dev_test_3step_fail,

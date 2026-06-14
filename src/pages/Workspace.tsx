@@ -1274,6 +1274,7 @@ interface ChatThread {
   key: string;
   projectPath: string;
   messages: ChatMessage[];
+  sessionId?: string;
 }
 
 // ── ChatPlanCard component ─────────────────────────────────────────────────
@@ -1349,6 +1350,7 @@ function ChatView() {
   const [thread, setThread] = useState<ChatThread | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
+  const [buildLoading, setBuildLoading] = useState(false);
   const [planValidations, setPlanValidations] = useState<Record<string, PlanValidation | "loading" | "error">>({});
   const [armErrors, setArmErrors] = useState<Record<string, string>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1432,6 +1434,30 @@ function ChatView() {
     }
   }
 
+  async function handleBuild() {
+    const key = chatKey();
+    if (!key || buildLoading || chatLoading) return;
+    const projectPath = await resolveProjectPath();
+    if (!projectPath) return;
+    setBuildLoading(true);
+    try {
+      const t = await invoke<ChatThread>("build_from_chat", { key, projectPath });
+      setThread(t);
+    } catch (e) {
+      setThread(prev => {
+        if (!prev) return prev;
+        const errMsg: ChatMessage = {
+          id: `err-${Date.now()}`, role: "agent",
+          text: `Build failed: ${String(e)}`,
+          ts: Math.floor(Date.now() / 1000), armed: false,
+        };
+        return { ...prev, messages: [...prev.messages, errMsg] };
+      });
+    } finally {
+      setBuildLoading(false);
+    }
+  }
+
   async function handleArm(msg: ChatMessage) {
     if (!msg.planPath || msg.armed) return;
     const key = chatKey();
@@ -1445,6 +1471,7 @@ function ChatView() {
 
   const key = chatKey();
   const hasTarget = !!key;
+  const hasAgentMsg = (thread?.messages ?? []).some(m => m.role === "agent");
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -1540,13 +1567,13 @@ function ChatView() {
 
       {/* Input */}
       <div style={{ padding: "8px 14px 12px", flexShrink: 0, borderTop: "1px solid #18181b" }}>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
           <input
             value={chatInput}
             onChange={e => setChatInput(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
             placeholder={hasTarget ? "What do you want to build?" : "Pick a project first"}
-            disabled={!hasTarget || chatLoading}
+            disabled={!hasTarget || chatLoading || buildLoading}
             style={{
               flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7,
               color: "#e4e4e7", fontSize: 13, padding: "8px 12px", outline: "none",
@@ -1554,17 +1581,30 @@ function ChatView() {
           />
           <button
             onClick={handleSend}
-            disabled={!hasTarget || chatLoading || !chatInput.trim()}
+            disabled={!hasTarget || chatLoading || buildLoading || !chatInput.trim()}
             style={{
               padding: "8px 14px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none",
-              cursor: !hasTarget || chatLoading || !chatInput.trim() ? "not-allowed" : "pointer",
-              background: !hasTarget || chatLoading || !chatInput.trim() ? "#27272a" : "#3730a3",
-              color: !hasTarget || chatLoading || !chatInput.trim() ? "#52525b" : "#a5b4fc",
+              cursor: !hasTarget || chatLoading || buildLoading || !chatInput.trim() ? "not-allowed" : "pointer",
+              background: !hasTarget || chatLoading || buildLoading || !chatInput.trim() ? "#27272a" : "#3730a3",
+              color: !hasTarget || chatLoading || buildLoading || !chatInput.trim() ? "#52525b" : "#a5b4fc",
             }}
           >
             Send
           </button>
         </div>
+        <button
+          onClick={handleBuild}
+          disabled={!hasAgentMsg || buildLoading || chatLoading}
+          style={{
+            width: "100%", padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
+            border: "none",
+            cursor: !hasAgentMsg || buildLoading || chatLoading ? "not-allowed" : "pointer",
+            background: buildLoading ? "#27272a" : !hasAgentMsg || chatLoading ? "#27272a" : "#14532d",
+            color: buildLoading ? "#52525b" : !hasAgentMsg || chatLoading ? "#52525b" : "#86efac",
+          }}
+        >
+          {buildLoading ? "Building plan… (~30s)" : "Build from this chat"}
+        </button>
       </div>
     </div>
   );

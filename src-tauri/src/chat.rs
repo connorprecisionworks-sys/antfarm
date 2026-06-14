@@ -31,19 +31,13 @@ pub struct ChatThread {
     pub key: String,
     pub project_path: String,
     pub messages: Vec<ChatMessage>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChatTurnResult {
-    reply: String,
-    ready: bool,
-    build_description: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const OPUS: &str = "claude-opus-4-8";
+const SONNET: &str = "claude-sonnet-4-6";
 
 static MSG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -80,7 +74,12 @@ fn load_thread_from_disk(key: &str, project_path: &str) -> ChatThread {
             return t;
         }
     }
-    ChatThread { key: key.to_string(), project_path: project_path.to_string(), messages: vec![] }
+    ChatThread {
+        key: key.to_string(),
+        project_path: project_path.to_string(),
+        messages: vec![],
+        session_id: None,
+    }
 }
 
 fn save_thread(thread: &ChatThread) {
@@ -91,49 +90,20 @@ fn save_thread(thread: &ChatThread) {
 
 // ── Prompt ────────────────────────────────────────────────────────────────────
 
-const CHAT_AGENT_PROMPT: &str = r#"You are a lead engineer chatting with the user to scope a build for the repository at {project_path}. Inspect the repo to ground yourself, then talk like a sharp, concise teammate: react to what they said, ask only the one or two questions that actually matter, suggest a direction. Do NOT write code or a full plan yet.
+const CHAT_AGENT_PROMPT: &str = "You are a lead engineer chatting with the user to scope a build for the repository at {project_path}. Inspect the repo. Talk like a sharp, concise teammate — react, ask only the questions that matter, suggest a direction. Do NOT write code.\n\nThe build harness runs offline in an isolated worktree with no network and no DB migrations, so if the idea needs live data or schema changes, say so and scope the buildable part to code only.\n\nWhen you and the user agree on what to build, say so plainly in your reply.";
 
-The build will run in an automated harness that works in an isolated git worktree and CANNOT access the network or run database migrations. If the idea needs live data or schema changes, say so plainly and scope the buildable part to code only.
+// ── Shared headless runner ────────────────────────────────────────────────────
 
-When you have enough to build, set ready=true and write build_description: a precise, self-contained instruction covering what to build AND how it should be verified (a test or build command). Until then keep ready=false and keep the conversation going.
-
-Output ONLY a JSON object, no prose, no fences:
-{ "reply": "<your chat message to the user>", "ready": <true|false>, "build_description": "<the build instruction; empty string unless ready>" }"#;
-
-// ── Core logic ────────────────────────────────────────────────────────────────
-
-fn chat_turn_core(
-    claude: String,
-    project_path: String,
-    messages: &[ChatMessage],
-) -> Result<ChatTurnResult, String> {
-    let brain = format!(
-        "{}/Desktop/CD_claude",
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-    );
-    let base = CHAT_AGENT_PROMPT.replace("{project_path}", &project_path);
-    let transcript = messages
-        .iter()
-        .map(|m| {
-            if m.role == "user" {
-                format!("User: {}", m.text)
-            } else {
-                format!("Agent: {}", m.text)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prompt = format!("{base}\n\nConversation so far:\n{transcript}\n\nRespond now as JSON.");
-
-    let mut child = Command::new(&claude)
-        .args([
-            "-p", &prompt,
-            "--output-format", "stream-json", "--verbose",
-            "--permission-mode", "dontAsk",
-            "--model", OPUS,
-            "--add-dir", &brain,
-        ])
-        .current_dir(&project_path)
+// Returns (result_text, captured_session_id). Uses stream-json so we can
+// pull the session_id from the init line and cost from the result line.
+fn run_headless(
+    claude: &str,
+    args: Vec<String>,
+    cwd: &str,
+) -> Result<(String, Option<String>), String> {
+    let mut child = Command::new(claude)
+        .args(&args)
+        .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -149,8 +119,9 @@ fn chat_turn_core(
     });
 
     let started = Instant::now();
-    let max_wall = Duration::from_secs(180);
+    let max_wall = Duration::from_secs(120);
     let mut result_text = String::new();
+    let mut captured_sid: Option<String> = None;
     let mut cost = 0.0_f64;
     loop {
         if started.elapsed() > max_wall {
@@ -160,13 +131,15 @@ fn chat_turn_core(
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(line) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    // Capture session_id from any stream line (init line carries it)
+                    if captured_sid.is_none() {
+                        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+                            captured_sid = Some(sid.to_string());
+                        }
+                    }
                     if v.get("type").and_then(|t| t.as_str()) == Some("result") {
-                        result_text = v
-                            .get("result")
-                            .and_then(|r| r.as_str())
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
+                        result_text = v.get("result").and_then(|r| r.as_str())
+                            .unwrap_or("").trim().to_string();
                         cost = v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
                     }
                 }
@@ -176,23 +149,63 @@ fn chat_turn_core(
         }
     }
     child.wait().ok();
-    eprintln!("antfarm chat_turn: Opus cost ${cost:.4}");
+    eprintln!("antfarm chat_turn: Sonnet cost ${cost:.4}");
+    Ok((result_text, captured_sid))
+}
 
-    let stripped = result_text
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let json_slice = match (stripped.find('{'), stripped.rfind('}')) {
-        (Some(start), Some(end)) if end >= start => &stripped[start..=end],
-        _ => {
-            return Err(format!(
-                "chat_turn: no JSON object in Opus output; raw: {result_text}"
-            ))
-        }
+// ── Turn logic ────────────────────────────────────────────────────────────────
+//
+// Turn 1 (no session_id): fresh Sonnet call; embeds CHAT_AGENT_PROMPT + user
+//   message; captures session_id from stream-json init line.
+// Turn N (session_id present): --resume <id> with ONLY the new user text; the
+//   resumed session already holds repo context + conversation, so we send
+//   nothing else. This is the speed win — no cold repo re-read.
+
+fn chat_turn_core(
+    claude: &str,
+    project_path: &str,
+    messages: &[ChatMessage],
+    session_id: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let brain = format!(
+        "{}/Desktop/CD_claude",
+        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+    );
+
+    let user_text = messages.iter().rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.text.clone())
+        .ok_or("no user message in thread")?;
+
+    let args = if let Some(sid) = session_id {
+        // Warm resume: only the new user message; session carries context.
+        vec![
+            "--resume".into(), sid.into(),
+            "-p".into(), user_text,
+            "--model".into(), SONNET.into(),
+            "--output-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--permission-mode".into(), "dontAsk".into(),
+        ]
+    } else {
+        // Cold start: embed system prompt + user message in the -p value.
+        let base = CHAT_AGENT_PROMPT.replace("{project_path}", project_path);
+        let prompt = format!("{base}\n\nUser: {user_text}");
+        vec![
+            "-p".into(), prompt,
+            "--model".into(), SONNET.into(),
+            "--output-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--permission-mode".into(), "dontAsk".into(),
+            "--add-dir".into(), brain,
+        ]
     };
-    serde_json::from_str::<ChatTurnResult>(json_slice)
-        .map_err(|e| format!("chat_turn: JSON parse failed ({e}); raw: {result_text}"))
+
+    let (reply, sid) = run_headless(claude, args, project_path)?;
+    if reply.is_empty() {
+        return Err("chat_turn: empty reply from model".into());
+    }
+    Ok((reply, sid))
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -226,12 +239,58 @@ pub fn send_chat_message(
     });
 
     let claude = dispatch.claude_path.lock().unwrap().clone();
-    let turn = chat_turn_core(claude.clone(), project_path.clone(), &thread.messages)?;
+    let (reply, new_sid) = chat_turn_core(
+        &claude,
+        &project_path,
+        &thread.messages,
+        thread.session_id.as_deref(),
+    )?;
 
+    if new_sid.is_some() {
+        thread.session_id = new_sid;
+    }
+
+    thread.messages.push(ChatMessage {
+        id: new_msg_id(),
+        role: "agent".into(),
+        text: reply,
+        ts: now_secs(),
+        plan_path: None,
+        plan_id: None,
+        armed: false,
+        error: None,
+    });
+
+    save_thread(&thread);
+    Ok(thread)
+}
+
+#[tauri::command]
+pub fn build_from_chat(
+    _app: AppHandle,
+    dispatch: State<'_, crate::dispatch::DispatchState>,
+    key: String,
+    project_path: String,
+) -> Result<ChatThread, String> {
+    let mut thread = load_thread_from_disk(&key, &project_path);
+    thread.project_path = project_path.clone();
+
+    let transcript = thread.messages.iter()
+        .map(|m| {
+            if m.role == "user" { format!("User: {}", m.text) }
+            else { format!("Agent: {}", m.text) }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let description = format!(
+        "Build what this conversation converged on.\n\nConversation so far:\n{transcript}"
+    );
+
+    let claude = dispatch.claude_path.lock().unwrap().clone();
     let mut agent_msg = ChatMessage {
         id: new_msg_id(),
         role: "agent".into(),
-        text: turn.reply.clone(),
+        text: "Here's the plan:".into(),
         ts: now_secs(),
         plan_path: None,
         plan_id: None,
@@ -239,15 +298,13 @@ pub fn send_chat_message(
         error: None,
     };
 
-    if turn.ready && !turn.build_description.trim().is_empty() {
-        match crate::harness::author_plan_core(claude, turn.build_description, project_path) {
-            Ok(result) => {
-                agent_msg.plan_id = Some(result.validation.summary.plan_id.clone());
-                agent_msg.plan_path = Some(result.plan_path);
-            }
-            Err(e) => {
-                agent_msg.error = Some(e);
-            }
+    match crate::harness::author_plan_core(claude, description, project_path) {
+        Ok(result) => {
+            agent_msg.plan_id = Some(result.validation.summary.plan_id.clone());
+            agent_msg.plan_path = Some(result.plan_path);
+        }
+        Err(e) => {
+            agent_msg.error = Some(e);
         }
     }
 
@@ -266,9 +323,7 @@ pub fn arm_chat_plan(
 ) -> Result<ChatThread, String> {
     let mut thread = load_thread_from_disk(&key, "");
 
-    let plan_path = thread
-        .messages
-        .iter()
+    let plan_path = thread.messages.iter()
         .find(|m| m.id == message_id)
         .and_then(|m| m.plan_path.clone())
         .ok_or_else(|| format!("message {message_id} not found or has no plan_path"))?;
