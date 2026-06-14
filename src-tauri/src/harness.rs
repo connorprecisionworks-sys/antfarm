@@ -105,6 +105,10 @@ pub struct RunState {
     pub goal: String,
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub review_verdict: String,
+    #[serde(default)]
+    pub review_notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -423,6 +427,102 @@ fn summarize_run(claude: &str, worktree: &str, base_commit: &str, goal: &str) ->
     (result_text, cost)
 }
 
+#[derive(Deserialize)]
+struct ReviewJson {
+    verdict: String,
+    notes: String,
+}
+
+fn review_run(claude: &str, worktree: &str, base_commit: &str, goal: &str, accept_tails: &str) -> (String, String, f64) {
+    let diff = match git(worktree, &["diff", &format!("{base_commit}...HEAD")]) {
+        Ok(d) => d,
+        Err(_) => return (String::new(), String::new(), 0.0),
+    };
+    if diff.trim().is_empty() {
+        return (String::new(), String::new(), 0.0);
+    }
+    let diff_capped = if diff.len() > 40_000 {
+        format!("{}\n... (diff truncated at 40k chars)", &diff[..40_000])
+    } else {
+        diff
+    };
+    let prompt = format!(
+        "You are a strict code reviewer for an UNATTENDED overnight run. The work claims to accomplish this goal:\n{goal}\n\n\
+         Full diff (base...HEAD):\n{diff_capped}\n\n\
+         Acceptance-check output:\n{accept_tails}\n\n\
+         Decide whether the diff correctly and safely accomplishes the goal with NO unrequested or out-of-scope changes. \
+         Respond with ONLY a single-line JSON object, no prose, no code fence: \
+         {{\"verdict\":\"approve\"|\"request_changes\"|\"reject\",\"notes\":\"one or two sentences; for non-approve, name the specific problem\"}}. \
+         approve = fully meets the goal, safe, in scope. \
+         request_changes = close but a specific fixable issue. \
+         reject = fundamentally wrong or unsafe."
+    );
+    let mut child = match Command::new(claude)
+        .args(["-p", &prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "dontAsk",
+               "--model", OPUS])
+        .current_dir(worktree)
+        .stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return ("flagged_parse_error".into(), format!("spawn failed: {e}"), 0.0),
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => { child.kill().ok(); return ("flagged_parse_error".into(), "no stdout".into(), 0.0); }
+    };
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+    let started = Instant::now();
+    let max_wall = Duration::from_secs(120);
+    let mut result_text = String::new();
+    let mut cost = 0.0_f64;
+    loop {
+        if started.elapsed() > max_wall {
+            child.kill().ok();
+            break;
+        }
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(line) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                        result_text = v.get("result").and_then(|r| r.as_str())
+                            .unwrap_or("").trim().to_string();
+                        cost = v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    child.wait().ok();
+
+    // Lenient parse: find first '{' and last '}', serde_json from that slice.
+    let raw_tail: String = result_text.chars().rev().take(200).collect::<String>().chars().rev().collect();
+    let parsed = result_text.find('{')
+        .and_then(|start| result_text.rfind('}').map(|end| &result_text[start..=end]))
+        .and_then(|slice| serde_json::from_str::<ReviewJson>(slice).ok());
+
+    match parsed {
+        Some(r) => {
+            let verdict = r.verdict.trim().to_lowercase();
+            (verdict, r.notes, cost)
+        }
+        None => (
+            "flagged_parse_error".into(),
+            format!("could not parse reviewer JSON; raw tail: {raw_tail}"),
+            cost,
+        ),
+    }
+}
+
 // ── Crash recovery ────────────────────────────────────────────────────────────
 
 /// Called once at startup. Any plan/run/step left "running" on disk is an
@@ -619,16 +719,43 @@ fn execute_run(
         }
     }
 
-    let any_green = rs.steps.iter().any(|s| s.status == "green");
-    if any_green && !rs.base_commit.is_empty() {
+    let gated = !run_failed && rs.steps.iter().any(|s| s.status == "green");
+    if gated && !rs.base_commit.is_empty() {
+        // a. summarize (unchanged)
         let (summ, summ_cost) = summarize_run(claude, &rs.worktree, &rs.base_commit, &run.goal);
         rs.summary = summ;
         rs.cost_usd += summ_cost;
-        let mut guard = shared.lock().unwrap();
-        guard.cost_usd += summ_cost;
-        // fall through — final status save below captures everything
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.cost_usd += summ_cost;
+        }
+        // b. budget guard: if night is now over budget, mark done and skip the gate
+        let over_budget = shared.lock().unwrap().cost_usd >= budgets.per_night_usd;
+        if over_budget {
+            rs.status = "done".into();
+        } else {
+            // c. Opus approval gate
+            let accept_tails: String = {
+                let raw: String = rs.steps.iter()
+                    .filter_map(|s| s.accept_output_tail.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+                if raw.len() > 4_000 { format!("{}\n... (truncated)", &raw[..4_000]) } else { raw }
+            };
+            let (review_verdict, review_notes, review_cost) =
+                review_run(claude, &rs.worktree, &rs.base_commit, &run.goal, &accept_tails);
+            rs.cost_usd += review_cost;
+            rs.review_verdict = review_verdict.clone();
+            rs.review_notes = review_notes;
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.cost_usd += review_cost;
+            }
+            rs.status = if review_verdict == "approve" { "approved".into() } else { "flagged".into() };
+        }
+    } else {
+        rs.status = if run_failed { "failed".into() } else { "done".into() };
     }
-    rs.status = if run_failed { "failed".into() } else { "done".into() };
     {
         let mut guard = shared.lock().unwrap();
         save_state_with(&mut guard, &rs);

@@ -1160,6 +1160,8 @@ interface HRunState {
   steps: HStepState[];
   goal: string;
   summary: string;
+  reviewVerdict: string;
+  reviewNotes: string;
 }
 
 interface HPlanState {
@@ -1371,6 +1373,16 @@ function AgentsView() {
                     <p className="text-[12px] text-zinc-400 leading-relaxed">{run.summary}</p>
                   ) : (
                     <p className="text-[11px] text-zinc-700 italic">No summary yet</p>
+                  )}
+
+                  {/* Reviewer note (Opus gate) */}
+                  {run.reviewNotes && (
+                    <div
+                      className="text-[11px] leading-relaxed rounded-md px-2.5 py-1.5"
+                      style={{ background: "#1a1207", color: "#fcd34d" }}
+                    >
+                      <span className="font-semibold">Reviewer:</span> {run.reviewNotes}
+                    </div>
                   )}
 
                   {/* Stat · chip · cost */}
