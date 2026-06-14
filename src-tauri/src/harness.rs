@@ -115,6 +115,23 @@ pub struct AuthorResult {
     pub validation: PlanValidation,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalOption {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub tradeoff: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalResult {
+    pub scope: String,
+    pub options: Vec<ProposalOption>,
+    pub questions: Vec<String>,
+}
+
 // ── Live state ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1103,6 +1120,26 @@ Rules:
 - Split into multiple runs only when chunks are genuinely independent and could run in parallel; otherwise one run with ordered steps.
 Output ONLY the JSON object."#;
 
+const PLAN_PROPOSE_PROMPT: &str = r#"You are the lead engineer on a team. The user has a rough idea. Do NOT write code or a plan yet. Inspect the repository to ground your thinking, then propose how to approach it and surface the decisions a human should make.
+
+User idea: {description}
+Repository: {project_path}
+
+Output ONLY a JSON object, no prose, no markdown fences:
+{
+  "scope": "<1-2 sentence read of what this actually involves in THIS repo>",
+  "options": [
+    { "id": "a", "title": "<short name>", "summary": "<1-2 sentences on the approach>", "tradeoff": "<one line: what you gain vs give up>" }
+  ],
+  "questions": [ "<an open question or assumption the human should confirm before building>" ]
+}
+
+Rules:
+- Give 2 or 3 genuinely DIFFERENT approaches, not variations of one. If the task is trivial enough that there's only one sensible approach, return a single option and say so in scope.
+- Keep each option concrete and tied to what you saw in the repo.
+- questions: 1-4 items, the decisions or unknowns that would change the build (libraries, data shape, scope boundaries, anything needing live data or a DB migration). Empty array if genuinely none.
+- Output ONLY the JSON object."#;
+
 pub fn author_plan_core(claude: String, description: String, project_path: String) -> Result<AuthorResult, String> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1192,6 +1229,81 @@ pub fn author_plan(
 ) -> Result<AuthorResult, String> {
     let claude = dispatch.claude_path.lock().unwrap().clone();
     author_plan_core(claude, description, project_path)
+}
+
+pub fn propose_plan_core(claude: String, description: String, project_path: String) -> Result<ProposalResult, String> {
+    let brain = format!("{}/Desktop/CD_claude", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+    let prompt = PLAN_PROPOSE_PROMPT
+        .replace("{description}", &description)
+        .replace("{project_path}", &project_path);
+
+    let mut child = Command::new(&claude)
+        .args(["-p", &prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "dontAsk",
+               "--model", OPUS,
+               "--add-dir", &brain])
+        .current_dir(&project_path)
+        .stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+
+    let started = Instant::now();
+    let max_wall = Duration::from_secs(180);
+    let mut result_text = String::new();
+    let mut cost = 0.0_f64;
+    loop {
+        if started.elapsed() > max_wall {
+            child.kill().ok();
+            break;
+        }
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(line) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                        result_text = v.get("result").and_then(|r| r.as_str())
+                            .unwrap_or("").trim().to_string();
+                        cost = v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    child.wait().ok();
+    eprintln!("antfarm propose_plan: Opus cost ${cost:.4}");
+
+    let stripped = result_text
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let json_slice = match (stripped.find('{'), stripped.rfind('}')) {
+        (Some(start), Some(end)) if end >= start => &stripped[start..=end],
+        _ => return Err(format!("propose_plan: no JSON object in Opus output; raw: {result_text}")),
+    };
+    serde_json::from_str::<ProposalResult>(json_slice)
+        .map_err(|e| format!("propose_plan: JSON parse failed ({e}); raw: {result_text}"))
+}
+
+#[tauri::command]
+pub fn propose_plan(
+    _app: AppHandle,
+    dispatch: State<'_, crate::dispatch::DispatchState>,
+    description: String,
+    project_path: String,
+) -> Result<ProposalResult, String> {
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    propose_plan_core(claude, description, project_path)
 }
 
 #[tauri::command]

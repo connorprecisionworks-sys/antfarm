@@ -1940,6 +1940,7 @@ fn main() {
             harness::harness_run_summary,
             harness::validate_plan_file,
             harness::author_plan,
+            harness::propose_plan,
             harness::dev_test_harness,
             harness::dev_test_3step_fail,
             harness::dev_test_budget_gate,

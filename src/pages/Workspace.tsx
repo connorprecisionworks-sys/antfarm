@@ -1246,6 +1246,17 @@ interface AuthorResult {
   planPath: string;
   validation: PlanValidation;
 }
+interface ProposalOption {
+  id: string;
+  title: string;
+  summary: string;
+  tradeoff: string;
+}
+interface ProposalResult {
+  scope: string;
+  options: ProposalOption[];
+  questions: string[];
+}
 
 // ── ValidationReadout component ────────────────────────────────────────────
 
@@ -1312,6 +1323,11 @@ function AgentsView() {
   const [loadPlanPath, setLoadPlanPath] = useState("");
   const [loadResult, setLoadResult] = useState<AuthorResult | null>(null);
   const [loadError, setLoadError] = useState("");
+  const [proposeLoading, setProposeLoading] = useState(false);
+  const [proposeError, setProposeError] = useState("");
+  const [proposeResult, setProposeResult] = useState<ProposalResult | null>(null);
+  const [selectedOptionId, setSelectedOptionId] = useState("");
+  const [proposeNotes, setProposeNotes] = useState("");
 
   async function refresh() {
     try {
@@ -1353,27 +1369,61 @@ function AgentsView() {
     invoke<Project[]>("list_projects").then(setProjects).catch(() => {});
   }, []);
 
-  async function handleAuthorPlan() {
-    const projectPath = authorProject
-      ? await invoke<RepoPath[]>("get_project_paths", { slug: authorProject.slug })
+  async function resolveProjectPath(): Promise<string> {
+    return authorProject
+      ? invoke<RepoPath[]>("get_project_paths", { slug: authorProject.slug })
           .then(paths => paths[0]?.path ?? authorCustomPath)
           .catch(() => authorCustomPath)
-      : authorCustomPath;
+      : Promise.resolve(authorCustomPath);
+  }
+
+  async function runAuthorPlan(description: string) {
+    const projectPath = await resolveProjectPath();
     if (!projectPath) { setAuthorError("Select a project or enter a path"); return; }
     setAuthorLoading(true);
     setAuthorError("");
     setAuthorResult(null);
     try {
-      const result = await invoke<AuthorResult>("author_plan", {
-        description: authorDesc,
-        projectPath,
-      });
+      const result = await invoke<AuthorResult>("author_plan", { description, projectPath });
       setAuthorResult(result);
     } catch (e) {
       setAuthorError(String(e));
     } finally {
       setAuthorLoading(false);
     }
+  }
+
+  async function handleAuthorPlan() {
+    setProposeResult(null);
+    await runAuthorPlan(authorDesc);
+  }
+
+  async function handleProposePlan() {
+    const projectPath = await resolveProjectPath();
+    if (!projectPath) { setAuthorError("Select a project or enter a path"); return; }
+    setProposeLoading(true);
+    setProposeError("");
+    setProposeResult(null);
+    setSelectedOptionId("");
+    setProposeNotes("");
+    setAuthorResult(null);
+    try {
+      const result = await invoke<ProposalResult>("propose_plan", { description: authorDesc, projectPath });
+      setProposeResult(result);
+    } catch (e) {
+      setProposeError(String(e));
+    } finally {
+      setProposeLoading(false);
+    }
+  }
+
+  async function handleBuildApproach() {
+    if (!selectedOptionId || !proposeResult) return;
+    const opt = proposeResult.options.find(o => o.id === selectedOptionId);
+    if (!opt) return;
+    const assembled = `${authorDesc}\n\nChosen approach: ${opt.title} — ${opt.summary}\n\nNotes/decisions: ${proposeNotes || "(none)"}`;
+    setProposeResult(null);
+    await runAuthorPlan(assembled);
   }
 
   async function handleArmAuthoredPlan(planPath: string) {
@@ -1495,18 +1545,85 @@ function AgentsView() {
                 style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 10px", outline: "none" }}
               />
             </div>
-            <button
-              onClick={handleAuthorPlan}
-              disabled={authorLoading || !authorDesc.trim()}
-              style={{
-                marginTop: 8, width: "100%", padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
-                border: "none", cursor: authorLoading || !authorDesc.trim() ? "not-allowed" : "pointer",
-                background: authorLoading ? "#27272a" : "#3730a3", color: authorLoading ? "#52525b" : "#a5b4fc",
-              }}
-            >
-              {authorLoading ? "Generating plan… (~30s)" : "Generate plan"}
-            </button>
-            {authorError && <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 6 }}>{authorError}</div>}
+            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+              <button
+                onClick={handleProposePlan}
+                disabled={proposeLoading || authorLoading || !authorDesc.trim()}
+                style={{
+                  flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
+                  border: "none", cursor: proposeLoading || authorLoading || !authorDesc.trim() ? "not-allowed" : "pointer",
+                  background: proposeLoading ? "#27272a" : "#312e81", color: proposeLoading ? "#52525b" : "#c7d2fe",
+                }}
+              >
+                {proposeLoading ? "Proposing… (~30s)" : "Propose approaches"}
+              </button>
+              <button
+                onClick={handleAuthorPlan}
+                disabled={authorLoading || proposeLoading || !authorDesc.trim()}
+                style={{
+                  flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
+                  border: "none", cursor: authorLoading || proposeLoading || !authorDesc.trim() ? "not-allowed" : "pointer",
+                  background: authorLoading ? "#27272a" : "#1e3a5f", color: authorLoading ? "#52525b" : "#93c5fd",
+                }}
+              >
+                {authorLoading ? "Generating… (~30s)" : "Generate plan"}
+              </button>
+            </div>
+            {(authorError || proposeError) && (
+              <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 6 }}>{authorError || proposeError}</div>
+            )}
+            {proposeResult && (
+              <div style={{ marginTop: 10, background: "#0d0d10", border: "1px solid #27272a", borderRadius: 10, padding: "12px 14px" }}>
+                <p style={{ fontSize: 11, color: "#a1a1aa", marginBottom: 10, lineHeight: 1.6 }}>{proposeResult.scope}</p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+                  {proposeResult.options.map(opt => (
+                    <div
+                      key={opt.id}
+                      onClick={() => setSelectedOptionId(opt.id)}
+                      style={{
+                        border: `1px solid ${selectedOptionId === opt.id ? "#6366f1" : "#3f3f46"}`,
+                        borderRadius: 8, padding: "10px 12px", cursor: "pointer",
+                        background: selectedOptionId === opt.id ? "#1e1b4b" : "#111113",
+                        transition: "border-color 0.1s, background 0.1s",
+                      }}
+                    >
+                      <div style={{ fontSize: 12, fontWeight: 600, color: selectedOptionId === opt.id ? "#a5b4fc" : "#e4e4e7", marginBottom: 3 }}>
+                        {opt.title}
+                      </div>
+                      <div style={{ fontSize: 11, color: "#a1a1aa", marginBottom: 4, lineHeight: 1.5 }}>{opt.summary}</div>
+                      <div style={{ fontSize: 10, color: "#71717a", fontStyle: "italic" }}>⚖ {opt.tradeoff}</div>
+                    </div>
+                  ))}
+                </div>
+                {proposeResult.questions.length > 0 && (
+                  <div style={{ background: "#1a1207", borderRadius: 6, padding: "8px 10px", marginBottom: 10 }}>
+                    <p style={{ fontSize: 10, fontWeight: 700, color: "#fcd34d", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>Open questions</p>
+                    {proposeResult.questions.map((q, i) => (
+                      <div key={i} style={{ fontSize: 11, color: "#fcd34d", marginBottom: i < proposeResult.questions.length - 1 ? 4 : 0 }}>• {q}</div>
+                    ))}
+                  </div>
+                )}
+                <textarea
+                  value={proposeNotes}
+                  onChange={e => setProposeNotes(e.target.value)}
+                  placeholder="Notes / answers to open questions (optional)"
+                  rows={2}
+                  style={{ width: "100%", background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "8px 10px", resize: "vertical", fontFamily: "inherit", outline: "none", marginBottom: 8 }}
+                />
+                <button
+                  disabled={!selectedOptionId}
+                  onClick={handleBuildApproach}
+                  style={{
+                    width: "100%", padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
+                    border: "none", cursor: selectedOptionId ? "pointer" : "not-allowed",
+                    background: selectedOptionId ? "#14532d" : "#27272a",
+                    color: selectedOptionId ? "#86efac" : "#52525b",
+                  }}
+                >
+                  Build this approach
+                </button>
+              </div>
+            )}
             {authorResult && (
               <ValidationReadout result={authorResult} onArm={handleArmAuthoredPlan} armError={""} />
             )}
