@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chat;
 mod dispatch;
 mod harness;
 mod mobile;
@@ -1941,6 +1942,9 @@ fn main() {
             harness::validate_plan_file,
             harness::author_plan,
             harness::propose_plan,
+            chat::load_chat,
+            chat::send_chat_message,
+            chat::arm_chat_plan,
             harness::dev_test_harness,
             harness::dev_test_3step_fail,
             harness::dev_test_budget_gate,

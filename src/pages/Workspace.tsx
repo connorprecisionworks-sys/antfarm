@@ -1258,6 +1258,318 @@ interface ProposalResult {
   questions: string[];
 }
 
+// ── Chat types ─────────────────────────────────────────────────────────────
+
+interface ChatMessage {
+  id: string;
+  role: "user" | "agent";
+  text: string;
+  ts: number;
+  planPath?: string;
+  planId?: string;
+  armed: boolean;
+  error?: string;
+}
+interface ChatThread {
+  key: string;
+  projectPath: string;
+  messages: ChatMessage[];
+}
+
+// ── ChatPlanCard component ─────────────────────────────────────────────────
+
+function ChatPlanCard({
+  armed, validation, armError, onArm,
+}: {
+  armed: boolean;
+  validation: PlanValidation | "loading" | "error" | undefined;
+  armError?: string;
+  onArm: () => void;
+}) {
+  if (armed) {
+    return (
+      <div style={{ background: "#052e16", border: "1px solid #166534", borderRadius: 8, padding: "8px 12px" }}>
+        <span style={{ fontSize: 12, color: "#86efac", fontWeight: 600 }}>Armed / started</span>
+      </div>
+    );
+  }
+  if (!validation || validation === "loading") {
+    return (
+      <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 8, padding: "8px 12px" }}>
+        <span style={{ fontSize: 11, color: "#71717a" }}>Loading plan…</span>
+      </div>
+    );
+  }
+  if (validation === "error") {
+    return (
+      <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 8, padding: "8px 12px" }}>
+        <span style={{ fontSize: 11, color: "#fca5a5" }}>Could not load plan</span>
+      </div>
+    );
+  }
+  const s = validation.summary;
+  return (
+    <div style={{ background: "#0d0f14", border: "1px solid #2d3748", borderRadius: 8, padding: "10px 12px" }}>
+      <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 6, fontWeight: 600 }}>
+        {s.planId} · {s.runCount} run{s.runCount !== 1 ? "s" : ""} · {s.stepCount} steps · ${s.perNightUsd.toFixed(2)} night cap
+      </div>
+      {validation.errors.length > 0 && (
+        <div style={{ marginBottom: 6 }}>
+          {validation.errors.map((e, i) => <div key={i} style={{ fontSize: 11, color: "#fca5a5" }}>{e}</div>)}
+        </div>
+      )}
+      {validation.warnings.length > 0 && (
+        <div style={{ marginBottom: 6 }}>
+          {validation.warnings.map((w, i) => <div key={i} style={{ fontSize: 11, color: "#fbbf24" }}>{w}</div>)}
+        </div>
+      )}
+      {armError && <div style={{ fontSize: 11, color: "#fca5a5", marginBottom: 6 }}>{armError}</div>}
+      <button
+        onClick={onArm}
+        disabled={!validation.ok}
+        style={{
+          width: "100%", padding: "6px 0", borderRadius: 6, fontSize: 12, fontWeight: 600,
+          border: "none", cursor: validation.ok ? "pointer" : "not-allowed",
+          background: validation.ok ? "#14532d" : "#27272a",
+          color: validation.ok ? "#86efac" : "#52525b",
+        }}
+      >
+        {validation.ok ? "Arm plan" : "Fix errors before arming"}
+      </button>
+    </div>
+  );
+}
+
+// ── ChatView component ─────────────────────────────────────────────────────
+
+function ChatView() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [chatProject, setChatProject] = useState<Project | null>(null);
+  const [chatCustomPath, setChatCustomPath] = useState("");
+  const [thread, setThread] = useState<ChatThread | null>(null);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [planValidations, setPlanValidations] = useState<Record<string, PlanValidation | "loading" | "error">>({});
+  const [armErrors, setArmErrors] = useState<Record<string, string>>({});
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    invoke<Project[]>("list_projects").then(setProjects).catch(() => {});
+  }, []);
+
+  function chatKey(): string {
+    if (chatProject) return chatProject.slug;
+    if (!chatCustomPath) return "";
+    return chatCustomPath.replace(/[^a-zA-Z0-9_-]/g, "_");
+  }
+
+  async function resolveProjectPath(): Promise<string> {
+    if (chatProject) {
+      return invoke<RepoPath[]>("get_project_paths", { slug: chatProject.slug })
+        .then(paths => paths[0]?.path ?? chatCustomPath)
+        .catch(() => chatCustomPath);
+    }
+    return chatCustomPath;
+  }
+
+  useEffect(() => {
+    const key = chatKey();
+    if (!key) { setThread(null); return; }
+    invoke<ChatThread>("load_chat", { key }).then(setThread).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatProject?.slug, chatCustomPath]);
+
+  useEffect(() => {
+    if (!thread) return;
+    thread.messages.forEach(msg => {
+      if (msg.planPath && !(msg.planPath in planValidations)) {
+        setPlanValidations(prev => ({ ...prev, [msg.planPath!]: "loading" }));
+        invoke<PlanValidation>("validate_plan_file", { planPath: msg.planPath! })
+          .then(v => setPlanValidations(prev => ({ ...prev, [msg.planPath!]: v })))
+          .catch(() => setPlanValidations(prev => ({ ...prev, [msg.planPath!]: "error" })));
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thread?.messages]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [thread?.messages.length]);
+
+  async function handleSend() {
+    const text = chatInput.trim();
+    const key = chatKey();
+    if (!text || chatLoading || !key) return;
+    const projectPath = await resolveProjectPath();
+    if (!projectPath) return;
+    setChatInput("");
+    setChatLoading(true);
+    // Optimistically show user message while agent turn runs
+    setThread(prev => {
+      const userMsg: ChatMessage = {
+        id: `opt-${Date.now()}`, role: "user", text,
+        ts: Math.floor(Date.now() / 1000), armed: false,
+      };
+      return prev
+        ? { ...prev, messages: [...prev.messages, userMsg] }
+        : { key, projectPath, messages: [userMsg] };
+    });
+    try {
+      const t = await invoke<ChatThread>("send_chat_message", { key, projectPath, text });
+      setThread(t);
+    } catch (e) {
+      setThread(prev => {
+        if (!prev) return prev;
+        const errMsg: ChatMessage = {
+          id: `err-${Date.now()}`, role: "agent",
+          text: `Something went wrong: ${String(e)}`,
+          ts: Math.floor(Date.now() / 1000), armed: false,
+        };
+        return { ...prev, messages: [...prev.messages.filter(m => !m.id.startsWith("opt-")), errMsg] };
+      });
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  async function handleArm(msg: ChatMessage) {
+    if (!msg.planPath || msg.armed) return;
+    const key = chatKey();
+    try {
+      const t = await invoke<ChatThread>("arm_chat_plan", { key, messageId: msg.id });
+      setThread(t);
+    } catch (e) {
+      setArmErrors(prev => ({ ...prev, [msg.id]: String(e) }));
+    }
+  }
+
+  const key = chatKey();
+  const hasTarget = !!key;
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Project picker */}
+      <div style={{ padding: "10px 14px 0", flexShrink: 0 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <select
+            value={chatProject?.slug ?? ""}
+            onChange={e => {
+              const p = projects.find(p => p.slug === e.target.value) ?? null;
+              setChatProject(p);
+              if (p) setChatCustomPath("");
+            }}
+            style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 8px", outline: "none" }}
+          >
+            <option value="">— pick project —</option>
+            {projects.map(p => <option key={p.slug} value={p.slug}>{p.name}</option>)}
+          </select>
+          <input
+            value={chatCustomPath}
+            onChange={e => { setChatCustomPath(e.target.value); setChatProject(null); }}
+            placeholder="or paste path"
+            style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 10px", outline: "none" }}
+          />
+        </div>
+      </div>
+
+      {/* Thread */}
+      <div className="flex-1 min-h-0 overflow-y-auto" style={{ padding: "12px 14px" }}>
+        {!hasTarget ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 6 }}>
+            <p style={{ fontSize: 13, color: "#52525b" }}>Pick a project to start chatting</p>
+          </div>
+        ) : !thread || thread.messages.length === 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 6 }}>
+            <p style={{ fontSize: 13, color: "#71717a" }}>Describe what you want to build</p>
+            <p style={{ fontSize: 11, color: "#52525b" }}>The agent reads the repo and helps you scope it</p>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {thread.messages.map(msg => (
+              <div
+                key={msg.id}
+                style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}
+              >
+                {msg.role === "user" ? (
+                  <div style={{
+                    maxWidth: "72%", background: "#1e3a5f", borderRadius: "12px 12px 3px 12px",
+                    padding: "8px 12px", fontSize: 13, color: "#bfdbfe", lineHeight: 1.5,
+                  }}>
+                    {msg.text}
+                  </div>
+                ) : (
+                  <div style={{ maxWidth: "82%", display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{
+                      background: "#111113", border: "1px solid #27272a",
+                      borderRadius: "12px 12px 12px 3px", padding: "8px 12px",
+                      fontSize: 13, color: "#e4e4e7", lineHeight: 1.6,
+                    }}>
+                      {msg.text}
+                    </div>
+                    {msg.error && (
+                      <div style={{ fontSize: 11, color: "#fbbf24", padding: "6px 10px", background: "#1a1207", borderRadius: 6 }}>
+                        couldn't author a plan: {msg.error}
+                      </div>
+                    )}
+                    {msg.planPath && (
+                      <ChatPlanCard
+                        armed={msg.armed}
+                        validation={planValidations[msg.planPath]}
+                        armError={armErrors[msg.id]}
+                        onArm={() => handleArm(msg)}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            {chatLoading && (
+              <div style={{ display: "flex", justifyContent: "flex-start" }}>
+                <div style={{
+                  background: "#111113", border: "1px solid #27272a",
+                  borderRadius: "12px 12px 12px 3px", padding: "10px 14px",
+                }}>
+                  <span style={{ fontSize: 12, color: "#52525b" }}>thinking…</span>
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
+          </div>
+        )}
+      </div>
+
+      {/* Input */}
+      <div style={{ padding: "8px 14px 12px", flexShrink: 0, borderTop: "1px solid #18181b" }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={chatInput}
+            onChange={e => setChatInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+            placeholder={hasTarget ? "What do you want to build?" : "Pick a project first"}
+            disabled={!hasTarget || chatLoading}
+            style={{
+              flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7,
+              color: "#e4e4e7", fontSize: 13, padding: "8px 12px", outline: "none",
+            }}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!hasTarget || chatLoading || !chatInput.trim()}
+            style={{
+              padding: "8px 14px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none",
+              cursor: !hasTarget || chatLoading || !chatInput.trim() ? "not-allowed" : "pointer",
+              background: !hasTarget || chatLoading || !chatInput.trim() ? "#27272a" : "#3730a3",
+              color: !hasTarget || chatLoading || !chatInput.trim() ? "#52525b" : "#a5b4fc",
+            }}
+          >
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── ValidationReadout component ────────────────────────────────────────────
 
 function ValidationReadout({ result, onArm, armError }: { result: AuthorResult; onArm: (path: string) => void; armError: string }) {
@@ -1832,9 +2144,9 @@ function AgentsView() {
 // ── Main Workspace page ────────────────────────────────────────────────────
 
 export function WorkspacePage() {
-  const [mode, setMode] = useState<"live" | "agents">(() => {
+  const [mode, setMode] = useState<"live" | "agents" | "chat">(() => {
     const saved = localStorage.getItem("antfarm-workspace-mode");
-    return saved === "agents" ? "agents" : "live";
+    return saved === "agents" ? "agents" : saved === "chat" ? "chat" : "live";
   });
   const [workspaces, setWorkspaces] = useState<WorkspaceEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -1861,7 +2173,7 @@ export function WorkspacePage() {
     invoke("save_workspaces", { workspaces: ws }).catch(console.error);
   }
 
-  function switchMode(m: "live" | "agents") {
+  function switchMode(m: "live" | "agents" | "chat") {
     setMode(m);
     localStorage.setItem("antfarm-workspace-mode", m);
   }
@@ -1945,7 +2257,7 @@ export function WorkspacePage() {
     <div className="flex flex-col h-full overflow-hidden">
       {/* Mode toggle — very top */}
       <div className="flex items-center gap-0.5 px-2.5 h-8 border-b border-zinc-800/80 bg-zinc-950 shrink-0">
-        {(["live", "agents"] as const).map(m => (
+        {(["live", "agents", "chat"] as const).map(m => (
           <button
             key={m}
             onClick={() => switchMode(m)}
@@ -1954,13 +2266,15 @@ export function WorkspacePage() {
               mode === m ? "bg-zinc-700 text-zinc-100" : "text-zinc-500 hover:text-zinc-300",
             ].join(" ")}
           >
-            {m === "live" ? "Live" : "Agents"}
+            {m === "live" ? "Live" : m === "agents" ? "Agents" : "Chat"}
           </button>
         ))}
       </div>
 
       {mode === "agents" ? (
         <AgentsView />
+      ) : mode === "chat" ? (
+        <ChatView />
       ) : (
         <>
           {/* Tab bar — outer row does NOT clip; only the tab strip scrolls.
