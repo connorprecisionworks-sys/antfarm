@@ -2,6 +2,45 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Chat loading indicators ──────────────────────────────────────────────── */
+
+@keyframes chat-dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.3; }
+  30% { transform: translateY(-5px); opacity: 1; }
+}
+
+@keyframes chat-spin {
+  to { transform: rotate(360deg); }
+}
+
+.chat-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #71717a;
+  animation: chat-dot-bounce 1.3s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.chat-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: chat-spin 0.65s linear infinite;
+  opacity: 0.75;
+  vertical-align: middle;
+  margin-right: 5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-dot  { animation: none; opacity: 0.5; }
+  .chat-spinner { animation: none; }
+}
+
 @layer base {
   html,
   body,

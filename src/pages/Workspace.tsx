@@ -1351,6 +1351,7 @@ function ChatView() {
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [buildLoading, setBuildLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const [planValidations, setPlanValidations] = useState<Record<string, PlanValidation | "loading" | "error">>({});
   const [armErrors, setArmErrors] = useState<Record<string, string>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1397,6 +1398,17 @@ function ChatView() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [thread?.messages.length]);
+
+  useEffect(() => {
+    if (!chatLoading) { setElapsed(0); return; }
+    setElapsed(0);
+    const id = setInterval(() => setElapsed(s => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [chatLoading]);
+
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   async function handleSend() {
     const text = chatInput.trim();
@@ -1553,10 +1565,27 @@ function ChatView() {
             {chatLoading && (
               <div style={{ display: "flex", justifyContent: "flex-start" }}>
                 <div style={{
-                  background: "#111113", border: "1px solid #27272a",
-                  borderRadius: "12px 12px 12px 3px", padding: "10px 14px",
+                  background: "#111113", border: "1px solid #3f3f46",
+                  borderRadius: "12px 12px 12px 3px", padding: "12px 16px",
+                  display: "flex", alignItems: "center", gap: 12,
                 }}>
-                  <span style={{ fontSize: 12, color: "#52525b" }}>thinking…</span>
+                  {prefersReducedMotion ? (
+                    <span style={{ fontSize: 12, color: "#71717a" }}>Thinking…</span>
+                  ) : (
+                    <>
+                      <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                        <span className="chat-dot" style={{ animationDelay: "0ms" }} />
+                        <span className="chat-dot" style={{ animationDelay: "160ms" }} />
+                        <span className="chat-dot" style={{ animationDelay: "320ms" }} />
+                      </div>
+                      <span style={{
+                        fontSize: 11, color: "#52525b",
+                        fontVariantNumeric: "tabular-nums", minWidth: 28,
+                      }}>
+                        {elapsed}s
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -1572,11 +1601,14 @@ function ChatView() {
             value={chatInput}
             onChange={e => setChatInput(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-            placeholder={hasTarget ? "What do you want to build?" : "Pick a project first"}
+            placeholder={chatLoading ? "Waiting for reply…" : hasTarget ? "What do you want to build?" : "Pick a project first"}
             disabled={!hasTarget || chatLoading || buildLoading}
             style={{
-              flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7,
-              color: "#e4e4e7", fontSize: 13, padding: "8px 12px", outline: "none",
+              flex: 1, background: "#0a0a0b",
+              border: `1px solid ${chatLoading || buildLoading ? "#27272a" : "#3f3f46"}`,
+              borderRadius: 7, color: "#e4e4e7", fontSize: 13, padding: "8px 12px", outline: "none",
+              opacity: chatLoading || buildLoading ? 0.45 : 1,
+              transition: "opacity 0.15s, border-color 0.15s",
             }}
           />
           <button
@@ -1587,9 +1619,11 @@ function ChatView() {
               cursor: !hasTarget || chatLoading || buildLoading || !chatInput.trim() ? "not-allowed" : "pointer",
               background: !hasTarget || chatLoading || buildLoading || !chatInput.trim() ? "#27272a" : "#3730a3",
               color: !hasTarget || chatLoading || buildLoading || !chatInput.trim() ? "#52525b" : "#a5b4fc",
+              display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap",
             }}
           >
-            Send
+            {chatLoading && <span className="chat-spinner" />}
+            {chatLoading ? "Sending…" : "Send"}
           </button>
         </div>
         <button
@@ -1599,11 +1633,13 @@ function ChatView() {
             width: "100%", padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
             border: "none",
             cursor: !hasAgentMsg || buildLoading || chatLoading ? "not-allowed" : "pointer",
-            background: buildLoading ? "#27272a" : !hasAgentMsg || chatLoading ? "#27272a" : "#14532d",
-            color: buildLoading ? "#52525b" : !hasAgentMsg || chatLoading ? "#52525b" : "#86efac",
+            background: buildLoading ? "#052e16" : !hasAgentMsg || chatLoading ? "#27272a" : "#14532d",
+            color: buildLoading ? "#4ade80" : !hasAgentMsg || chatLoading ? "#52525b" : "#86efac",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
           }}
         >
-          {buildLoading ? "Building plan… (~30s)" : "Build from this chat"}
+          {buildLoading && <span className="chat-spinner" />}
+          {buildLoading ? "Generating plan… (~30s)" : "Build from this chat"}
         </button>
       </div>
     </div>
