@@ -2,6 +2,7 @@
 
 mod dispatch;
 mod harness;
+mod mobile;
 mod pty;
 
 use chrono::{Datelike, Local, Timelike, Weekday};
@@ -1891,6 +1892,8 @@ fn main() {
         .setup(move |app| {
             // Mark any step/run left "running" from a prior crash as interrupted.
             harness::reconcile_orphans();
+            // Start the read-only mobile status server on 127.0.0.1:8787 (non-blocking).
+            mobile::start();
             // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
             let path = dispatch::resolve_claude_path();
             *dispatch_claude.lock().unwrap() = path;
