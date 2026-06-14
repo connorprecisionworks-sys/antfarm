@@ -201,9 +201,15 @@ fn exclude_from_worktree_git(worktree: &str, pattern: &str) -> Result<(), String
 }
 
 fn write_allowlist(worktree: &str, project_slug: &str) -> Result<(), String> {
-    let src = home().join(format!(".antfarm/allowlists/{project_slug}.json"));
+    let allowlists = home().join(".antfarm/allowlists");
+    let src = allowlists.join(format!("{project_slug}.json"));
+    let default_path = allowlists.join("_default.json");
     let text = std::fs::read_to_string(&src)
-        .map_err(|e| format!("allowlist missing for {project_slug}: {e} — refuse to run unattended without one"))?;
+        .or_else(|_| std::fs::read_to_string(&default_path))
+        .map_err(|_| format!(
+            "no allowlist found for '{project_slug}' and no _default.json fallback — \
+             refuse to run unattended without one"
+        ))?;
     let dir = Path::new(worktree).join(".claude");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("settings.json"), text).map_err(|e| e.to_string())?;
