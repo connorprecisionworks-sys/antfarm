@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use tauri::Manager;
 
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
@@ -142,6 +143,22 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     .btn-toss { background: #27272a; color: #a1a1aa; }
     .btn-toss:active { background: #3f3f46; }
 
+    #plans-section { padding: 12px; border-top: 1px solid #27272a; }
+    #plans-hdr { font-size: 11px; font-weight: 700; color: #52525b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+    .plan-card {
+      background: #111113; border: 1px solid #27272a; border-radius: 14px;
+      padding: 12px 14px; margin-bottom: 8px;
+    }
+    .plan-goal { font-size: 13px; font-weight: 600; color: #f4f4f5; margin-bottom: 4px; }
+    .plan-meta { font-size: 11px; color: #71717a; margin-bottom: 8px; }
+    .btn-arm {
+      background: #1e3a5f; color: #7dd3fc;
+      border: none; border-radius: 9px; padding: 8px 0;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      width: 100%; -webkit-tap-highlight-color: transparent;
+    }
+    .btn-arm:active { background: #164e63; }
+
     /* Diff overlay */
     #overlay {
       display: none; position: fixed; inset: 0; background: #0a0a0b;
@@ -172,6 +189,11 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     <span id="status">connecting…</span>
   </div>
   <div id="list"></div>
+
+  <div id="plans-section">
+    <div id="plans-hdr">Start a run</div>
+    <div id="plans-list"><div class="empty" style="padding:20px 0;font-size:12px;">Loading plans…</div></div>
+  </div>
 
   <div id="overlay">
     <div id="ov-hdr">
@@ -343,6 +365,50 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
     fetchRuns();
     setInterval(fetchRuns, 5000);
+
+    async function fetchPlans() {
+      try {
+        const r = await fetch('/api/plans', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+        if (!r.ok) return;
+        renderPlans(await r.json());
+      } catch (e) { /* ignore */ }
+    }
+
+    function renderPlans(plans) {
+      const el = document.getElementById('plans-list');
+      if (!plans || plans.length === 0) {
+        el.innerHTML = '<div style="font-size:12px;color:#3f3f46;padding:8px 0;">No authored plans found.</div>';
+        return;
+      }
+      el.innerHTML = plans.map((p, i) => `
+        <div class="plan-card">
+          <div class="plan-goal">${esc(p.goalPreview || p.planId)}</div>
+          <div class="plan-meta">${p.runCount} run${p.runCount !== 1 ? 's' : ''} · $${p.perNightUsd ? p.perNightUsd.toFixed(2) : '?'} night cap${p.ok ? '' : ' · <span style="color:#fca5a5">invalid</span>'}</div>
+          <button class="btn-arm" onclick="armPlan(${i})" ${p.ok ? '' : 'disabled style="opacity:0.4"'}>Arm &amp; start</button>
+        </div>
+      `).join('');
+      window._afPlans = plans;
+    }
+
+    async function armPlan(i) {
+      const p = window._afPlans && window._afPlans[i];
+      if (!p) return;
+      if (!window.confirm('Arm and start this plan?')) return;
+      try {
+        const r = await fetch('/api/arm', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: p.path }),
+        });
+        const text = await r.text();
+        if (!r.ok) { alert('Error: ' + text); return; }
+        alert('Armed! Plan started.');
+        fetchRuns();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+    fetchPlans();
   </script>
 </body>
 </html>
@@ -350,8 +416,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-pub fn start() {
-    std::thread::spawn(|| {
+pub fn start(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
         let token = load_or_create_token();
         let server = match tiny_http::Server::http("127.0.0.1:8787") {
             Ok(s) => s,
@@ -361,7 +427,7 @@ pub fn start() {
             }
         };
         eprintln!("antfarm mobile: listening on http://127.0.0.1:8787");
-        for request in server.incoming_requests() {
+        for mut request in server.incoming_requests() {
             let url = request.url().to_string();
             let path: &str = url.split('?').next().unwrap_or("/");
             let auth = is_authorized(&request, &token);
@@ -436,6 +502,91 @@ pub fn start() {
                     let run = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::reject_run(plan, run) {
                         Ok(()) => respond(request, 200, "text/plain", "tossed".into()),
+                        Err(e) => respond(request, 500, "text/plain", e),
+                    }
+                }
+                "/api/plans" => {
+                    if !auth {
+                        respond(request, 401, "text/plain", "401 Unauthorized".into());
+                        continue;
+                    }
+                    let authored_dir = home().join(".antfarm/plans-authored");
+                    let mut result: Vec<serde_json::Value> = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&authored_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+                            let path_str = path.to_string_lossy().into_owned();
+                            let plan_id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                            match crate::harness::validate_plan_file(path_str.clone()) {
+                                Ok(v) => {
+                                    let goal_preview = v.summary.runs.first().map(|r| r.goal.clone()).unwrap_or_default();
+                                    result.push(serde_json::json!({
+                                        "planId": plan_id,
+                                        "path": path_str,
+                                        "ok": v.ok,
+                                        "runCount": v.summary.run_count,
+                                        "perNightUsd": v.summary.per_night_usd,
+                                        "goalPreview": goal_preview,
+                                    }));
+                                }
+                                Err(_) => {
+                                    result.push(serde_json::json!({
+                                        "planId": plan_id,
+                                        "path": path_str,
+                                        "ok": false,
+                                        "runCount": 0,
+                                        "perNightUsd": 0.0,
+                                        "goalPreview": "",
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    let json = serde_json::to_string(&result).unwrap_or_else(|_| "[]".into());
+                    respond(request, 200, "application/json", json);
+                }
+                "/api/arm" => {
+                    if !auth {
+                        respond(request, 401, "text/plain", "401 Unauthorized".into());
+                        continue;
+                    }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
+                        continue;
+                    }
+                    // Read body
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let path = match serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                    {
+                        Some(p) => p,
+                        None => { respond(request, 400, "text/plain", "missing path".into()); continue; }
+                    };
+                    // Validate first
+                    match crate::harness::validate_plan_file(path.clone()) {
+                        Err(e) => { respond(request, 400, "text/plain", format!("read error: {e}")); continue; }
+                        Ok(v) if !v.ok => {
+                            let err_json = serde_json::to_string(&v.errors).unwrap_or_default();
+                            respond(request, 400, "application/json", err_json);
+                            continue;
+                        }
+                        Ok(_) => {}
+                    }
+                    // Arm it
+                    let harness: tauri::State<crate::harness::HarnessState> = app.state();
+                    let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
+                    let claude = dispatch.claude_path.lock().unwrap().clone();
+                    let aborts = harness.aborts.clone();
+                    drop(harness);
+                    drop(dispatch);
+                    match crate::harness::arm_plan_from_path(app.clone(), claude, aborts, path) {
+                        Ok(plan_id) => {
+                            let json = serde_json::json!({ "planId": plan_id }).to_string();
+                            respond(request, 200, "application/json", json);
+                        }
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }

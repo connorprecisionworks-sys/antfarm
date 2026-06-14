@@ -1215,6 +1215,85 @@ function HStatusChip({ status }: { status: string }) {
 
 // ── Agents view ────────────────────────────────────────────────────────────────
 
+// ── Validator types ────────────────────────────────────────────────────────
+
+interface PlanRunSummary {
+  runId: string;
+  goal: string;
+  projectPath: string;
+  pathExists: boolean;
+  isGit: boolean;
+  stepCount: number;
+  models: string[];
+}
+interface PlanSummary {
+  planId: string;
+  runCount: number;
+  stepCount: number;
+  models: string[];
+  perStepUsd: number;
+  perRunUsd: number;
+  perNightUsd: number;
+  runs: PlanRunSummary[];
+}
+interface PlanValidation {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  summary: PlanSummary;
+}
+interface AuthorResult {
+  planPath: string;
+  validation: PlanValidation;
+}
+
+// ── ValidationReadout component ────────────────────────────────────────────
+
+function ValidationReadout({ result, onArm, armError }: { result: AuthorResult; onArm: (path: string) => void; armError: string }) {
+  const { validation, planPath } = result;
+  const s = validation.summary;
+  return (
+    <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 10, padding: "12px 14px", marginTop: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: "#a1a1aa" }}>
+          {s.planId} · {s.runCount} run{s.runCount !== 1 ? "s" : ""} · {s.stepCount} steps · ${s.perNightUsd.toFixed(2)} night cap
+        </span>
+        <span style={{ fontSize: 10, color: "#3f3f46", fontFamily: "monospace", marginLeft: "auto" }}>{planPath.split("/").pop()}</span>
+      </div>
+      {validation.errors.length > 0 && (
+        <div style={{ background: "#450a0a", borderRadius: 6, padding: "6px 10px", marginBottom: 6 }}>
+          {validation.errors.map((e, i) => <div key={i} style={{ fontSize: 11, color: "#fca5a5" }}>{e}</div>)}
+        </div>
+      )}
+      {validation.warnings.length > 0 && (
+        <div style={{ background: "#1a1207", borderRadius: 6, padding: "6px 10px", marginBottom: 6 }}>
+          {validation.warnings.map((w, i) => <div key={i} style={{ fontSize: 11, color: "#fcd34d" }}>{w}</div>)}
+        </div>
+      )}
+      {s.runs.map(r => (
+        <div key={r.runId} style={{ borderTop: "1px solid #27272a", paddingTop: 6, marginTop: 6 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#e4e4e7", marginBottom: 3 }}>{r.goal}</div>
+          <div style={{ fontSize: 11, color: "#71717a", marginBottom: 4 }}>{r.projectPath} · {r.pathExists ? (r.isGit ? "git repo" : "exists, no git") : "⚠ path missing"}</div>
+          <div style={{ fontSize: 10, color: "#52525b", fontFamily: "monospace" }}>models: {r.models.join(", ")}</div>
+        </div>
+      ))}
+      {armError && <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 6 }}>{armError}</div>}
+      <button
+        disabled={!validation.ok}
+        onClick={() => onArm(planPath)}
+        style={{
+          marginTop: 10, width: "100%", padding: "7px 0", borderRadius: 7,
+          fontSize: 12, fontWeight: 600, border: "none", cursor: validation.ok ? "pointer" : "not-allowed",
+          background: validation.ok ? "#14532d" : "#27272a",
+          color: validation.ok ? "#86efac" : "#52525b",
+        }}
+      >
+        {validation.ok ? "Arm plan" : "Fix errors before arming"}
+      </button>
+    </div>
+  );
+}
+
 function AgentsView() {
   const [plans, setPlans] = useState<HPlanState[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1223,6 +1302,16 @@ function AgentsView() {
   const [staleWorktrees, setStaleWorktrees] = useState<string[]>([]);
   const [msgs, setMsgs] = useState<Record<string, { text: string; error: boolean }>>({});
   const [stats, setStats] = useState<Record<string, string>>({});
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [authorDesc, setAuthorDesc] = useState("");
+  const [authorProject, setAuthorProject] = useState<Project | null>(null);
+  const [authorCustomPath, setAuthorCustomPath] = useState("");
+  const [authorResult, setAuthorResult] = useState<AuthorResult | null>(null);
+  const [authorError, setAuthorError] = useState("");
+  const [authorLoading, setAuthorLoading] = useState(false);
+  const [loadPlanPath, setLoadPlanPath] = useState("");
+  const [loadResult, setLoadResult] = useState<AuthorResult | null>(null);
+  const [loadError, setLoadError] = useState("");
 
   async function refresh() {
     try {
@@ -1259,6 +1348,56 @@ function AgentsView() {
     listen("antfarm-harness-event", () => refresh()).then(fn => { unlisten = fn; });
     return () => { clearInterval(interval); unlisten?.(); };
   }, []);
+
+  useEffect(() => {
+    invoke<Project[]>("list_projects").then(setProjects).catch(() => {});
+  }, []);
+
+  async function handleAuthorPlan() {
+    const projectPath = authorProject
+      ? await invoke<RepoPath[]>("get_project_paths", { slug: authorProject.slug })
+          .then(paths => paths[0]?.path ?? authorCustomPath)
+          .catch(() => authorCustomPath)
+      : authorCustomPath;
+    if (!projectPath) { setAuthorError("Select a project or enter a path"); return; }
+    setAuthorLoading(true);
+    setAuthorError("");
+    setAuthorResult(null);
+    try {
+      const result = await invoke<AuthorResult>("author_plan", {
+        description: authorDesc,
+        projectPath,
+      });
+      setAuthorResult(result);
+    } catch (e) {
+      setAuthorError(String(e));
+    } finally {
+      setAuthorLoading(false);
+    }
+  }
+
+  async function handleArmAuthoredPlan(planPath: string) {
+    try {
+      await invoke<string>("arm_night_plan", { planPath });
+      setAuthorResult(null);
+      setAuthorDesc("");
+      setAuthorProject(null);
+      refresh();
+    } catch (e) {
+      setAuthorError(String(e));
+    }
+  }
+
+  async function handleLoadPlan() {
+    setLoadError("");
+    setLoadResult(null);
+    try {
+      const v = await invoke<PlanValidation>("validate_plan_file", { planPath: loadPlanPath });
+      setLoadResult({ planPath: loadPlanPath, validation: v });
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  }
 
   const visiblePlans = hideDev ? plans.filter(p => !p.planId.startsWith("dev-")) : plans;
 
@@ -1326,6 +1465,87 @@ function AgentsView() {
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto">
+        {/* Author a plan panel */}
+        <div style={{ padding: "14px 14px 0" }}>
+          <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 12, padding: "14px" }}>
+            <p style={{ fontSize: 12, fontWeight: 700, color: "#a1a1aa", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>Author a plan</p>
+            <textarea
+              value={authorDesc}
+              onChange={e => setAuthorDesc(e.target.value)}
+              placeholder="Describe what you want the agent to do overnight…"
+              rows={3}
+              style={{ width: "100%", background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "8px 10px", resize: "vertical", fontFamily: "inherit", outline: "none" }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <select
+                value={authorProject?.slug ?? ""}
+                onChange={e => {
+                  const p = projects.find(p => p.slug === e.target.value) ?? null;
+                  setAuthorProject(p);
+                }}
+                style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 8px", outline: "none" }}
+              >
+                <option value="">— pick project —</option>
+                {projects.map(p => <option key={p.slug} value={p.slug}>{p.name}</option>)}
+              </select>
+              <input
+                value={authorCustomPath}
+                onChange={e => setAuthorCustomPath(e.target.value)}
+                placeholder="or paste path"
+                style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 10px", outline: "none" }}
+              />
+            </div>
+            <button
+              onClick={handleAuthorPlan}
+              disabled={authorLoading || !authorDesc.trim()}
+              style={{
+                marginTop: 8, width: "100%", padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600,
+                border: "none", cursor: authorLoading || !authorDesc.trim() ? "not-allowed" : "pointer",
+                background: authorLoading ? "#27272a" : "#3730a3", color: authorLoading ? "#52525b" : "#a5b4fc",
+              }}
+            >
+              {authorLoading ? "Generating plan… (~30s)" : "Generate plan"}
+            </button>
+            {authorError && <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 6 }}>{authorError}</div>}
+            {authorResult && (
+              <ValidationReadout result={authorResult} onArm={handleArmAuthoredPlan} armError={""} />
+            )}
+          </div>
+
+          {/* Load existing plan */}
+          <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 12, padding: "14px", marginTop: 10 }}>
+            <p style={{ fontSize: 12, fontWeight: 700, color: "#a1a1aa", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>Load existing plan</p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                value={loadPlanPath}
+                onChange={e => setLoadPlanPath(e.target.value)}
+                placeholder="~/.antfarm/plans-authored/…json"
+                style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 10px", outline: "none" }}
+              />
+              <button
+                onClick={handleLoadPlan}
+                disabled={!loadPlanPath.trim()}
+                style={{ padding: "6px 12px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none", cursor: loadPlanPath.trim() ? "pointer" : "not-allowed", background: "#27272a", color: "#a1a1aa" }}
+              >
+                Validate
+              </button>
+            </div>
+            {loadError && <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 6 }}>{loadError}</div>}
+            {loadResult && (
+              <ValidationReadout result={loadResult} onArm={async (path) => {
+                try {
+                  await invoke<string>("arm_night_plan", { planPath: path });
+                  setLoadResult(null);
+                  setLoadPlanPath("");
+                  refresh();
+                } catch (e) {
+                  setLoadError(String(e));
+                }
+              }} armError={""} />
+            )}
+          </div>
+        </div>
+
         {!loading && entries.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-64 gap-3">
             <Activity size={32} className="text-zinc-800" />

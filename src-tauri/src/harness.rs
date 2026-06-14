@@ -72,6 +72,49 @@ pub struct NightPlan {
     pub runs: Vec<RunSpec>,
 }
 
+// ── Validation types ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub run_id: String,
+    pub goal: String,
+    pub project_path: String,
+    pub path_exists: bool,
+    pub is_git: bool,
+    pub step_count: u32,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSummary {
+    pub plan_id: String,
+    pub run_count: u32,
+    pub step_count: u32,
+    pub models: Vec<String>,
+    pub per_step_usd: f64,
+    pub per_run_usd: f64,
+    pub per_night_usd: f64,
+    pub runs: Vec<RunSummary>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanValidation {
+    pub ok: bool,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub summary: PlanSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorResult {
+    pub plan_path: String,
+    pub validation: PlanValidation,
+}
+
 // ── Live state ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -155,6 +198,17 @@ fn plans_dir() -> PathBuf {
     let d = home().join(".antfarm/plans");
     std::fs::create_dir_all(&d).ok();
     d
+}
+
+fn plans_authored_dir() -> PathBuf {
+    let d = home().join(".antfarm/plans-authored");
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+fn is_known_model(s: &str) -> bool {
+    let m = s.to_lowercase();
+    m.contains("haiku") || m.contains("sonnet") || m.contains("opus")
 }
 
 fn save_state(st: &PlanState) {
@@ -830,6 +884,138 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
     });
 }
 
+pub fn validate_night_plan(plan: &NightPlan) -> PlanValidation {
+    use std::collections::{BTreeSet, HashSet};
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    if plan.plan_id.trim().is_empty() {
+        errors.push("plan_id is empty".into());
+    }
+    if plan.runs.is_empty() {
+        errors.push("runs list is empty".into());
+    }
+    if !is_known_model(&plan.defaults.model) {
+        errors.push(format!("defaults.model '{}' is not a known model (must contain haiku, sonnet, or opus)", plan.defaults.model));
+    }
+
+    // Budget sanity
+    let b = &plan.budgets;
+    if !b.per_step_usd.is_finite() || b.per_step_usd <= 0.0 {
+        errors.push(format!("per_step_usd must be finite and > 0 (got {})", b.per_step_usd));
+    } else if !b.per_run_usd.is_finite() || b.per_run_usd <= 0.0 {
+        errors.push(format!("per_run_usd must be finite and > 0 (got {})", b.per_run_usd));
+    } else if b.per_run_usd < b.per_step_usd {
+        errors.push(format!("per_run_usd ({}) must be >= per_step_usd ({})", b.per_run_usd, b.per_step_usd));
+    }
+    if !b.per_night_usd.is_finite() || b.per_night_usd <= 0.0 {
+        errors.push(format!("per_night_usd must be finite and > 0 (got {})", b.per_night_usd));
+    } else if b.per_night_usd < b.per_run_usd {
+        errors.push(format!("per_night_usd ({}) must be >= per_run_usd ({})", b.per_night_usd, b.per_run_usd));
+    }
+
+    // Run-level checks
+    let mut seen_run_ids: HashSet<&str> = HashSet::new();
+    for run in &plan.runs {
+        if run.run_id.trim().is_empty() {
+            errors.push("a run has an empty run_id".into());
+        } else if !seen_run_ids.insert(run.run_id.as_str()) {
+            errors.push(format!("duplicate run_id '{}'", run.run_id));
+        }
+        if run.steps.is_empty() {
+            errors.push(format!("run '{}' has zero steps", run.run_id));
+        }
+        if run.project_path.trim().is_empty() {
+            errors.push(format!("run '{}': project_path is empty", run.run_id));
+        } else if !Path::new(&run.project_path).is_dir() {
+            errors.push(format!("run '{}': project_path '{}' does not exist as a directory", run.run_id, run.project_path));
+        }
+        let mut seen_step_ids: HashSet<&str> = HashSet::new();
+        for step in &run.steps {
+            if step.id.trim().is_empty() {
+                errors.push(format!("run '{}': a step has an empty id", run.run_id));
+            } else if !seen_step_ids.insert(step.id.as_str()) {
+                errors.push(format!("run '{}': duplicate step id '{}'", run.run_id, step.id));
+            }
+            if step.accept.trim().is_empty() {
+                errors.push(format!("run '{}' step '{}': accept is empty", run.run_id, step.id));
+            }
+            if let Some(m) = &step.model {
+                if !is_known_model(m) {
+                    errors.push(format!("run '{}' step '{}': model '{}' is not a known model", run.run_id, step.id, m));
+                }
+            }
+        }
+    }
+
+    // Warnings
+    if plan.armed {
+        warnings.push("armed flag in file is ignored; use the Arm button".into());
+    }
+    if plan.budgets.per_night_usd > 20.0 {
+        warnings.push(format!("high night budget ${:.2}", plan.budgets.per_night_usd));
+    }
+    let plans_state_dir = home().join(".antfarm/plans").join(&plan.plan_id);
+    if plans_state_dir.is_dir() {
+        warnings.push(format!("plan_id '{}' already exists; arming may collide with prior state", plan.plan_id));
+    }
+    for run in &plan.runs {
+        let p = Path::new(&run.project_path);
+        if p.is_dir() && !p.join(".git").is_dir() {
+            warnings.push(format!("run '{}': '{}' has no .git subdir; harness creates a worktree", run.run_id, run.project_path));
+        }
+        if run.setup.is_none() && p.is_dir()
+            && (p.join("package.json").exists() || p.join("Cargo.toml").exists()) {
+            warnings.push(format!("run '{}': no setup command; a fresh worktree has no installed deps", run.run_id));
+        }
+    }
+
+    // Build summary
+    let mut all_models: BTreeSet<String> = BTreeSet::new();
+    all_models.insert(plan.defaults.model.clone());
+    let mut total_steps: u32 = 0;
+    let mut run_summaries: Vec<RunSummary> = Vec::new();
+    for run in &plan.runs {
+        let p = Path::new(&run.project_path);
+        let path_exists = p.is_dir();
+        let is_git = p.join(".git").is_dir();
+        let mut run_models: BTreeSet<String> = BTreeSet::new();
+        run_models.insert(plan.defaults.model.clone());
+        for step in &run.steps {
+            let m = step.model.as_deref().unwrap_or(&plan.defaults.model).to_string();
+            run_models.insert(m.clone());
+            all_models.insert(m);
+        }
+        total_steps += run.steps.len() as u32;
+        run_summaries.push(RunSummary {
+            run_id: run.run_id.clone(),
+            goal: run.goal.clone(),
+            project_path: run.project_path.clone(),
+            path_exists,
+            is_git,
+            step_count: run.steps.len() as u32,
+            models: run_models.into_iter().collect(),
+        });
+    }
+
+    PlanValidation {
+        ok: errors.is_empty(),
+        errors,
+        warnings,
+        summary: PlanSummary {
+            plan_id: plan.plan_id.clone(),
+            run_count: plan.runs.len() as u32,
+            step_count: total_steps,
+            models: all_models.into_iter().collect(),
+            per_step_usd: plan.budgets.per_step_usd,
+            per_run_usd: plan.budgets.per_run_usd,
+            per_night_usd: plan.budgets.per_night_usd,
+            runs: run_summaries,
+        },
+    }
+}
+
 fn save_state_with(st: &mut PlanState, rs: &RunState) {
     if let Some(existing) = st.runs.iter_mut().find(|r| r.run_id == rs.run_id) {
         *existing = rs.clone();
@@ -841,17 +1027,171 @@ fn save_state_with(st: &mut PlanState, rs: &RunState) {
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
+pub fn arm_plan_from_path(
+    app: AppHandle,
+    claude: String,
+    aborts: Arc<Mutex<HashMap<String, bool>>>,
+    plan_path: String,
+) -> Result<String, String> {
+    let text = std::fs::read_to_string(&plan_path).map_err(|e| e.to_string())?;
+    let plan: NightPlan = serde_json::from_str(&text).map_err(|e| format!("invalid plan: {e}"))?;
+    aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
+    let id = plan.plan_id.clone();
+    execute_plan(app, claude, plan, aborts);
+    Ok(id)
+}
+
 #[tauri::command]
 pub fn arm_night_plan(app: AppHandle, state: State<'_, HarnessState>,
                       dispatch: State<'_, crate::dispatch::DispatchState>,
                       plan_path: String) -> Result<String, String> {
-    let text = std::fs::read_to_string(&plan_path).map_err(|e| e.to_string())?;
-    let plan: NightPlan = serde_json::from_str(&text).map_err(|e| format!("invalid plan: {e}"))?;
     let claude = dispatch.claude_path.lock().unwrap().clone();
-    state.aborts.lock().unwrap().insert(plan.plan_id.clone(), false);
-    let id = plan.plan_id.clone();
-    execute_plan(app, claude, plan, state.aborts.clone());
-    Ok(id)
+    arm_plan_from_path(app, claude, state.aborts.clone(), plan_path)
+}
+
+#[tauri::command]
+pub fn validate_plan_file(plan_path: String) -> Result<PlanValidation, String> {
+    let text = match std::fs::read_to_string(&plan_path) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("read error: {e}")),
+    };
+    match serde_json::from_str::<NightPlan>(&text) {
+        Ok(plan) => Ok(validate_night_plan(&plan)),
+        Err(e) => Ok(PlanValidation {
+            ok: false,
+            errors: vec![format!("invalid plan JSON: {e}")],
+            ..Default::default()
+        }),
+    }
+}
+
+const PLAN_AUTHOR_PROMPT: &str = r#"You are the orchestrator for an overnight coding harness. Convert the user's request into a single valid night-plan JSON object and output ONLY that JSON, no prose, no markdown fences.
+
+User request: {description}
+Target repository: {project_path}
+Use this exact plan_id: {plan_id}
+
+Inspect the repo (read package.json, Cargo.toml, or test files) to choose REAL accept checks and setup commands that match this project.
+
+Schema (all fields required unless marked optional):
+{
+  "plan_id": "{plan_id}",
+  "armed": false,
+  "budgets": { "per_step_usd": <num>, "per_run_usd": <num>, "per_night_usd": <num> },
+  "defaults": { "model": "claude-sonnet-4-6", "max_wall_minutes": 30, "silence_minutes": 5, "max_attempts": 2, "permission_mode": "dontAsk" },
+  "max_parallel": 1,
+  "runs": [
+    {
+      "run_id": "<unique-kebab-id>",
+      "project_path": "{project_path}",
+      "goal": "<one sentence>",
+      "setup": "<install command or omit if no deps, e.g. npm ci>",
+      "on_fail": "stop_run",
+      "steps": [
+        { "id": "<unique-within-run>", "prompt": "<precise instruction>", "accept": "<shell command that exits nonzero on failure, e.g. npm run build, npm test, cargo test, node --test>", "max_attempts": 2, "model": "<claude-haiku-4-5-20251001 | claude-sonnet-4-6 | claude-opus-4-8>" }
+      ]
+    }
+  ]
+}
+
+Rules:
+- armed MUST be false.
+- Assign step.model by difficulty: claude-haiku-4-5-20251001 for trivial/mechanical, claude-sonnet-4-6 for standard work, claude-opus-4-8 for gnarly/ambiguous. Use EXACTLY those model strings.
+- Every step.accept must be a real shell command that fails (nonzero exit) when the work is wrong. Never leave accept empty.
+- If the repo has a lockfile, include a setup command (npm ci / cargo fetch).
+- Budgets ascending: per_step_usd <= per_run_usd <= per_night_usd, all > 0. Estimate conservatively (a Sonnet step is roughly $0.10-0.30).
+- Split into multiple runs only when chunks are genuinely independent and could run in parallel; otherwise one run with ordered steps.
+Output ONLY the JSON object."#;
+
+#[tauri::command]
+pub fn author_plan(
+    _app: AppHandle,
+    dispatch: State<'_, crate::dispatch::DispatchState>,
+    description: String,
+    project_path: String,
+) -> Result<AuthorResult, String> {
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let plan_id = format!("authored-{ts}");
+    let brain = format!("{}/Desktop/CD_claude", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+    let prompt = PLAN_AUTHOR_PROMPT
+        .replace("{description}", &description)
+        .replace("{project_path}", &project_path)
+        .replace("{plan_id}", &plan_id);
+
+    let mut child = Command::new(&claude)
+        .args(["-p", &prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "dontAsk",
+               "--model", OPUS,
+               "--add-dir", &brain])
+        .current_dir(&project_path)
+        .stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+
+    let started = Instant::now();
+    let max_wall = Duration::from_secs(180);
+    let mut result_text = String::new();
+    let mut cost = 0.0_f64;
+    loop {
+        if started.elapsed() > max_wall {
+            child.kill().ok();
+            break;
+        }
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(line) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                        result_text = v.get("result").and_then(|r| r.as_str())
+                            .unwrap_or("").trim().to_string();
+                        cost = v.get("total_cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    child.wait().ok();
+    eprintln!("antfarm author_plan: Opus cost ${cost:.4}");
+
+    // Extract JSON: strip fences, find first '{' to last '}'
+    let stripped = result_text
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let json_slice = match (stripped.find('{'), stripped.rfind('}')) {
+        (Some(start), Some(end)) if end >= start => &stripped[start..=end],
+        _ => return Err(format!("author_plan: no JSON object in Opus output; raw: {result_text}")),
+    };
+    // Validate the JSON parses
+    serde_json::from_str::<serde_json::Value>(json_slice)
+        .map_err(|e| format!("author_plan: JSON parse failed ({e}); raw: {result_text}"))?;
+
+    // Write to disk
+    let out_dir = plans_authored_dir();
+    let plan_path = out_dir.join(format!("{plan_id}.json"));
+    std::fs::write(&plan_path, json_slice)
+        .map_err(|e| format!("write failed: {e}"))?;
+    let plan_path_str = plan_path.to_string_lossy().into_owned();
+
+    // Validate
+    let validation = validate_plan_file(plan_path_str.clone())?;
+
+    Ok(AuthorResult { plan_path: plan_path_str, validation })
 }
 
 #[tauri::command]
@@ -1283,5 +1623,89 @@ mod tests {
             !(0.0_f64 >= b.per_night_usd),
             "gate must be open before first step runs"
         );
+    }
+
+    fn make_good_plan() -> NightPlan {
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        NightPlan {
+            plan_id: "test-plan-good".into(),
+            armed: false,
+            budgets: Budgets { per_step_usd: 0.10, per_run_usd: 0.50, per_night_usd: 2.0 },
+            defaults: PlanDefaults {
+                model: "claude-sonnet-4-6".into(),
+                max_wall_minutes: 30,
+                silence_minutes: 5,
+                max_attempts: 2,
+                permission_mode: "dontAsk".into(),
+            },
+            max_parallel: 1,
+            runs: vec![RunSpec {
+                run_id: "run-1".into(),
+                project_path: tmp,
+                goal: "a test goal".into(),
+                setup: None,
+                on_fail: None,
+                steps: vec![StepSpec {
+                    id: "step-1".into(),
+                    prompt: "do the thing".into(),
+                    accept: "true".into(),
+                    max_attempts: None,
+                    model: None,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn good_plan_validates_ok() {
+        let plan = make_good_plan();
+        let v = validate_night_plan(&plan);
+        assert!(v.ok, "unexpected errors: {:?}", v.errors);
+    }
+
+    #[test]
+    fn bad_model_caught() {
+        let mut plan = make_good_plan();
+        plan.defaults.model = "gpt-4-turbo".into();
+        let v = validate_night_plan(&plan);
+        assert!(!v.ok);
+        assert!(v.errors.iter().any(|e| e.contains("gpt-4-turbo")), "errors: {:?}", v.errors);
+    }
+
+    #[test]
+    fn empty_accept_caught() {
+        let mut plan = make_good_plan();
+        plan.runs[0].steps[0].accept = "   ".into();
+        let v = validate_night_plan(&plan);
+        assert!(!v.ok);
+        assert!(v.errors.iter().any(|e| e.contains("accept is empty")), "errors: {:?}", v.errors);
+    }
+
+    #[test]
+    fn broken_budget_order_caught() {
+        let mut plan = make_good_plan();
+        plan.budgets.per_run_usd = 0.05; // less than per_step_usd 0.10
+        let v = validate_night_plan(&plan);
+        assert!(!v.ok);
+        assert!(v.errors.iter().any(|e| e.contains("per_run_usd") && e.contains("per_step_usd")), "errors: {:?}", v.errors);
+    }
+
+    #[test]
+    fn dup_run_id_caught() {
+        let mut plan = make_good_plan();
+        let extra = plan.runs[0].clone();
+        plan.runs.push(extra);
+        let v = validate_night_plan(&plan);
+        assert!(!v.ok);
+        assert!(v.errors.iter().any(|e| e.contains("duplicate run_id")), "errors: {:?}", v.errors);
+    }
+
+    #[test]
+    fn missing_path_caught() {
+        let mut plan = make_good_plan();
+        plan.runs[0].project_path = "/tmp/antfarm-test-path-does-not-exist-xyzzy-12345".into();
+        let v = validate_night_plan(&plan);
+        assert!(!v.ok);
+        assert!(v.errors.iter().any(|e| e.contains("does not exist as a directory")), "errors: {:?}", v.errors);
     }
 }

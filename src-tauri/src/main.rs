@@ -1893,7 +1893,7 @@ fn main() {
             // Mark any step/run left "running" from a prior crash as interrupted.
             harness::reconcile_orphans();
             // Start the read-only mobile status server on 127.0.0.1:8787 (non-blocking).
-            mobile::start();
+            mobile::start(app.handle().clone());
             // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
             let path = dispatch::resolve_claude_path();
             *dispatch_claude.lock().unwrap() = path;
@@ -1935,6 +1935,8 @@ fn main() {
             harness::take_over_overnight_run,
             harness::list_stale_worktrees,
             harness::harness_run_summary,
+            harness::validate_plan_file,
+            harness::author_plan,
             harness::dev_test_harness,
             harness::dev_test_3step_fail,
             harness::dev_test_budget_gate,
