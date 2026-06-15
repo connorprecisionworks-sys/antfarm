@@ -216,13 +216,16 @@ pub fn load_chat(key: String) -> ChatThread {
 }
 
 #[tauri::command]
-pub fn send_chat_message(
+pub async fn send_chat_message(
     _app: AppHandle,
     dispatch: State<'_, crate::dispatch::DispatchState>,
     key: String,
     project_path: String,
     text: String,
 ) -> Result<ChatThread, String> {
+    // Resolve all State + do non-blocking prep before going off-thread.
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+
     let mut thread = load_thread_from_disk(&key, &project_path);
     thread.key = key.clone();
     thread.project_path = project_path.clone();
@@ -238,13 +241,16 @@ pub fn send_chat_message(
         error: None,
     });
 
-    let claude = dispatch.claude_path.lock().unwrap().clone();
-    let (reply, new_sid) = chat_turn_core(
-        &claude,
-        &project_path,
-        &thread.messages,
-        thread.session_id.as_deref(),
-    )?;
+    // Clone owned inputs for the blocking closure (State is !Send).
+    let msgs = thread.messages.clone();
+    let sid  = thread.session_id.clone();
+    let pp   = project_path.clone();
+
+    let (reply, new_sid) = tauri::async_runtime::spawn_blocking(move || {
+        chat_turn_core(&claude, &pp, &msgs, sid.as_deref())
+    })
+    .await
+    .map_err(|e| format!("task panicked: {e}"))??;
 
     if new_sid.is_some() {
         thread.session_id = new_sid;
@@ -266,12 +272,15 @@ pub fn send_chat_message(
 }
 
 #[tauri::command]
-pub fn build_from_chat(
+pub async fn build_from_chat(
     _app: AppHandle,
     dispatch: State<'_, crate::dispatch::DispatchState>,
     key: String,
     project_path: String,
 ) -> Result<ChatThread, String> {
+    // Resolve all State + assemble description before going off-thread.
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+
     let mut thread = load_thread_from_disk(&key, &project_path);
     thread.project_path = project_path.clone();
 
@@ -286,7 +295,13 @@ pub fn build_from_chat(
         "Build what this conversation converged on.\n\nConversation so far:\n{transcript}"
     );
 
-    let claude = dispatch.claude_path.lock().unwrap().clone();
+    let pp = project_path.clone();
+    let author_result = tauri::async_runtime::spawn_blocking(move || {
+        crate::harness::author_plan_core(claude, description, pp)
+    })
+    .await
+    .map_err(|e| format!("task panicked: {e}"))?;
+
     let mut agent_msg = ChatMessage {
         id: new_msg_id(),
         role: "agent".into(),
@@ -298,7 +313,7 @@ pub fn build_from_chat(
         error: None,
     };
 
-    match crate::harness::author_plan_core(claude, description, project_path) {
+    match author_result {
         Ok(result) => {
             agent_msg.plan_id = Some(result.validation.summary.plan_id.clone());
             agent_msg.plan_path = Some(result.plan_path);

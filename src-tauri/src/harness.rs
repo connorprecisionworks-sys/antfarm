@@ -1221,14 +1221,16 @@ pub fn author_plan_core(claude: String, description: String, project_path: Strin
 }
 
 #[tauri::command]
-pub fn author_plan(
+pub async fn author_plan(
     _app: AppHandle,
     dispatch: State<'_, crate::dispatch::DispatchState>,
     description: String,
     project_path: String,
 ) -> Result<AuthorResult, String> {
     let claude = dispatch.claude_path.lock().unwrap().clone();
-    author_plan_core(claude, description, project_path)
+    tauri::async_runtime::spawn_blocking(move || author_plan_core(claude, description, project_path))
+        .await
+        .map_err(|e| format!("task panicked: {e}"))?
 }
 
 pub fn propose_plan_core(claude: String, description: String, project_path: String) -> Result<ProposalResult, String> {
@@ -1296,14 +1298,16 @@ pub fn propose_plan_core(claude: String, description: String, project_path: Stri
 }
 
 #[tauri::command]
-pub fn propose_plan(
+pub async fn propose_plan(
     _app: AppHandle,
     dispatch: State<'_, crate::dispatch::DispatchState>,
     description: String,
     project_path: String,
 ) -> Result<ProposalResult, String> {
     let claude = dispatch.claude_path.lock().unwrap().clone();
-    propose_plan_core(claude, description, project_path)
+    tauri::async_runtime::spawn_blocking(move || propose_plan_core(claude, description, project_path))
+        .await
+        .map_err(|e| format!("task panicked: {e}"))?
 }
 
 #[tauri::command]
