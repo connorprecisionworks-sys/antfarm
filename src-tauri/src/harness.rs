@@ -1090,18 +1090,35 @@ Use this exact plan_id: {plan_id}
 
 Inspect the repo (read package.json, Cargo.toml, or test files) to choose REAL accept checks and setup commands that match this project.
 
+DECOMPOSITION (most important):
+- DEFAULT to MANY small runs. Create a SEPARATE run for each independently-shippable unit of work. If the request is a list of N independent things (N charts, N bug fixes, N pages), produce N runs — NOT one run with N steps.
+- Use multiple STEPS inside ONE run ONLY for pieces that are tightly coupled and must land together as a single mergeable change (e.g. a pure helper + the component that uses it + its test = one run, 2-3 steps).
+- CRITICAL — runs are parallel and independent: each run branches from the CURRENT main and is not merged until a human reviews it, so every run MUST be independently buildable from main and MUST NOT depend on another run's unmerged output. Put work that depends on shared NEW code in the SAME run; only split work that is genuinely independent. If many items would share a new foundational piece, either give each run its own self-contained version, or put that foundation together with its consumers in one run.
+- Keep each run SMALL: one focused change, a handful of files, an accept check that can plausibly pass. A run that touches a dozen pages is too big — split it into more runs.
+- When there are multiple runs, set "max_parallel": 3 (the harness caps concurrency there).
+
 Schema (all fields required unless marked optional):
 {
   "plan_id": "{plan_id}",
   "armed": false,
   "budgets": { "per_step_usd": <num>, "per_run_usd": <num>, "per_night_usd": <num> },
   "defaults": { "model": "claude-sonnet-4-6", "max_wall_minutes": 30, "silence_minutes": 5, "max_attempts": 2, "permission_mode": "dontAsk" },
-  "max_parallel": 1,
+  "max_parallel": 3,
   "runs": [
     {
-      "run_id": "<unique-kebab-id>",
+      "run_id": "<unique-kebab-id-a>",
       "project_path": "{project_path}",
-      "goal": "<one sentence>",
+      "goal": "<one sentence describing first independent unit>",
+      "setup": "<install command or omit if no deps, e.g. npm ci>",
+      "on_fail": "stop_run",
+      "steps": [
+        { "id": "<unique-within-run>", "prompt": "<precise instruction>", "accept": "<shell command that exits nonzero on failure, e.g. npm run build, npm test, cargo test, node --test>", "max_attempts": 2, "model": "<claude-haiku-4-5-20251001 | claude-sonnet-4-6 | claude-opus-4-8>" }
+      ]
+    },
+    {
+      "run_id": "<unique-kebab-id-b>",
+      "project_path": "{project_path}",
+      "goal": "<one sentence describing second independent unit>",
       "setup": "<install command or omit if no deps, e.g. npm ci>",
       "on_fail": "stop_run",
       "steps": [
@@ -1117,7 +1134,6 @@ Rules:
 - Every step.accept must be a real shell command that fails (nonzero exit) when the work is wrong. Never leave accept empty.
 - If the repo has a lockfile, include a setup command (npm ci / cargo fetch).
 - Budgets ascending: per_step_usd <= per_run_usd <= per_night_usd, all > 0. Estimate conservatively (a Sonnet step is roughly $0.10-0.30).
-- Split into multiple runs only when chunks are genuinely independent and could run in parallel; otherwise one run with ordered steps.
 Output ONLY the JSON object."#;
 
 const PLAN_PROPOSE_PROMPT: &str = r#"You are the lead engineer on a team. The user has a rough idea. Do NOT write code or a plan yet. Inspect the repository to ground your thinking, then propose how to approach it and surface the decisions a human should make.
