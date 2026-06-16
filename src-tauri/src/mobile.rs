@@ -717,6 +717,11 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       letter-spacing: .08em; cursor: pointer; padding: 4px 8px;
     }
     #voice-captions-btn.on { color: #7c97e8; }
+    #rt-debug {
+      font-size: 10px; font-family: ui-monospace, monospace;
+      color: #3f3f46; letter-spacing: .05em; text-align: center;
+      min-height: 14px; margin-top: 6px; padding: 0 20px;
+    }
 
     /* ── Voice nav tab ── */
     .tab-voice {
@@ -757,6 +762,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     <canvas id="orb-canvas"></canvas>
     <!-- state label under orb -->
     <div id="voice-state-text"></div>
+    <!-- mic/rtc debug (visible until confirmed working) -->
+    <div id="rt-debug"></div>
     <!-- bottom controls -->
     <div id="voice-bottom">
       <div style="display:flex;gap:12px;align-items:center;">
@@ -1828,11 +1835,36 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         s === 'thinking'   ? 'THINKING...'   : s === 'speaking'  ? 'SPEAKING' : '';
     }
 
+    function rtDebug(msg) {
+      const el = document.getElementById('rt-debug');
+      if (el) el.textContent = msg;
+    }
+
     async function openVoiceOverlay(mode) {
+      // AudioContext MUST be created + resumed synchronously in the user gesture
+      // (before any await) — iOS Safari permanently suspends it otherwise.
+      if (!_RT.audioCtx || _RT.audioCtx.state === 'closed') {
+        _RT.audioCtx = new AudioContext();
+      }
+      _RT.audioCtx.resume(); // fire-and-forget; unlocks hardware audio on iOS
+
+      // Pre-create the remote <audio> element and call .play() here in the gesture
+      // so iOS grants it autoplay permission for when the remote track arrives.
+      let remoteAudio = document.getElementById('rt-remote-audio');
+      if (!remoteAudio) {
+        remoteAudio = document.createElement('audio');
+        remoteAudio.id = 'rt-remote-audio';
+        remoteAudio.autoplay = true;
+        remoteAudio.setAttribute('playsinline', '');
+        document.body.appendChild(remoteAudio);
+      }
+      remoteAudio.play().catch(() => {}); // unlock audio session in gesture
+
       const ov = document.getElementById('voice-overlay');
       ov.classList.add('active');
       requestAnimationFrame(() => ov.classList.add('visible'));
       startOrbCanvas();
+      rtDebug('connecting...');
       await connectRealtime(mode || 'morning');
     }
 
@@ -1873,43 +1905,64 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         if (!r.ok) throw new Error(await r.text());
         const d = await r.json();
         token = d.token; model = d.model;
+        rtDebug('token ok · model: ' + model);
       } catch (e) {
         setOrbState('idle');
-        document.getElementById('voice-status-text').textContent = 'failed: ' + e.message;
+        document.getElementById('voice-status-text').textContent = 'token failed: ' + e.message;
+        rtDebug('token failed: ' + e.message);
         return;
       }
-      // 2. Mic
+      // 2. Mic — getUserMedia is safe after awaits inside a user-gesture async chain
       try {
-        _RT.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (_) {
+        _RT.stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        const trk = _RT.stream.getAudioTracks()[0];
+        rtDebug('mic: ' + (trk ? trk.readyState + ' en=' + trk.enabled : 'no track'));
+      } catch (e) {
         setOrbState('idle');
         document.getElementById('voice-status-text').textContent = 'mic denied';
+        rtDebug('mic denied: ' + e.message);
         return;
       }
-      // 3. WebAudio mic analyser
-      _RT.audioCtx = new AudioContext();
+      // 3. Wire mic → analyser (AudioContext already created + resumed in openVoiceOverlay)
       const micSrc = _RT.audioCtx.createMediaStreamSource(_RT.stream);
       _RT.micAn = _RT.audioCtx.createAnalyser(); _RT.micAn.fftSize = 256;
       _RT.micFreqBuf = new Uint8Array(_RT.micAn.frequencyBinCount);
-      micSrc.connect(_RT.micAn);
+      micSrc.connect(_RT.micAn); // NOT to destination — avoids mic feedback loop
+      rtDebug('mic wired · ctx: ' + _RT.audioCtx.state);
       // 4. RTCPeerConnection
       _RT.pc = new RTCPeerConnection();
       _RT.pc.ontrack = (e) => {
         const s = e.streams[0]; if (!s) return;
-        const outSrc = _RT.audioCtx.createMediaStreamSource(s);
-        _RT.outAn = _RT.audioCtx.createAnalyser(); _RT.outAn.fftSize = 256;
-        _RT.outFreqBuf = new Uint8Array(_RT.outAn.frequencyBinCount);
-        outSrc.connect(_RT.outAn);
-        outSrc.connect(_RT.audioCtx.destination);
+        // <audio> element handles remote playback — required for iOS Safari autoplay
+        let remoteAudio = document.getElementById('rt-remote-audio');
+        if (!remoteAudio) {
+          remoteAudio = document.createElement('audio');
+          remoteAudio.id = 'rt-remote-audio';
+          remoteAudio.autoplay = true;
+          remoteAudio.setAttribute('playsinline', '');
+          document.body.appendChild(remoteAudio);
+        }
+        remoteAudio.srcObject = s;
+        remoteAudio.play().catch(() => {});
+        // Also wire to analyser for orb reactivity (audio element plays, not destination)
+        if (_RT.audioCtx && _RT.audioCtx.state !== 'closed') {
+          const outSrc = _RT.audioCtx.createMediaStreamSource(s);
+          _RT.outAn = _RT.audioCtx.createAnalyser(); _RT.outAn.fftSize = 256;
+          _RT.outFreqBuf = new Uint8Array(_RT.outAn.frequencyBinCount);
+          outSrc.connect(_RT.outAn);
+        }
+        rtDebug('remote track received');
       };
+      // 5. Add mic track BEFORE creating offer
       for (const track of _RT.stream.getTracks()) _RT.pc.addTrack(track, _RT.stream);
-      // 5. Data channel
+      // 6. Data channel
       _RT.dc = _RT.pc.createDataChannel('oai-events');
       _RT.dc.onopen = () => {
         setOrbState('listening');
         _RT.lastAudioTs = Date.now();
         _RT.sessionStart = Date.now();
         startSessionTimer();
+        rtDebug('dc open · ctx: ' + _RT.audioCtx.state);
         _RT.idleTimer = setInterval(() => {
           if (Date.now() - _RT.lastAudioTs > 40000) {
             const s = document.getElementById('voice-status-text');
@@ -1922,7 +1975,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       };
       _RT.dc.onmessage = (e) => { try { handleRealtimeEvent(JSON.parse(e.data)); } catch {} };
       _RT.dc.onclose = () => setOrbState('idle');
-      // 6. SDP exchange
+      // 7. SDP exchange
       const offer = await _RT.pc.createOffer();
       await _RT.pc.setLocalDescription(offer);
       try {
@@ -1933,15 +1986,17 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         });
         if (!sdpR.ok) throw new Error(await sdpR.text());
         await _RT.pc.setRemoteDescription({ type: 'answer', sdp: await sdpR.text() });
+        rtDebug('sdp negotiated');
       } catch (e) {
         document.getElementById('voice-status-text').textContent = 'WebRTC failed';
+        rtDebug('sdp error: ' + e.message);
         stopRealtime();
       }
     }
 
     function handleRealtimeEvent(evt) {
       switch (evt.type) {
-        case 'input_audio_buffer.speech_started':   _RT.lastAudioTs = Date.now(); setOrbState('listening'); break;
+        case 'input_audio_buffer.speech_started':   _RT.lastAudioTs = Date.now(); setOrbState('listening'); rtDebug('vad: speech'); break;
         case 'response.audio.delta':                _RT.lastAudioTs = Date.now(); setOrbState('speaking');  break;
         case 'response.audio.done':                 setOrbState('listening'); break;
         case 'response.function_call_arguments.done':
@@ -2006,8 +2061,11 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       if (_RT.stream) { _RT.stream.getTracks().forEach(t => t.stop()); _RT.stream = null; }
       if (_RT.audioCtx) { try { _RT.audioCtx.close(); } catch {} _RT.audioCtx = null; }
       _RT.micAn = null; _RT.outAn = null; _RT.sessionStart = null; _RT.pendingDispatch = null;
+      const remoteAudio = document.getElementById('rt-remote-audio');
+      if (remoteAudio) { remoteAudio.srcObject = null; remoteAudio.remove(); }
       const t = document.getElementById('voice-timer'); if (t) t.textContent = '';
       const c = document.getElementById('voice-cost');  if (c) c.textContent = '';
+      rtDebug('');
     }
 
     function startSessionTimer() {
