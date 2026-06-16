@@ -1962,6 +1962,7 @@ fn main() {
             morning::generate_morning_briefing,
             morning::morning_chat_send,
             morning::morning_insight,
+            morning::refresh_whoop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

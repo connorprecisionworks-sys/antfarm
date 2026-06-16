@@ -46,44 +46,26 @@ Rules:
 - Output ONLY the JSON. Nothing else."#;
 
 #[tauri::command]
-pub async fn generate_morning_briefing(dispatch: State<'_, DispatchState>) -> Result<String, String> {
+pub async fn generate_morning_briefing(
+    dispatch: State<'_, DispatchState>,
+    now: String,
+) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let brain = format!("{}/Desktop/CD_claude", home);
     let claude = dispatch.claude_path.lock().unwrap().clone();
 
-    tauri::async_runtime::spawn_blocking(move || run_morning(home, brain, claude))
+    tauri::async_runtime::spawn_blocking(move || run_morning(brain, claude, now))
         .await
         .map_err(|e| format!("task panicked: {e}"))?
 }
 
-fn run_morning(home: String, brain: String, claude: String) -> Result<String, String> {
-    // Step 1: best-effort whoop refresh (~45s timeout, ignore errors)
-    {
-        let cmd = format!(
-            "node {}/Desktop/CD_claude/tools-built/whoop-report/whoop-fetch.cjs",
-            home
-        );
-        if let Ok(mut child) = Command::new("/bin/zsh")
-            .args(["-lc", &cmd])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
-        {
-            let (tx, rx) = mpsc::channel::<()>();
-            std::thread::spawn(move || {
-                child.wait().ok();
-                tx.send(()).ok();
-            });
-            let _ = rx.recv_timeout(Duration::from_secs(45));
-        }
-    }
+fn run_morning(brain: String, claude: String, now: String) -> Result<String, String> {
+    let prompt = format!("Current local date and time: {now}.\n\n{MORNING_PROMPT}");
 
-    // Step 2: headless claude — stream-json, same pattern as summarize_run
     let mut child = Command::new(&claude)
         .args([
             "-p",
-            MORNING_PROMPT,
+            &prompt,
             "--output-format",
             "stream-json",
             "--verbose",
@@ -92,7 +74,7 @@ fn run_morning(home: String, brain: String, claude: String) -> Result<String, St
             "--add-dir",
             &brain,
             "--model",
-            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
         ])
         .current_dir(&brain)
         .stdout(Stdio::piped())
@@ -146,6 +128,37 @@ fn run_morning(home: String, brain: String, claude: String) -> Result<String, St
     }
 }
 
+// ── Whoop refresh (decoupled from briefing generation) ────────────────────────
+
+#[tauri::command]
+pub async fn refresh_whoop() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let cmd = format!(
+            "node {}/Desktop/CD_claude/tools-built/whoop-report/whoop-fetch.cjs",
+            home
+        );
+        let mut child = Command::new("/bin/zsh")
+            .args(["-lc", &cmd])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn whoop-fetch: {e}"))?;
+        let (tx, rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            child.wait().ok();
+            tx.send(()).ok();
+        });
+        match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(()) => Ok("ok".into()),
+            Err(_) => Err("whoop-fetch timed out after 90s".into()),
+        }
+    })
+    .await
+    .map_err(|e| format!("task panicked: {e}"))?
+}
+
 // ── Right-now insight ────────────────────────────────────────────────────────
 
 const INSIGHT_PROMPT: &str = r#"You are Connor's live morning coach. Give ONE short, specific recommendation for what to do RIGHT NOW based on his current state. It is SUMMER (no school).
@@ -162,18 +175,20 @@ Output 1-2 sentences, conversational, specific, no fluff, no em dashes. Just the
 pub async fn morning_insight(
     dispatch: State<'_, DispatchState>,
     done_summary: String,
+    now: String,
 ) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let brain = format!("{}/Desktop/CD_claude", home);
     let claude = dispatch.claude_path.lock().unwrap().clone();
 
-    tauri::async_runtime::spawn_blocking(move || run_insight(claude, brain, done_summary))
+    tauri::async_runtime::spawn_blocking(move || run_insight(claude, brain, done_summary, now))
         .await
         .map_err(|e| format!("task panicked: {e}"))?
 }
 
-fn run_insight(claude: String, brain: String, done_summary: String) -> Result<String, String> {
-    let prompt = INSIGHT_PROMPT.replace("{done_summary}", &done_summary);
+fn run_insight(claude: String, brain: String, done_summary: String, now: String) -> Result<String, String> {
+    let base = INSIGHT_PROMPT.replace("{done_summary}", &done_summary);
+    let prompt = format!("Current local date and time: {now}.\n\n{base}");
     let args = vec![
         "-p".into(), prompt,
         "--model".into(), "claude-haiku-4-5-20251001".into(),
@@ -194,9 +209,9 @@ fn run_insight(claude: String, brain: String, done_summary: String) -> Result<St
 //
 // Per-day warm-session chat. Turn 1 (cold start): embeds MORNING_CHAT_PROMPT +
 // briefing JSON in the -p value and uses --add-dir to give the model the full
-// brain. Turn N: --resume <session_id> with only the new user message. Session
-// id is persisted to ~/.antfarm/morning-sessions/{date_key}.txt so warm
-// follow-ups survive across quick app re-launches within the same day.
+// brain. Turn N: --resume <session_id> with only the new user message + current
+// time. Session id is persisted to ~/.antfarm/morning-sessions/{date_key}.txt
+// so warm follow-ups survive across quick app re-launches within the same day.
 
 const MORNING_CHAT_PROMPT: &str = "You are Connor's morning agent (Jarvis). You know his day. Help him through it: answer follow-ups, react to 'I finished X' by suggesting the next move, recommend, and when something is a real task offer to dispatch it to his agents (1 agent / swarm / orchestrator). Warm, sharp, short. No em dashes.";
 
@@ -224,23 +239,26 @@ fn morning_turn_core(
     date_key: &str,
     briefing_json: &str,
     message: &str,
+    now: &str,
 ) -> Result<(String, Option<String>), String> {
     let session_id = load_morning_session_id(date_key);
 
     let args: Vec<String> = if let Some(sid) = session_id {
-        // Warm resume: only the new user message; session carries all prior context.
+        // Warm resume: prepend current time to user message; session carries prior context.
+        let msg_with_time = format!("Current local date and time: {now}.\n\n{message}");
         vec![
             "--resume".into(), sid,
-            "-p".into(), message.into(),
-            "--model".into(), "claude-sonnet-4-6".into(),
+            "-p".into(), msg_with_time,
+            "--model".into(), "claude-haiku-4-5-20251001".into(),
             "--output-format".into(), "stream-json".into(),
             "--verbose".into(),
             "--permission-mode".into(), "dontAsk".into(),
         ]
     } else {
-        // Cold start: embed system prompt + briefing + user message.
+        // Cold start: embed system prompt + time + briefing + user message.
         let prompt = format!(
-            "{MORNING_CHAT_PROMPT}\n\n\
+            "Current local date and time: {now}.\n\n\
+             {MORNING_CHAT_PROMPT}\n\n\
              Here is Connor's briefing for today:\n{briefing_json}\n\n\
              You have the full brain directory via --add-dir \
              (active/whoop-today.json, CLAUDE.md, active/now.md, \
@@ -249,7 +267,7 @@ fn morning_turn_core(
         );
         vec![
             "-p".into(), prompt,
-            "--model".into(), "claude-sonnet-4-6".into(),
+            "--model".into(), "claude-haiku-4-5-20251001".into(),
             "--output-format".into(), "stream-json".into(),
             "--verbose".into(),
             "--permission-mode".into(), "dontAsk".into(),
@@ -266,6 +284,7 @@ pub async fn morning_chat_send(
     date_key: String,
     briefing_json: String,
     message: String,
+    now: String,
 ) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let brain = format!("{}/Desktop/CD_claude", home);
@@ -275,7 +294,7 @@ pub async fn morning_chat_send(
     let bj = briefing_json.clone();
 
     let (reply, new_sid) = tauri::async_runtime::spawn_blocking(move || {
-        morning_turn_core(&claude, &brain, &dk, &bj, &message)
+        morning_turn_core(&claude, &brain, &dk, &bj, &message, &now)
     })
     .await
     .map_err(|e| format!("task panicked: {e}"))??;

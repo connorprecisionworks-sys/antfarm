@@ -214,6 +214,10 @@ function buildDoneSummary(
   return parts.join(". ") + ".";
 }
 
+function nowString(): string {
+  return new Date().toLocaleString();
+}
+
 let _chatSeq = 0;
 function newChatId() { return `cm-${++_chatSeq}`; }
 
@@ -257,22 +261,23 @@ function InsightCard({ doneSummary }: { doneSummary: string }) {
   async function fetchInsight(summary: string) {
     setLoading(true);
     try {
-      const result = await invoke<string>("morning_insight", { doneSummary: summary });
+      const result = await invoke<string>("morning_insight", {
+        doneSummary: summary,
+        now: nowString(),
+      });
       setText(result);
       setRevKey((k) => k + 1);
     } catch {
-      // keep last text on error — don't blank
+      // keep last text on error
     } finally {
       setLoading(false);
     }
   }
 
-  // Immediate fetch on mount
   useEffect(() => {
     fetchInsight(summaryRef.current);
   }, []);
 
-  // Debounced re-fetch on state changes (1.5s after last change)
   useEffect(() => {
     if (isFirstRun.current) { isFirstRun.current = false; return; }
     const t = setTimeout(() => fetchInsight(doneSummary), 1500);
@@ -283,26 +288,19 @@ function InsightCard({ doneSummary }: { doneSummary: string }) {
 
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden relative">
-      {/* Thin shimmer bar at top while loading */}
       {loading && (
         <div className="absolute inset-x-0 top-0 h-0.5">
           <div className="h-full insight-bar" />
         </div>
       )}
-
       <div className="px-4 pt-3 pb-3">
-        {/* Header */}
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
             <span className="relative flex h-2 w-2 shrink-0">
               {!loading && !reducedMotion && (
                 <span className="absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-60 animate-ping" />
               )}
-              <span
-                className={`relative inline-flex rounded-full h-2 w-2 transition-colors ${
-                  loading ? "bg-zinc-600" : "bg-indigo-500"
-                }`}
-              />
+              <span className={`relative inline-flex rounded-full h-2 w-2 transition-colors ${loading ? "bg-zinc-600" : "bg-indigo-500"}`} />
             </span>
             <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Right now</p>
           </div>
@@ -316,7 +314,6 @@ function InsightCard({ doneSummary }: { doneSummary: string }) {
           </button>
         </div>
 
-        {/* Body */}
         {hasSkeleton ? (
           <div className="space-y-1.5">
             <div className="h-4 rounded-md insight-shimmer-line" />
@@ -539,14 +536,12 @@ function TaskRow({ task, isDone, onToggleDone, onRemove, isExpanded, onExpand, p
           style={{ borderColor: dotBorder, backgroundColor: dotFill }}
           aria-label={isDone ? "Mark undone" : "Mark done"}
         />
-
         <button className="flex-1 min-w-0 text-left" onClick={() => onExpand(isExpanded ? null : task.id)}>
           <p className={`text-sm transition-colors ${isDone ? "text-zinc-600 line-through" : "text-zinc-200"}`}>
             {task.text}
           </p>
           {task.detail && <p className="text-xs text-zinc-500 mt-0.5">{task.detail}</p>}
         </button>
-
         <button
           onClick={onRemove}
           className="shrink-0 opacity-0 group-hover/task:opacity-100 transition-opacity text-zinc-600 hover:text-zinc-400"
@@ -554,7 +549,6 @@ function TaskRow({ task, isDone, onToggleDone, onRemove, isExpanded, onExpand, p
         >
           <X size={12} strokeWidth={2} />
         </button>
-
         <ChevronRight
           size={14} strokeWidth={1.75}
           className={`text-zinc-600 shrink-0 transition-transform duration-150 ${isExpanded ? "rotate-90" : ""}`}
@@ -627,7 +621,7 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
   const rColor = recoveryColor(health.recovery);
 
   const routineDateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
-  const [routineItems, setRoutineItems] = useState<string[]>(() => loadRoutineItems());
+  const [routineItems, setRoutineItems]   = useState<string[]>(() => loadRoutineItems());
   const [routineChecks, setRoutineChecks] = useState<Set<string>>(() => loadRoutineChecks(routineDateKey));
 
   const [expandedId, setExpandedId]     = useState<string | null>(null);
@@ -686,7 +680,7 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
         </div>
       </div>
 
-      {/* Right now — live insight below health */}
+      {/* Right now */}
       <InsightCard doneSummary={doneSummary} />
 
       {/* Day shape + commitments */}
@@ -704,7 +698,7 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
         )}
       </div>
 
-      {/* Morning routine checklist */}
+      {/* Morning routine */}
       <RoutineChecklist
         items={routineItems}
         onItemsChange={setRoutineItems}
@@ -713,7 +707,7 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
         dateKey={routineDateKey}
       />
 
-      {/* Work task list */}
+      {/* Work tasks */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
         <div className="flex items-center justify-between px-4 pt-3 pb-2">
           <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">The Plan</p>
@@ -837,6 +831,7 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         dateKey,
         briefingJson,
         message: text,
+        now: nowString(),
       });
       setMessages((prev) => [...prev, { id: newChatId(), role: "agent", text: reply }]);
     } catch (e) {
@@ -855,7 +850,6 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
     <div className="shrink-0 flex flex-col border-t border-zinc-800 bg-zinc-950/80">
       <style>{CHAT_STYLES}</style>
 
-      {/* Collapse header */}
       <button
         onClick={toggleExpanded}
         className="flex items-center justify-between px-4 py-2.5 w-full hover:bg-zinc-900/40 transition-colors"
@@ -874,7 +868,6 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         />
       </button>
 
-      {/* Collapsible body */}
       <div
         style={{
           maxHeight: expanded ? "240px" : "0",
@@ -931,16 +924,19 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
 
 type Phase =
   | { kind: "idle" }
-  | { kind: "loading" }
+  | { kind: "loading"; label?: string }
   | { kind: "done"; briefing: MorningBriefing }
   | { kind: "raw"; text: string }
   | { kind: "error"; message: string };
+
+type WhoopState = "idle" | "loading" | "done";
 
 export function Morning() {
   const [phase, setPhase]               = useState<Phase>({ kind: "idle" });
   const [done, setDone]                 = useState<Set<string>>(new Set());
   const [projects, setProjects]         = useState<Project[]>([]);
   const [briefingJson, setBriefingJson] = useState<string>("");
+  const [whoopState, setWhoopState]     = useState<WhoopState>("idle");
 
   const dateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
 
@@ -957,10 +953,8 @@ export function Morning() {
     });
   }
 
-  function run() {
-    setPhase({ kind: "loading" });
-    setDone(new Set());
-    invoke<string>("generate_morning_briefing")
+  function generate() {
+    invoke<string>("generate_morning_briefing", { now: nowString() })
       .then((raw) => {
         const b = parseBriefing(raw);
         if (b) {
@@ -973,32 +967,81 @@ export function Morning() {
       .catch((e) => setPhase({ kind: "error", message: String(e) }));
   }
 
-  useEffect(() => { run(); }, []);
+  // Mount: fire-and-forget whoop refresh, generate immediately from cache
+  useEffect(() => {
+    invoke("refresh_whoop").catch(() => {});
+    setPhase({ kind: "loading" });
+    setDone(new Set());
+    generate();
+  }, []);
+
+  // Explicit refresh: wait for fresh Whoop data, then regenerate
+  async function run() {
+    setPhase({ kind: "loading", label: "Refreshing Whoop data..." });
+    setDone(new Set());
+    try { await invoke("refresh_whoop"); } catch {}
+    setPhase({ kind: "loading" });
+    generate();
+  }
+
+  // Standalone Whoop refresh button (no regeneration)
+  async function refreshWhoop() {
+    if (whoopState === "loading") return;
+    setWhoopState("loading");
+    try {
+      await invoke("refresh_whoop");
+      setWhoopState("done");
+      setTimeout(() => setWhoopState("idle"), 2000);
+    } catch {
+      setWhoopState("idle");
+    }
+  }
+
+  const isLoading = phase.kind === "loading";
+  const loadingLabel = phase.kind === "loading"
+    ? (phase.label ?? "Pulling your Whoop and your day...")
+    : "";
 
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 shrink-0">
         <h1 className="text-base font-semibold text-zinc-100">Morning</h1>
-        {phase.kind !== "loading" && (
+        <div className="flex items-center gap-3">
+          {/* Whoop refresh button */}
           <button
-            onClick={run}
-            className="flex items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
+            onClick={refreshWhoop}
+            disabled={whoopState === "loading" || isLoading}
+            className="flex items-center gap-1.5 text-xs text-zinc-600 hover:text-zinc-400 disabled:opacity-30 transition-colors"
+            title="Refresh Whoop data"
           >
-            <RefreshCw size={13} strokeWidth={1.75} />
-            Refresh
+            <RefreshCw
+              size={11} strokeWidth={2}
+              className={whoopState === "loading" ? "animate-spin" : ""}
+            />
+            <span>{whoopState === "done" ? "Whoop ✓" : "Whoop"}</span>
           </button>
-        )}
+          {/* Main refresh */}
+          {!isLoading && (
+            <button
+              onClick={run}
+              className="flex items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"
+            >
+              <RefreshCw size={13} strokeWidth={1.75} />
+              Refresh
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Cards area */}
       <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
-        {phase.kind === "loading" && (
+        {isLoading && (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-zinc-400">
             <svg className="animate-spin" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M21 12a9 9 0 1 1-6.219-8.56" />
             </svg>
-            <p className="text-sm">Pulling your Whoop and your day...</p>
+            <p className="text-sm">{loadingLabel}</p>
           </div>
         )}
 
@@ -1028,7 +1071,7 @@ export function Morning() {
         )}
       </div>
 
-      {/* Docked chat — stays mounted once briefing has loaded at least once */}
+      {/* Docked chat */}
       {briefingJson && (
         <MorningChat briefingJson={briefingJson} dateKey={dateKey} />
       )}
