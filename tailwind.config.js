@@ -11,6 +11,15 @@ export default {
           3: "#27272a",
         },
       },
+      animation: {
+        "progress-fill": "progress-fill 5s linear forwards",
+      },
+      keyframes: {
+        "progress-fill": {
+          from: { width: "0%" },
+          to:   { width: "100%" },
+        },
+      },
     },
   },
   plugins: [],
