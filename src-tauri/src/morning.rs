@@ -1,3 +1,4 @@
+use chrono::Local;
 use serde_json;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -47,21 +48,72 @@ Rules:
 - If whoop-today.json is missing or fetched_at date is not today: set all health numbers to 0, read = "No Whoop data for today."
 - Output ONLY the JSON. Nothing else."#;
 
+// ── Plan-sig helper ───────────────────────────────────────────────────────────
+// Returns "YYYY-MM-DD|<locked-timestamp>" when tomorrow-plan.md is locked for
+// today, or "none" otherwise. This string is stored in the briefing cache so a
+// same-day re-lock (new timestamp) naturally busts the cache.
+
+fn today_plan_sig(brain: &str) -> String {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let plan_path = format!("{}/active/tomorrow-plan.md", brain);
+    let content = match std::fs::read_to_string(&plan_path) {
+        Ok(s) => s,
+        Err(_) => return "none".into(),
+    };
+    let first_line = content.lines().next().unwrap_or("");
+    if let Some(rest) = first_line.strip_prefix("# Plan for ") {
+        let mut parts = rest.splitn(2, " (LOCKED ");
+        let date_part = parts.next().unwrap_or("").trim();
+        if date_part == today {
+            if let Some(locked_part) = parts.next() {
+                let ts = locked_part.trim_end_matches(')');
+                return format!("{today}|{ts}");
+            }
+        }
+    }
+    "none".into()
+}
+
 #[tauri::command]
 pub async fn generate_morning_briefing(
     dispatch: State<'_, DispatchState>,
     now: String,
+    force: bool,
 ) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let brain = format!("{}/Desktop/CD_claude", home);
     let claude = dispatch.claude_path.lock().unwrap().clone();
 
-    tauri::async_runtime::spawn_blocking(move || run_morning(brain, claude, now))
+    tauri::async_runtime::spawn_blocking(move || run_morning(brain, claude, now, force))
         .await
         .map_err(|e| format!("task panicked: {e}"))?
 }
 
-pub(crate) fn run_morning(brain: String, claude: String, now: String) -> Result<String, String> {
+pub(crate) fn run_morning(brain: String, claude: String, now: String, force: bool) -> Result<String, String> {
+    let today      = Local::now().format("%Y-%m-%d").to_string();
+    let plan_sig   = today_plan_sig(&brain);
+    let cache_path = format!("{}/active/today-brief.json", brain);
+
+    // Cache hit: same date + same plan_sig -> return unchanged
+    if !force {
+        if let Ok(raw) = std::fs::read_to_string(&cache_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let cached_date = v.get("date").and_then(|x| x.as_str()).unwrap_or("");
+                let cached_sig  = v.get("plan_sig").and_then(|x| x.as_str()).unwrap_or("X");
+                if cached_date == today && cached_sig == plan_sig {
+                    if let Some(briefing) = v.get("briefing") {
+                        return Ok(briefing.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // No locked plan and not a forced auto-plan: ask instead of guessing
+    if plan_sig == "none" && !force {
+        return Ok(r#"{"needs_plan":true}"#.into());
+    }
+
     let prompt = format!("Current local date and time: {now}.\n\n{MORNING_PROMPT}");
 
     let mut child = Command::new(&claude)
@@ -124,10 +176,23 @@ pub(crate) fn run_morning(brain: String, claude: String, now: String) -> Result<
     child.wait().ok();
 
     if result_text.is_empty() {
-        Err("morning briefing returned empty result".into())
-    } else {
-        Ok(result_text)
+        return Err("morning briefing returned empty result".into());
     }
+
+    // Write cache so reloads return the same briefing (busted only by date or new lock)
+    if let Ok(bv) = serde_json::from_str::<serde_json::Value>(&result_text) {
+        let auto_planned = bv.get("auto_planned").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cache_obj = serde_json::json!({
+            "date": today,
+            "plan_sig": plan_sig,
+            "auto_planned": auto_planned,
+            "briefing": bv,
+        });
+        let _ = std::fs::create_dir_all(format!("{}/active", brain));
+        let _ = std::fs::write(&cache_path, cache_obj.to_string());
+    }
+
+    Ok(result_text)
 }
 
 // ── Whoop refresh (decoupled from briefing generation) ────────────────────────

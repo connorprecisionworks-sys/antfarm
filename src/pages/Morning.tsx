@@ -938,6 +938,7 @@ type Phase =
   | { kind: "idle" }
   | { kind: "loading"; label?: string }
   | { kind: "done"; briefing: MorningBriefing }
+  | { kind: "needs_plan" }
   | { kind: "raw"; text: string }
   | { kind: "error"; message: string };
 
@@ -975,9 +976,13 @@ export function Morning() {
     });
   }
 
-  function generate() {
-    invoke<string>("generate_morning_briefing", { now: nowString() })
+  function generate(force = false) {
+    invoke<string>("generate_morning_briefing", { now: nowString(), force })
       .then((raw) => {
+        try {
+          const quick = JSON.parse(raw.trim());
+          if (quick && quick.needs_plan) { setPhase({ kind: "needs_plan" }); return; }
+        } catch {}
         const b = parseBriefing(raw);
         if (b) {
           setBriefingJson(JSON.stringify(b));
@@ -989,21 +994,21 @@ export function Morning() {
       .catch((e) => setPhase({ kind: "error", message: String(e) }));
   }
 
-  // Mount: fire-and-forget whoop refresh, generate immediately from cache
+  // Mount: fire-and-forget whoop refresh, read from cache (no force)
   useEffect(() => {
     invoke("refresh_whoop").catch(() => {});
     setPhase({ kind: "loading" });
     setDone(new Set());
-    generate();
+    generate(false);
   }, []);
 
-  // Explicit refresh: wait for fresh Whoop data, then regenerate
+  // Explicit refresh: wait for fresh Whoop data, then force-regenerate
   async function run() {
     setPhase({ kind: "loading", label: "Refreshing Whoop data..." });
     setDone(new Set());
     try { await invoke("refresh_whoop"); } catch {}
     setPhase({ kind: "loading" });
-    generate();
+    generate(true);
   }
 
   // Standalone Whoop refresh button (no regeneration)
@@ -1076,6 +1081,34 @@ export function Morning() {
               <path d="M21 12a9 9 0 1 1-6.219-8.56" />
             </svg>
             <p className="text-sm">{loadingLabel}</p>
+          </div>
+        )}
+
+        {phase.kind === "needs_plan" && (
+          <div className="max-w-2xl mx-auto">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-8 flex flex-col items-center text-center gap-4">
+              <Moon size={32} strokeWidth={1} className="text-zinc-600" />
+              <div>
+                <h2 className="text-base font-semibold text-zinc-100 mb-2">No plan locked for today</h2>
+                <p className="text-sm text-zinc-500 max-w-xs mx-auto">
+                  Lock a plan the night before to get a focused morning briefing.
+                </p>
+              </div>
+              <div className="flex gap-3 mt-1">
+                <button
+                  onClick={() => navigate("/tonight")}
+                  className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors"
+                >
+                  Plan with me
+                </button>
+                <button
+                  onClick={() => { setPhase({ kind: "loading" }); generate(true); }}
+                  className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-sm font-medium transition-colors"
+                >
+                  Auto-plan from yesterday
+                </button>
+              </div>
+            </div>
           </div>
         )}
 

@@ -838,6 +838,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
     var _morningCallId = 0;
     var _morningErr = null;
+    var _morningNeedsPlan = false;
     var _activeLoader = null;
 
     function loadMorning() {
@@ -848,6 +849,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       if (_activeLoader) { _activeLoader.destroy(); _activeLoader = null; }
 
       _morningErr = null;
+      _morningNeedsPlan = false;
       const callId = ++_morningCallId;
 
       fetch('/api/refresh-whoop', { method: 'POST', headers: authHeaders() }).catch(() => {});
@@ -859,6 +861,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         if (callId !== _morningCallId) return;
         if (_morningErr) {
           showMorningError(_morningErr);
+        } else if (_morningNeedsPlan) {
+          showMorningNeedsPlan();
         } else {
           renderBriefing(BRIEFING);
           document.getElementById('chat-send-btn').disabled = false;
@@ -869,6 +873,62 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
       const now = encodeURIComponent(new Date().toLocaleString());
       fetch('/api/morning?now=' + now, { headers: authHeaders() })
+        .then(r => r.text().then(text => {
+          if (callId !== _morningCallId) return;
+          if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
+          try {
+            const quick = JSON.parse(text);
+            if (quick && quick.needs_plan) { _morningNeedsPlan = true; loader.finish(); return; }
+          } catch {}
+          const b = parseBriefing(text);
+          if (!b) throw new Error('Could not parse briefing JSON');
+          BRIEFING = b;
+          BRIEFING_JSON = JSON.stringify(b);
+          loader.finish();
+        }))
+        .catch(e => {
+          if (callId !== _morningCallId) return;
+          _morningErr = e.message;
+          loader.finish();
+        });
+    }
+
+    function showMorningNeedsPlan() {
+      const content = document.getElementById('morning-content');
+      content.style.display = 'block';
+      content.innerHTML = `
+        <div style="max-width:420px;margin:40px auto;padding:32px 24px;border:1px solid #27272a;border-radius:16px;background:#18181b;display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#52525b" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>
+          </svg>
+          <div>
+            <p style="font-size:15px;font-weight:600;color:#f4f4f5;margin:0 0 6px;">No plan locked for today</p>
+            <p style="font-size:13px;color:#71717a;margin:0;max-width:260px;">Lock a plan the night before to get a focused morning briefing.</p>
+          </div>
+          <button onclick="autoplanMorning()" style="margin-top:4px;padding:10px 20px;border-radius:10px;background:#3f3f46;border:none;color:#e4e4e7;font-size:13px;font-weight:600;cursor:pointer;">Auto-plan from yesterday</button>
+          <p style="font-size:11px;color:#52525b;margin:0;">To chat through tomorrow, open the desktop app.</p>
+        </div>`;
+    }
+
+    async function autoplanMorning() {
+      _morningNeedsPlan = false;
+      const content = document.getElementById('morning-content');
+      content.innerHTML = '';
+      content.style.display = 'none';
+      const now = encodeURIComponent(new Date().toLocaleString());
+      const callId = ++_morningCallId;
+      const wrap = document.getElementById('morning-loader-wrap');
+      wrap.innerHTML = '';
+      const loader = MorningLoader.mount(wrap, function() {
+        _activeLoader = null;
+        if (callId !== _morningCallId) return;
+        if (_morningErr) { showMorningError(_morningErr); return; }
+        renderBriefing(BRIEFING);
+        document.getElementById('chat-send-btn').disabled = false;
+        loadInsight();
+      });
+      _activeLoader = loader;
+      fetch('/api/morning?now=' + now + '&force=true', { headers: authHeaders() })
         .then(r => r.text().then(text => {
           if (callId !== _morningCallId) return;
           if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
@@ -1431,10 +1491,11 @@ pub fn start(app: tauri::AppHandle) {
 
                 "/api/morning" => {
                     if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
-                    let now = url_decode(query_param(&url, "now").unwrap_or_default());
+                    let now   = url_decode(query_param(&url, "now").unwrap_or_default());
+                    let force = query_param(&url, "force").as_deref() == Some("true");
                     let claude = claude_path(&app);
                     let brain  = brain_path();
-                    match crate::morning::run_morning(brain, claude, now) {
+                    match crate::morning::run_morning(brain, claude, now, force) {
                         Ok(text) => respond(request, 200, "text/plain; charset=utf-8", text),
                         Err(e)   => respond(request, 500, "text/plain", e),
                     }
