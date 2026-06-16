@@ -7,24 +7,55 @@ use tauri::State;
 
 use crate::dispatch::DispatchState;
 
-const MORNING_PROMPT: &str = r#"You are Connor's chief of staff and morning agent (think Jarvis). Generate his morning briefing as scannable markdown for his phone. Follow his rules: no em dashes, no fluff, direct, warm but sharp.
+const MORNING_PROMPT: &str = r#"You are Connor's chief of staff and morning agent (think Jarvis).
+Connor's rules: no em dashes, direct, warm but sharp.
 
-Read these files (you have them via --add-dir): active/whoop-today.json (his Whoop health), CLAUDE.md (priorities + how he works), active/now.md and active/tomorrow-plan.md (in-flight work + the day plan), active/school-schedule.md (schedule).
+Read these files via --add-dir: active/whoop-today.json, CLAUDE.md, active/now.md,
+active/tomorrow-plan.md, active/school-schedule.md.
 
-Produce, in this order:
-1. A HEALTH READ from whoop-today.json: recovery %, sleep hours + performance, HRV, resting HR, yesterday's strain — then ONE sharp line predicting how today should go and how to flex intensity (low recovery / restless -> front-load light work, protect energy for meetings, maybe skip a hard workout; high recovery -> attack the hardest thing first, good training day). If the file is missing or fetched_at is not today, say so in one line.
-2. TODAY: date, weekday, fixed commitments/meetings with times.
-3. THE PLAN: the prioritized things to do today (lean on tomorrow-plan.md / now.md), ordered by leverage, factoring in his recovery.
-4. START HERE: the single first task + one line why.
-5. A short proactive nudge or two (a habit, a prep reminder for upcoming demos, an offer to run an agent swarm on something) — keep it human, like a manager who knows him.
-End with one line: the #1 thing that makes today a win.
-Keep it tight."#;
+Summer context: School (Jupiter Christian) may not be in session. Check school-schedule.md
+before listing any school commitments.
+
+Output ONLY this JSON object. No prose, no code fences, nothing else:
+
+{
+  "greeting": "<short warm opener, 10 words max>",
+  "date_label": "<e.g. JUN 16 · OPEN DAY or JUN 17 · SCHOOL 8:30-3:15>",
+  "health": {
+    "recovery": <integer 0-100 from whoop-today.json>,
+    "sleep_hours": <float 1dp>,
+    "sleep_perf": <integer 0-100 sleep performance %>,
+    "hrv": <float 1dp ms>,
+    "rhr": <integer bpm>,
+    "strain": <float 1dp>,
+    "read": "<ONE line: how these numbers shape today. Low -> front-load easy work, protect energy for meetings; high -> attack the hardest thing first, good training day.>"
+  },
+  "day_line": "<one sentence: shape of the day — energy level + key anchor>",
+  "commitments": ["<time + event, e.g. 2:00pm Jake ACU call>"],
+  "tasks": [
+    { "id": "t1", "text": "<concise task name>", "detail": "<time estimate or context, 8 words max>" }
+  ],
+  "agent_note": "<one proactive line: a habit reminder, demo prep nudge, or offer to run an agent swarm. Omit this field entirely if nothing useful to say.>"
+}
+
+Rules:
+- tasks: 4-7 items ordered by leverage factoring in recovery.
+- commitments: only hard-scheduled items with times. Use [] if none.
+- If whoop-today.json is missing or fetched_at date is not today: set all health numbers to 0, read = "No Whoop data for today."
+- Output ONLY the JSON. Nothing else."#;
 
 #[tauri::command]
-pub fn generate_morning_briefing(dispatch: State<'_, DispatchState>) -> Result<String, String> {
+pub async fn generate_morning_briefing(dispatch: State<'_, DispatchState>) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let brain = format!("{}/Desktop/CD_claude", home);
+    let claude = dispatch.claude_path.lock().unwrap().clone();
 
+    tauri::async_runtime::spawn_blocking(move || run_morning(home, brain, claude))
+        .await
+        .map_err(|e| format!("task panicked: {e}"))?
+}
+
+fn run_morning(home: String, brain: String, claude: String) -> Result<String, String> {
     // Step 1: best-effort whoop refresh (~45s timeout, ignore errors)
     {
         let cmd = format!(
@@ -47,9 +78,7 @@ pub fn generate_morning_briefing(dispatch: State<'_, DispatchState>) -> Result<S
         }
     }
 
-    // Step 2: headless claude briefing — same stream-json pattern as summarize_run
-    let claude = dispatch.claude_path.lock().unwrap().clone();
-
+    // Step 2: headless claude — stream-json, same pattern as summarize_run
     let mut child = Command::new(&claude)
         .args([
             "-p",
