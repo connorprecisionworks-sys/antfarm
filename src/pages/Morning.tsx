@@ -18,6 +18,10 @@ const CHAT_STYLES = `
     0%   { background-position: 200% 0; }
     100% { background-position: -200% 0; }
   }
+  @keyframes insightIn {
+    from { opacity: 0; transform: translateY(3px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
   @media (prefers-reduced-motion: no-preference) {
     .msg-enter { animation: msgIn 0.25s ease-out both; }
     .dot-b1 { animation: dotBounce 1.2s ease-in-out infinite 0ms; }
@@ -28,9 +32,23 @@ const CHAT_STYLES = `
       background-size: 200% 100%;
       animation: chatShimmer 1.5s linear infinite;
     }
+    .insight-in { animation: insightIn 0.3s ease-out both; }
+    .insight-bar {
+      background: linear-gradient(90deg, transparent 0%, #6366f1 50%, transparent 100%);
+      background-size: 200% 100%;
+      animation: chatShimmer 1.6s linear infinite;
+    }
+    .insight-shimmer-line {
+      background: linear-gradient(90deg, #27272a 25%, #3f3f46 50%, #27272a 75%);
+      background-size: 200% 100%;
+      animation: chatShimmer 1.5s linear infinite;
+    }
   }
   @media (prefers-reduced-motion: reduce) {
     .typing-shimmer { background: #27272a; }
+    .insight-in { opacity: 1; }
+    .insight-bar { background: #6366f1; opacity: 0.4; }
+    .insight-shimmer-line { background: #27272a; }
   }
 `;
 
@@ -161,6 +179,41 @@ function parseBriefing(raw: string): MorningBriefing | null {
   }
 }
 
+function buildDoneSummary(
+  routineItems: string[],
+  routineChecks: Set<string>,
+  tasks: MorningTask[],
+  doneTasks: Set<string>,
+  removedTasks: Set<string>,
+): string {
+  const hour = new Date().getHours();
+  const timeLabel =
+    hour < 10 ? "early morning"
+    : hour < 12 ? "mid-morning"
+    : hour < 15 ? "afternoon"
+    : "late afternoon";
+
+  const doneRoutine    = routineItems.filter((i) => routineChecks.has(i));
+  const pendingRoutine = routineItems.filter((i) => !routineChecks.has(i));
+  const visibleTasks   = tasks.filter((t) => !removedTasks.has(t.id));
+  const doneWork       = visibleTasks.filter((t) => doneTasks.has(t.id));
+  const pendingWork    = visibleTasks.filter((t) => !doneTasks.has(t.id));
+
+  const parts: string[] = [];
+  parts.push(doneRoutine.length > 0
+    ? `Routine done: ${doneRoutine.join(", ")}`
+    : "Routine: none started yet");
+  if (pendingRoutine.length > 0)
+    parts.push(`Routine pending: ${pendingRoutine.join(", ")}`);
+  parts.push(doneWork.length > 0
+    ? `Work tasks done: ${doneWork.map((t) => t.text).join(", ")}`
+    : "Work tasks: none done yet");
+  if (pendingWork.length > 0)
+    parts.push(`Work tasks pending: ${pendingWork.map((t) => t.text).join(", ")}`);
+  parts.push(`Time: ${timeLabel}`);
+  return parts.join(". ") + ".";
+}
+
 let _chatSeq = 0;
 function newChatId() { return `cm-${++_chatSeq}`; }
 
@@ -187,47 +240,139 @@ function RecoveryRing({ pct }: { pct: number }) {
   );
 }
 
-// ── Routine checklist ─────────────────────────────────────────────────────────
+// ── Insight card ──────────────────────────────────────────────────────────────
 
-function RoutineChecklist() {
-  const dateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
-  const [items, setItems]   = useState<string[]>(() => loadRoutineItems());
-  const [checks, setChecks] = useState<Set<string>>(() => loadRoutineChecks(dateKey));
+function InsightCard({ doneSummary }: { doneSummary: string }) {
+  const reducedMotion = useMemo(
+    () => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches,
+    []
+  );
+  const [text, setText]       = useState("");
+  const [loading, setLoading] = useState(false);
+  const [revKey, setRevKey]   = useState(0);
+  const isFirstRun   = useRef(true);
+  const summaryRef   = useRef(doneSummary);
+  summaryRef.current = doneSummary;
+
+  async function fetchInsight(summary: string) {
+    setLoading(true);
+    try {
+      const result = await invoke<string>("morning_insight", { doneSummary: summary });
+      setText(result);
+      setRevKey((k) => k + 1);
+    } catch {
+      // keep last text on error — don't blank
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Immediate fetch on mount
+  useEffect(() => {
+    fetchInsight(summaryRef.current);
+  }, []);
+
+  // Debounced re-fetch on state changes (1.5s after last change)
+  useEffect(() => {
+    if (isFirstRun.current) { isFirstRun.current = false; return; }
+    const t = setTimeout(() => fetchInsight(doneSummary), 1500);
+    return () => clearTimeout(t);
+  }, [doneSummary]);
+
+  const hasSkeleton = loading && !text;
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden relative">
+      {/* Thin shimmer bar at top while loading */}
+      {loading && (
+        <div className="absolute inset-x-0 top-0 h-0.5">
+          <div className="h-full insight-bar" />
+        </div>
+      )}
+
+      <div className="px-4 pt-3 pb-3">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2 w-2 shrink-0">
+              {!loading && !reducedMotion && (
+                <span className="absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-60 animate-ping" />
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-2 w-2 transition-colors ${
+                  loading ? "bg-zinc-600" : "bg-indigo-500"
+                }`}
+              />
+            </span>
+            <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Right now</p>
+          </div>
+          <button
+            onClick={() => fetchInsight(doneSummary)}
+            disabled={loading}
+            className="text-zinc-600 hover:text-zinc-400 disabled:opacity-30 transition-colors"
+            aria-label="Refresh insight"
+          >
+            <RefreshCw size={11} strokeWidth={2} className={loading ? "animate-spin" : ""} />
+          </button>
+        </div>
+
+        {/* Body */}
+        {hasSkeleton ? (
+          <div className="space-y-1.5">
+            <div className="h-4 rounded-md insight-shimmer-line" />
+            <div className="h-4 rounded-md w-4/5 insight-shimmer-line" />
+          </div>
+        ) : (
+          <p
+            key={revKey}
+            className={`text-sm text-zinc-200 leading-relaxed ${revKey > 0 && !reducedMotion ? "insight-in" : ""}`}
+          >
+            {text || <span className="text-zinc-500">Generating your insight...</span>}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Routine checklist (controlled) ────────────────────────────────────────────
+
+interface RoutineChecklistProps {
+  items: string[];
+  onItemsChange: (items: string[]) => void;
+  checks: Set<string>;
+  onChecksChange: (checks: Set<string>) => void;
+  dateKey: string;
+}
+
+function RoutineChecklist({ items, onItemsChange, checks, onChecksChange, dateKey }: RoutineChecklistProps) {
   const [addText, setAddText] = useState("");
   const addRef = useRef<HTMLInputElement>(null);
 
   function toggleCheck(text: string) {
-    setChecks((prev) => {
-      const next = new Set(prev);
-      if (next.has(text)) next.delete(text);
-      else next.add(text);
-      lsSet(routineChecksKey(dateKey), JSON.stringify([...next]));
-      return next;
-    });
+    const next = new Set(checks);
+    if (next.has(text)) next.delete(text);
+    else next.add(text);
+    lsSet(routineChecksKey(dateKey), JSON.stringify([...next]));
+    onChecksChange(next);
   }
 
   function removeItem(text: string) {
-    setItems((prev) => {
-      const next = prev.filter((i) => i !== text);
-      lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(next));
-      return next;
-    });
-    setChecks((prev) => {
-      const next = new Set(prev);
-      next.delete(text);
-      lsSet(routineChecksKey(dateKey), JSON.stringify([...next]));
-      return next;
-    });
+    const nextItems = items.filter((i) => i !== text);
+    lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(nextItems));
+    onItemsChange(nextItems);
+    const nextChecks = new Set(checks);
+    nextChecks.delete(text);
+    lsSet(routineChecksKey(dateKey), JSON.stringify([...nextChecks]));
+    onChecksChange(nextChecks);
   }
 
   function addItem() {
     const text = addText.trim();
     if (!text || items.includes(text)) return;
-    setItems((prev) => {
-      const next = [...prev, text];
-      lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(next));
-      return next;
-    });
+    const next = [...items, text];
+    lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(next));
+    onItemsChange(next);
     setAddText("");
     setTimeout(() => addRef.current?.focus(), 0);
   }
@@ -237,12 +382,8 @@ function RoutineChecklist() {
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
       <div className="flex items-center justify-between px-4 pt-3 pb-2">
-        <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">
-          Morning routine
-        </p>
-        <p className="text-[10px] text-zinc-600 tabular-nums">
-          {checkedCount}/{items.length}
-        </p>
+        <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Morning routine</p>
+        <p className="text-[10px] text-zinc-600 tabular-nums">{checkedCount}/{items.length}</p>
       </div>
 
       <div className="divide-y divide-zinc-800/40">
@@ -250,7 +391,6 @@ function RoutineChecklist() {
           const isDone = checks.has(item);
           return (
             <div key={item} className="flex items-center gap-3 px-4 py-2.5 group/routine">
-              {/* Check dot */}
               <button
                 onClick={() => toggleCheck(item)}
                 className="shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-all"
@@ -266,7 +406,6 @@ function RoutineChecklist() {
                   </svg>
                 )}
               </button>
-
               <span
                 className={`flex-1 text-sm select-none transition-colors cursor-default ${
                   isDone ? "text-zinc-600 line-through" : "text-zinc-300"
@@ -275,8 +414,6 @@ function RoutineChecklist() {
               >
                 {item}
               </span>
-
-              {/* Remove x — visible on hover */}
               <button
                 onClick={() => removeItem(item)}
                 className="shrink-0 opacity-0 group-hover/routine:opacity-100 transition-opacity text-zinc-600 hover:text-zinc-400"
@@ -289,7 +426,6 @@ function RoutineChecklist() {
         })}
       </div>
 
-      {/* Add input */}
       <div className="flex items-center gap-2 px-4 py-2.5 border-t border-zinc-800/40">
         <input
           ref={addRef}
@@ -397,7 +533,6 @@ function TaskRow({ task, isDone, onToggleDone, onRemove, isExpanded, onExpand, p
   return (
     <>
       <div className={`flex items-center gap-3 px-4 py-3 group/task transition-colors ${isExpanded ? "bg-zinc-900/80" : ""}`}>
-        {/* Done dot */}
         <button
           onClick={onToggleDone}
           className="shrink-0 w-4 h-4 rounded-full border-2 transition-all"
@@ -405,7 +540,6 @@ function TaskRow({ task, isDone, onToggleDone, onRemove, isExpanded, onExpand, p
           aria-label={isDone ? "Mark undone" : "Mark done"}
         />
 
-        {/* Text — click to expand handoff panel */}
         <button className="flex-1 min-w-0 text-left" onClick={() => onExpand(isExpanded ? null : task.id)}>
           <p className={`text-sm transition-colors ${isDone ? "text-zinc-600 line-through" : "text-zinc-200"}`}>
             {task.text}
@@ -413,7 +547,6 @@ function TaskRow({ task, isDone, onToggleDone, onRemove, isExpanded, onExpand, p
           {task.detail && <p className="text-xs text-zinc-500 mt-0.5">{task.detail}</p>}
         </button>
 
-        {/* Remove x — visible on row hover */}
         <button
           onClick={onRemove}
           className="shrink-0 opacity-0 group-hover/task:opacity-100 transition-opacity text-zinc-600 hover:text-zinc-400"
@@ -492,6 +625,11 @@ interface BriefingViewProps {
 function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps) {
   const { health } = briefing;
   const rColor = recoveryColor(health.recovery);
+
+  const routineDateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const [routineItems, setRoutineItems] = useState<string[]>(() => loadRoutineItems());
+  const [routineChecks, setRoutineChecks] = useState<Set<string>>(() => loadRoutineChecks(routineDateKey));
+
   const [expandedId, setExpandedId]     = useState<string | null>(null);
   const [removedTasks, setRemovedTasks] = useState<Set<string>>(new Set());
 
@@ -509,6 +647,11 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
 
   const visibleTasks = briefing.tasks.filter((t) => !removedTasks.has(t.id));
   const doneVisible  = visibleTasks.filter((t) => done.has(t.id)).length;
+
+  const doneSummary = useMemo(
+    () => buildDoneSummary(routineItems, routineChecks, briefing.tasks, done, removedTasks),
+    [routineItems, routineChecks, briefing.tasks, done, removedTasks]
+  );
 
   return (
     <div className="max-w-2xl mx-auto space-y-4">
@@ -543,6 +686,9 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
         </div>
       </div>
 
+      {/* Right now — live insight below health */}
+      <InsightCard doneSummary={doneSummary} />
+
       {/* Day shape + commitments */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 space-y-2">
         <p className="text-sm text-zinc-200">{briefing.day_line}</p>
@@ -559,14 +705,18 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
       </div>
 
       {/* Morning routine checklist */}
-      <RoutineChecklist />
+      <RoutineChecklist
+        items={routineItems}
+        onItemsChange={setRoutineItems}
+        checks={routineChecks}
+        onChecksChange={setRoutineChecks}
+        dateKey={routineDateKey}
+      />
 
       {/* Work task list */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
         <div className="flex items-center justify-between px-4 pt-3 pb-2">
-          <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">
-            The Plan
-          </p>
+          <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">The Plan</p>
           {doneVisible > 0 && (
             <button
               onClick={clearDone}
@@ -733,7 +883,6 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
           transition: bodyTransition,
         }}
       >
-        {/* Thread — inner scroll */}
         <div
           ref={scrollRef}
           className="overflow-y-auto px-4 py-3 space-y-2"
@@ -748,7 +897,6 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
           {thinking && <TypingIndicator />}
         </div>
 
-        {/* Input row */}
         <div className="flex gap-2 items-center px-4 py-2.5 border-t border-zinc-800/50">
           <input
             ref={inputRef}

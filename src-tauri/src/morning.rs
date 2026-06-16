@@ -146,6 +146,50 @@ fn run_morning(home: String, brain: String, claude: String) -> Result<String, St
     }
 }
 
+// ── Right-now insight ────────────────────────────────────────────────────────
+
+const INSIGHT_PROMPT: &str = r#"You are Connor's live morning coach. Give ONE short, specific recommendation for what to do RIGHT NOW based on his current state. It is SUMMER (no school).
+
+His progress so far: {done_summary}
+
+Also read active/whoop-today.json (recovery/sleep) and CLAUDE.md + active/now.md + active/tomorrow-plan.md for his day and priorities.
+
+React to what he's done. Vibe: "Coffee and breakfast in, you're fueled. Recovery's middling, so knock out the Jake points while you're sharp, then take your workout as the break." / "Workout done. Your focus window's open, start the Roastlytics seed before energy dips."
+
+Output 1-2 sentences, conversational, specific, no fluff, no em dashes. Just the recommendation, nothing else."#;
+
+#[tauri::command]
+pub async fn morning_insight(
+    dispatch: State<'_, DispatchState>,
+    done_summary: String,
+) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let brain = format!("{}/Desktop/CD_claude", home);
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+
+    tauri::async_runtime::spawn_blocking(move || run_insight(claude, brain, done_summary))
+        .await
+        .map_err(|e| format!("task panicked: {e}"))?
+}
+
+fn run_insight(claude: String, brain: String, done_summary: String) -> Result<String, String> {
+    let prompt = INSIGHT_PROMPT.replace("{done_summary}", &done_summary);
+    let args = vec![
+        "-p".into(), prompt,
+        "--model".into(), "claude-haiku-4-5-20251001".into(),
+        "--output-format".into(), "stream-json".into(),
+        "--verbose".into(),
+        "--permission-mode".into(), "dontAsk".into(),
+        "--add-dir".into(), brain.clone(),
+    ];
+    let (text, _) = crate::chat::run_headless(&claude, args, &brain)?;
+    if text.is_empty() {
+        Err("morning_insight: empty response".into())
+    } else {
+        Ok(text)
+    }
+}
+
 // ── Morning chat ──────────────────────────────────────────────────────────────
 //
 // Per-day warm-session chat. Turn 1 (cold start): embeds MORNING_CHAT_PROMPT +
