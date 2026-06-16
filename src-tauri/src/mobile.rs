@@ -2289,12 +2289,15 @@ fn call_openai_realtime_session(api_key: &str, brief_ctx: &str, mode: &str) -> R
 }
 
 fn extract_realtime_token_response(raw: serde_json::Value) -> String {
-    let token = raw.get("client_secret")
-        .and_then(|cs| cs.get("value"))
+    let nested = raw.get("session");
+    // GA client_secrets: top-level "value"; fallback to older shapes
+    let token = raw.get("value")
         .and_then(|v| v.as_str())
+        .or_else(|| raw.get("client_secret").and_then(|cs| cs.get("value")).and_then(|v| v.as_str()))
+        .or_else(|| nested.and_then(|s| s.get("client_secret")).and_then(|cs| cs.get("value")).and_then(|v| v.as_str()))
         .unwrap_or_default()
         .to_string();
-    let nested = raw.get("session");
+    eprintln!("[realtime-token] extracted token prefix: {}", &token.chars().take(6).collect::<String>());
     let model = raw.get("model")
         .or_else(|| nested.and_then(|s| s.get("model")))
         .and_then(|m| m.as_str())
@@ -2329,12 +2332,15 @@ pub async fn get_realtime_token(mode: Option<String>) -> Result<serde_json::Valu
     }
     let raw = resp.json::<serde_json::Value>().await
         .map_err(|e| format!("parse realtime session: {e}"))?;
-    let token = raw.get("client_secret")
-        .and_then(|cs| cs.get("value"))
+    let nested = raw.get("session");
+    // GA client_secrets: top-level "value"; fallback to older shapes
+    let token = raw.get("value")
         .and_then(|v| v.as_str())
+        .or_else(|| raw.get("client_secret").and_then(|cs| cs.get("value")).and_then(|v| v.as_str()))
+        .or_else(|| nested.and_then(|s| s.get("client_secret")).and_then(|cs| cs.get("value")).and_then(|v| v.as_str()))
         .unwrap_or_default()
         .to_string();
-    let nested = raw.get("session");
+    eprintln!("[realtime-token] extracted token prefix: {}", &token.chars().take(6).collect::<String>());
     let model = raw.get("model")
         .or_else(|| nested.and_then(|s| s.get("model")))
         .and_then(|m| m.as_str())
