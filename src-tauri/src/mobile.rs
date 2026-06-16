@@ -2133,36 +2133,39 @@ wait for a clear go before launching. Drafting is cheap; launching spends real m
 and writes real code.\n\n{brief_ctx}"
     );
     serde_json::json!({
-        "model": "gpt-4o-mini-realtime-preview",
-        "voice": "ash",
-        "instructions": instructions,
-        "tools": [
-            {
-                "type": "function",
-                "name": "get_brief",
-                "description": "Return today's morning brief and tomorrow's plan as text.",
-                "parameters": { "type": "object", "properties": {} }
-            },
-            {
-                "type": "function",
-                "name": "draft_dispatch",
-                "description": "Draft an autonomous agent coding task for one of Connor's repos. Returns a plan summary. Always call this before launch_dispatch.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task": { "type": "string", "description": "Concrete coding task for the agent to implement" }
-                    },
-                    "required": ["task"]
+        "session": {
+            "type": "realtime",
+            "model": "gpt-4o-mini-realtime-preview",
+            "audio": { "output": { "voice": "ash" } },
+            "instructions": instructions,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_brief",
+                    "description": "Return today's morning brief and tomorrow's plan as text.",
+                    "parameters": { "type": "object", "properties": {} }
+                },
+                {
+                    "type": "function",
+                    "name": "draft_dispatch",
+                    "description": "Draft an autonomous agent coding task for one of Connor's repos. Returns a plan summary. Always call this before launch_dispatch.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task": { "type": "string", "description": "Concrete coding task for the agent to implement" }
+                        },
+                        "required": ["task"]
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "launch_dispatch",
+                    "description": "Arm and run the previously drafted plan. Only call after Connor explicitly says go.",
+                    "parameters": { "type": "object", "properties": {} }
                 }
-            },
-            {
-                "type": "function",
-                "name": "launch_dispatch",
-                "description": "Arm and run the previously drafted plan. Only call after Connor explicitly says go.",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        ],
-        "tool_choice": "auto"
+            ],
+            "tool_choice": "auto"
+        }
     })
 }
 
@@ -2170,7 +2173,7 @@ fn call_openai_realtime_session(api_key: &str, brief_ctx: &str) -> Result<serde_
     let body = realtime_session_body(brief_ctx);
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .post("https://api.openai.com/v1/realtime/sessions")
+        .post("https://api.openai.com/v1/realtime/client_secrets")
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body)
         .send()
@@ -2183,17 +2186,20 @@ fn call_openai_realtime_session(api_key: &str, brief_ctx: &str) -> Result<serde_
     resp.json::<serde_json::Value>().map_err(|e| format!("parse realtime session: {e}"))
 }
 
-fn extract_realtime_token_response(session: serde_json::Value) -> String {
-    let token = session.get("client_secret")
+fn extract_realtime_token_response(raw: serde_json::Value) -> String {
+    let token = raw.get("client_secret")
         .and_then(|cs| cs.get("value"))
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let model = session.get("model")
+    let nested = raw.get("session");
+    let model = raw.get("model")
+        .or_else(|| nested.and_then(|s| s.get("model")))
         .and_then(|m| m.as_str())
         .unwrap_or("gpt-4o-mini-realtime-preview")
         .to_string();
-    let session_id = session.get("id")
+    let session_id = raw.get("id")
+        .or_else(|| nested.and_then(|s| s.get("id")))
         .and_then(|i| i.as_str())
         .unwrap_or_default()
         .to_string();
@@ -2207,7 +2213,7 @@ pub async fn get_realtime_token() -> Result<serde_json::Value, String> {
     let body = realtime_session_body(&brief_ctx);
     let client = reqwest::Client::new();
     let resp = client
-        .post("https://api.openai.com/v1/realtime/sessions")
+        .post("https://api.openai.com/v1/realtime/client_secrets")
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body)
         .send()
@@ -2218,8 +2224,25 @@ pub async fn get_realtime_token() -> Result<serde_json::Value, String> {
         let t = resp.text().await.unwrap_or_default();
         return Err(format!("OpenAI realtime HTTP {s}: {t}"));
     }
-    resp.json::<serde_json::Value>().await
-        .map_err(|e| format!("parse realtime session: {e}"))
+    let raw = resp.json::<serde_json::Value>().await
+        .map_err(|e| format!("parse realtime session: {e}"))?;
+    let token = raw.get("client_secret")
+        .and_then(|cs| cs.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let nested = raw.get("session");
+    let model = raw.get("model")
+        .or_else(|| nested.and_then(|s| s.get("model")))
+        .and_then(|m| m.as_str())
+        .unwrap_or("gpt-4o-mini-realtime-preview")
+        .to_string();
+    let session_id = raw.get("id")
+        .or_else(|| nested.and_then(|s| s.get("id")))
+        .and_then(|i| i.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(serde_json::json!({ "token": token, "model": model, "session_id": session_id }))
 }
 
 // ── Voice tool call handlers (Tauri commands for desktop VoiceMode) ──────────
