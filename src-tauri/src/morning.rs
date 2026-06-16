@@ -34,13 +34,13 @@ Output ONLY this JSON object. No prose, no code fences, nothing else:
   "day_line": "<one sentence: shape of the day — energy level + key anchor>",
   "commitments": ["<time + event, e.g. 2:00pm Jake ACU call>"],
   "tasks": [
-    { "id": "t1", "text": "<concise task name>", "detail": "<time estimate or context, 8 words max>" }
+    { "id": "t1", "text": "<e.g. Get the Roastlytics demo ready for Scotty>", "detail": "<time estimate or context, 8 words max>" }
   ],
   "agent_note": "<one proactive line: a habit reminder, demo prep nudge, or offer to run an agent swarm. Omit this field entirely if nothing useful to say.>"
 }
 
 Rules:
-- tasks: 4-7 items ordered by leverage factoring in recovery.
+- tasks: 3-5 of today's REAL priorities, written like a founder's sticky note — concrete outcomes in plain English (e.g. 'Get the Roastlytics demo ready for Scotty', 'Prep for the 2pm Jake call'). Translate anything technical in the brain into the human GOAL it serves. NEVER output internal engineering substeps or workflow jargon: no 'build', 'test', 'deploy', 'green', 'git push', 'npm run build', 'merge', 'commit', migration/RPC/commit-hash names, or Claude Code/harness steps. If a brain note is a dev task, name the goal, not the steps. Order by leverage, factoring in recovery.
 - commitments: only hard-scheduled items with times. Use [] if none.
 - If whoop-today.json is missing or fetched_at date is not today: set all health numbers to 0, read = "No Whoop data for today."
 - Output ONLY the JSON. Nothing else."#;

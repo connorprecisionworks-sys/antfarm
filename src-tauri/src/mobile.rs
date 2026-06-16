@@ -261,6 +261,22 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     .task-text { font-size: 13px; color: #e4e4e7; line-height: 1.4; }
     .task-detail { font-size: 11px; color: #71717a; }
 
+    /* routine */
+    .routine-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 0; border-bottom: 1px solid #1c1c1f;
+      cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .routine-row:last-child { border-bottom: none; }
+    .routine-circle {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid #52525b; flex-shrink: 0;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .routine-circle.checked { background: #6366f1; border-color: #6366f1; }
+    .routine-label { font-size: 13px; color: #e4e4e7; }
+    .routine-label.done { text-decoration: line-through; color: #52525b; }
+
     /* win / agent note */
     .win-card { border-color: #3f3a1a; background: #16140a; }
     .win-label { font-size: 10px; font-weight: 700; color: #78716c; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; }
@@ -700,10 +716,24 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         html += `</div>`;
       }
 
+      // Morning Routine
+      const routineItems = getRoutineItems();
+      const routineChecks = getRoutineChecks();
+      html += `<div class="card">
+        <div class="section-lbl">Morning Routine</div>`;
+      routineItems.forEach((item, idx) => {
+        const checked = !!routineChecks[idx];
+        html += `<div class="routine-row" onclick="toggleRoutine(${idx})" id="routine-row-${idx}">
+          <span class="routine-circle${checked ? ' checked' : ''}" id="routine-circle-${idx}"></span>
+          <span class="routine-label${checked ? ' done' : ''}" id="routine-label-${idx}">${esc(item)}</span>
+        </div>`;
+      });
+      html += `</div>`;
+
       // Tasks
       if (b.tasks && b.tasks.length) {
         html += `<div class="card">
-          <div class="section-lbl">The Plan</div>`;
+          <div class="section-lbl">Today's Priorities</div>`;
         b.tasks.forEach(t => {
           html += `<div class="task-row">
             <span class="task-dot"></span>
@@ -762,6 +792,46 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         <button onclick="loadMorning()" style="margin-top:4px;font-size:12px;color:#6366f1;background:none;border:none;cursor:pointer;text-decoration:underline">Try again</button>
       </div>`;
       content.style.display = 'block';
+    }
+
+    // ── Morning Routine ───────────────────────────────────────────────────────
+
+    const ROUTINE_DEFAULT = ["Coffee","Breakfast / fuel","Plan / review the day","Reading (20 min)","Workout","Work block"];
+
+    function getRoutineItems() {
+      try {
+        const raw = localStorage.getItem('antfarm-routine-items');
+        if (raw) { const p = JSON.parse(raw); if (Array.isArray(p) && p.length) return p; }
+      } catch {}
+      const items = ROUTINE_DEFAULT.slice();
+      localStorage.setItem('antfarm-routine-items', JSON.stringify(items));
+      return items;
+    }
+
+    function getRoutineChecks() {
+      const key = 'antfarm-routine-checks-' + new Date().toISOString().slice(0, 10);
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) return JSON.parse(raw);
+      } catch {}
+      return {};
+    }
+
+    function setRoutineCheck(idx, checked) {
+      const key = 'antfarm-routine-checks-' + new Date().toISOString().slice(0, 10);
+      const checks = getRoutineChecks();
+      checks[idx] = checked;
+      localStorage.setItem(key, JSON.stringify(checks));
+    }
+
+    function toggleRoutine(idx) {
+      const checks = getRoutineChecks();
+      const nowChecked = !checks[idx];
+      setRoutineCheck(idx, nowChecked);
+      const circle = document.getElementById('routine-circle-' + idx);
+      const label  = document.getElementById('routine-label-' + idx);
+      if (circle) circle.classList.toggle('checked', nowChecked);
+      if (label)  label.classList.toggle('done', nowChecked);
     }
 
     // ── Morning data fetching ─────────────────────────────────────────────────
