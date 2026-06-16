@@ -220,11 +220,16 @@ fn call_openai_stt(audio_bytes: Vec<u8>, audio_content_type: String, api_key: &s
 
 const TTS_MAX_CHARS: usize = 4096;
 
-fn call_openai_tts(text: &str, api_key: &str) -> Result<Vec<u8>, String> {
+const VOICE_JARVIS: &str            = "ash";   // Morning / Jarvis persona
+#[allow(dead_code)]
+const VOICE_DISPATCH: &str          = "onyx";  // reserved for Part C desktop Tauri commands
+
+fn call_openai_tts(text: &str, voice: &str, api_key: &str) -> Result<Vec<u8>, String> {
     let text = if text.len() > TTS_MAX_CHARS { &text[..TTS_MAX_CHARS] } else { text };
+    let voice = if voice.is_empty() { VOICE_JARVIS } else { voice };
     let body = serde_json::json!({
         "model": "tts-1",
-        "voice": "alloy",
+        "voice": voice,
         "input": text,
         "response_format": "mp3",
     });
@@ -1599,10 +1604,15 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         const lbl = document.getElementById('voice-state-label');
         if (data.mode === 'plan_intent') {
           PENDING_PLAN = true;
+          _lastReplyVoice = VOICE_JARVIS;
           lbl.textContent = "Plan ready — say 'go' to launch";
+        } else if (data.mode === 'launched') {
+          PENDING_PLAN = false;
+          _lastReplyVoice = VOICE_DISPATCH;
+          lbl.textContent = '';
         } else {
           PENDING_PLAN = false;
-          if (data.mode === 'launched') lbl.textContent = '';
+          _lastReplyVoice = VOICE_JARVIS;
         }
       } catch (e) {
         CHAT_MSGS.push({ role: 'error', text: e.message });
@@ -1613,16 +1623,20 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       CHAT_THINKING = false;
       renderChat();
 
-      if (replyText) await playVoiceTTS(replyText);
+      if (replyText) await playVoiceTTS(replyText, _lastReplyVoice);
     }
 
-    async function playVoiceTTS(text) {
+    const VOICE_JARVIS   = 'ash';
+    const VOICE_DISPATCH = 'onyx';
+    let _lastReplyVoice  = VOICE_JARVIS;
+
+    async function playVoiceTTS(text, voice = VOICE_JARVIS) {
       setVoiceState('speaking');
       try {
         const r = await fetch('/api/tts', {
           method: 'POST',
           headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, voice }),
         });
         if (!r.ok) throw new Error(await r.text());
         const url = URL.createObjectURL(await r.blob());
@@ -2058,14 +2072,13 @@ pub fn start(app: tauri::AppHandle) {
                     };
                     let mut body = String::new();
                     let _ = request.as_reader().read_to_string(&mut body);
-                    let text = serde_json::from_str::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
-                        .unwrap_or_default();
+                    let parsed = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                    let text = parsed.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    let voice = parsed.get("voice").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     if text.trim().is_empty() {
                         respond(request, 400, "text/plain", "missing text".into()); continue;
                     }
-                    match call_openai_tts(&text, &api_key) {
+                    match call_openai_tts(&text, &voice, &api_key) {
                         Ok(mp3_bytes) => respond_binary(request, 200, "audio/mpeg", mp3_bytes),
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
