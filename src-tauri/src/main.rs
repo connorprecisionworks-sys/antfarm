@@ -2357,6 +2357,16 @@ fn save_png_to_desktop(filename: String, data_base64: String) -> Result<String, 
     Ok(dest.to_string_lossy().into_owned())
 }
 
+// ── Dev helpers ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn open_devtools(window: tauri::WebviewWindow) {
+    #[cfg(debug_assertions)]
+    window.open_devtools();
+    #[cfg(not(debug_assertions))]
+    let _ = window;
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -2462,6 +2472,7 @@ fn main() {
             planning::get_tomorrow_plan,
             wrapped_stats,
             save_png_to_desktop,
+            open_devtools,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -31,10 +31,43 @@ export function VoiceMode() {
   const outBufRef   = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const orbRafRef   = useRef<number | null>(null);
   const timerRef    = useRef<number | null>(null);
-  const idleTimerRef   = useRef<number | null>(null);
-  const lastAudioRef   = useRef<number>(0);
+  const idleTimerRef    = useRef<number | null>(null);
+  const lastAudioRef    = useRef<number>(0);
   const sessionStartRef = useRef<number | null>(null);
   const orbStateRef = useRef<OrbState>("idle");
+
+  // ── Debug log ──────────────────────────────────────────────────────────────
+  const debugLogRef       = useRef<string[]>([]);
+  const logPanelRef       = useRef<HTMLDivElement>(null);
+  const audioDeltaCountRef = useRef(0);
+  const [debugLog, setDebugLog] = useState<string[]>([]);
+
+  function log(msg: string) {
+    const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+    const line = `[${ts}] ${msg}`;
+    console.log("[VOICE]", line);
+    const next = [...debugLogRef.current.slice(-299), line];
+    debugLogRef.current = next;
+    setDebugLog(next);
+  }
+
+  // Auto-scroll log panel to bottom
+  useEffect(() => {
+    if (logPanelRef.current) {
+      logPanelRef.current.scrollTop = logPanelRef.current.scrollHeight;
+    }
+  }, [debugLog]);
+
+  // Cmd+Option+I → open devtools
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.metaKey && e.altKey && e.key === "i") {
+        invoke("open_devtools").catch(() => {});
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
 
   const [voiceMode, setVoiceMode]     = useState<Mode>("realtime");
   const [orbState, setOrbStateReact]  = useState<OrbState>("idle");
@@ -160,6 +193,7 @@ export function VoiceMode() {
   }
 
   async function handleToolCall(name: string, args: Record<string, string>, callId: string) {
+    log(`tool: ${name} call_id=${callId}`);
     let result = "ok";
     try {
       if (name === "get_brief") {
@@ -173,17 +207,54 @@ export function VoiceMode() {
       } else if (name === "lock_tomorrow_plan") {
         result = await invoke<string>("tool_lock_tomorrow_plan");
       }
-    } catch (e) { result = "Error: " + String(e); }
+      log(`tool: ${name} result="${result.slice(0, 80)}"`);
+    } catch (e) {
+      result = "Error: " + String(e);
+      log(`tool: ${name} ERROR: ${result}`);
+    }
     sendRT({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output: result } });
     sendRT({ type: "response.create" });
     if (orbStateRef.current === "thinking") setOrbState("listening");
   }
 
   function handleRealtimeEvent(evt: Record<string, unknown>) {
-    switch (evt.type) {
-      case "input_audio_buffer.speech_started": lastAudioRef.current = Date.now(); setOrbState("listening"); break;
-      case "response.audio.delta":              lastAudioRef.current = Date.now(); setOrbState("speaking");  break;
-      case "response.audio.done":               setOrbState("listening"); break;
+    const evtType = String(evt.type ?? "");
+
+    // audio.delta fires many times/sec — track count, only log first of each response
+    if (evtType === "response.audio.delta") {
+      audioDeltaCountRef.current++;
+      if (audioDeltaCountRef.current === 1) {
+        log("response.audio.delta ×1 (first of response)");
+      } else {
+        // update the count in-place on the last delta line to avoid flooding
+        const arr = debugLogRef.current;
+        if (arr.length > 0) {
+          const last = arr[arr.length - 1];
+          if (last.includes("response.audio.delta")) {
+            const updated = last.replace(/×\d+/, `×${audioDeltaCountRef.current}`);
+            arr[arr.length - 1] = updated;
+            setDebugLog([...arr]);
+          }
+        }
+      }
+      lastAudioRef.current = Date.now();
+      setOrbState("speaking");
+      return;
+    }
+
+    log(`evt: ${evtType}`);
+
+    switch (evtType) {
+      case "input_audio_buffer.speech_started":
+        lastAudioRef.current = Date.now();
+        setOrbState("listening");
+        break;
+      case "input_audio_buffer.speech_stopped":
+        break;
+      case "response.audio.done":
+        audioDeltaCountRef.current = 0;
+        setOrbState("listening");
+        break;
       case "response.function_call_arguments.done": {
         setOrbState("thinking");
         let args: Record<string, string> = {};
@@ -198,21 +269,36 @@ export function VoiceMode() {
         const item = output?.[0] as Record<string, unknown> | undefined;
         const content = item?.content as unknown[] | undefined;
         const tx = (content?.[0] as Record<string, unknown> | undefined)?.transcript;
-        if (typeof tx === "string") setCaptions(tx);
+        if (typeof tx === "string") {
+          setCaptions(tx);
+          log(`response.done — transcript: "${tx.slice(0, 60)}"`);
+        }
         break;
       }
+      case "error": {
+        const err = evt.error as Record<string, unknown> | undefined;
+        log(`SERVER ERROR: ${err?.type} — ${err?.message}`);
+        break;
+      }
+      default:
+        break;
     }
   }
 
   const connect = useCallback(async () => {
+    log(`=== connect() mode=${mode}`);
     setError(""); setErrorKind("");
     setOrbState("connecting");
     startOrb();
 
+    // 1. Token
     let session: RealtimeTokenResponse;
     try {
+      log("invoking get_realtime_token...");
       session = await invoke<RealtimeTokenResponse>("get_realtime_token", { mode });
+      log(`token ok — present:${!!session.token} model:${session.model} sid:${session.session_id}`);
     } catch (e) {
+      log("token FAILED: " + String(e));
       setOrbState("idle");
       setError("Token failed: " + String(e));
       setErrorKind("network");
@@ -220,12 +306,17 @@ export function VoiceMode() {
       return;
     }
 
+    // 2. Mic
     let stream: MediaStream;
     try {
+      log("getUserMedia({audio:true})...");
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const track = stream.getAudioTracks()[0];
+      log(`getUserMedia ok — tracks:${stream.getAudioTracks().length} readyState:${track?.readyState} enabled:${track?.enabled}`);
     } catch (e) {
-      setOrbState("idle");
       const msg = String(e);
+      log("getUserMedia FAILED: " + msg);
+      setOrbState("idle");
       if (msg.includes("NotAllowed") || msg.includes("Permission")) {
         setError("Mic access denied — check System Preferences → Privacy → Microphone.");
         setErrorKind("mic");
@@ -238,31 +329,61 @@ export function VoiceMode() {
     }
     streamRef.current = stream;
 
+    // 3. AudioContext + analyser
+    log("creating AudioContext...");
     const audioCtx = new AudioContext();
     audioCtxRef.current = audioCtx;
+    log(`AudioContext state: ${audioCtx.state}`);
+    if (audioCtx.state === "suspended") {
+      log("AudioContext suspended — calling resume()...");
+      await audioCtx.resume();
+      log(`AudioContext after resume: ${audioCtx.state}`);
+    }
     const micSrc = audioCtx.createMediaStreamSource(stream);
     const micAn = audioCtx.createAnalyser(); micAn.fftSize = 256;
-    micAnRef.current = micAn; micBufRef.current = new Uint8Array(micAn.frequencyBinCount) as Uint8Array<ArrayBuffer>;
+    micAnRef.current = micAn;
+    micBufRef.current = new Uint8Array(micAn.frequencyBinCount) as Uint8Array<ArrayBuffer>;
     micSrc.connect(micAn);
+    log("mic → analyser wired");
 
+    // 4. PeerConnection
+    log("creating RTCPeerConnection...");
     const pc = new RTCPeerConnection();
     pcRef.current = pc;
+    pc.onconnectionstatechange = () => log(`pc.connectionState: ${pc.connectionState}`);
+    pc.oniceconnectionstatechange = () => log(`pc.iceConnectionState: ${pc.iceConnectionState}`);
+    pc.onicegatheringstatechange = () => log(`pc.iceGatheringState: ${pc.iceGatheringState}`);
+    pc.onsignalingstatechange = () => log(`pc.signalingState: ${pc.signalingState}`);
     pc.ontrack = (e) => {
+      log(`pc.ontrack — streams:${e.streams.length} track.kind:${e.track.kind} track.readyState:${e.track.readyState}`);
       const s = e.streams[0]; if (!s) return;
       const outSrc = audioCtx.createMediaStreamSource(s);
       const outAn = audioCtx.createAnalyser(); outAn.fftSize = 256;
-      outAnRef.current = outAn; outBufRef.current = new Uint8Array(outAn.frequencyBinCount) as Uint8Array<ArrayBuffer>;
+      outAnRef.current = outAn;
+      outBufRef.current = new Uint8Array(outAn.frequencyBinCount) as Uint8Array<ArrayBuffer>;
       outSrc.connect(outAn);
       outSrc.connect(audioCtx.destination);
+      log("remote audio → analyser + destination wired");
     };
-    for (const track of stream.getTracks()) pc.addTrack(track, stream);
 
+    // 5. Add tracks
+    const tracks = stream.getTracks();
+    log(`adding ${tracks.length} track(s) to pc...`);
+    for (const track of tracks) {
+      pc.addTrack(track, stream);
+      log(`  addTrack: ${track.kind} / ${track.readyState} / enabled:${track.enabled}`);
+    }
+
+    // 6. Data channel
+    log("creating data channel 'oai-events'...");
     const dc = pc.createDataChannel("oai-events");
     dcRef.current = dc;
     dc.onopen = () => {
+      log("DATA CHANNEL OPEN ✓");
       setOrbState("listening");
       lastAudioRef.current = Date.now();
       sessionStartRef.current = Date.now();
+      audioDeltaCountRef.current = 0;
       timerRef.current = window.setInterval(() => {
         if (!sessionStartRef.current) return;
         const sec = Math.floor((Date.now() - sessionStartRef.current) / 1000);
@@ -273,6 +394,7 @@ export function VoiceMode() {
       }, 1000);
       idleTimerRef.current = window.setInterval(() => {
         if (Date.now() - lastAudioRef.current > 40000) {
+          log("idle timeout — disconnecting");
           setIdleEnded(true);
           disconnect();
           setTimeout(() => setIdleEnded(false), 3000);
@@ -282,19 +404,36 @@ export function VoiceMode() {
     dc.onmessage = (e) => {
       try { handleRealtimeEvent(JSON.parse(e.data)); } catch {}
     };
-    dc.onclose = () => setOrbState("idle");
+    dc.onerror = (e) => log(`dc.onerror: ${JSON.stringify(e)}`);
+    dc.onclose = () => { log("data channel closed"); setOrbState("idle"); };
 
+    // 7. SDP offer → exchange
+    log("createOffer...");
     const offer = await pc.createOffer();
+    log(`offer created — SDP length:${offer.sdp?.length ?? 0}`);
     await pc.setLocalDescription(offer);
+    log("setLocalDescription done");
+
+    const sdpUrl = `https://api.openai.com/v1/realtime?model=${session.model}`;
+    log(`POST ${sdpUrl}`);
     try {
-      const sdpR = await fetch(`https://api.openai.com/v1/realtime?model=${session.model}`, {
+      const sdpR = await fetch(sdpUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${session.token}`, "Content-Type": "application/sdp" },
         body: offer.sdp!,
       });
-      if (!sdpR.ok) throw new Error(await sdpR.text());
-      await pc.setRemoteDescription({ type: "answer", sdp: await sdpR.text() });
+      log(`SDP response: HTTP ${sdpR.status} ${sdpR.statusText}`);
+      if (!sdpR.ok) {
+        const errBody = await sdpR.text();
+        log(`SDP error body: ${errBody}`);
+        throw new Error(`HTTP ${sdpR.status}: ${errBody}`);
+      }
+      const answerSdp = await sdpR.text();
+      log(`SDP answer received — length:${answerSdp.length}`);
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      log("setRemoteDescription done — waiting for dc.onopen...");
     } catch (e) {
+      log("SDP exchange FAILED: " + String(e));
       setError("WebRTC failed: " + String(e));
       setErrorKind("network");
       disconnect();
@@ -303,6 +442,7 @@ export function VoiceMode() {
   }, [startOrb, stopOrb]);
 
   const disconnect = useCallback(() => {
+    log("disconnect()");
     if (idleTimerRef.current) { clearInterval(idleTimerRef.current); idleTimerRef.current = null; }
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     if (dcRef.current) { try { dcRef.current.close(); } catch {} dcRef.current = null; }
@@ -431,6 +571,48 @@ export function VoiceMode() {
           </div>
         </div>
       )}
+
+      {/* ── Debug log panel ─────────────────────────────────────────────────── */}
+      <div
+        className="absolute left-2 right-2 z-20"
+        style={{ bottom: "80px" }}
+      >
+        <div className="flex items-center justify-between px-1 mb-1">
+          <span className="text-[9px] font-mono text-zinc-700 tracking-widest uppercase select-none">
+            Voice Debug · ⌘⌥I for console
+          </span>
+          <button
+            onClick={() => navigator.clipboard.writeText(debugLog.join("\n")).catch(() => {})}
+            className="text-[9px] font-mono text-zinc-700 hover:text-zinc-400 border border-zinc-800 px-2 py-0.5 rounded transition-colors"
+          >
+            copy all
+          </button>
+        </div>
+        <div
+          ref={logPanelRef}
+          className="rounded-lg border border-zinc-800/40 p-2 font-mono text-[9px] leading-relaxed overflow-y-auto select-text"
+          style={{ height: "108px", background: "rgba(0,0,0,0.55)", wordBreak: "break-all" }}
+        >
+          {debugLog.length === 0 ? (
+            <span className="text-zinc-700">waiting for connect()…</span>
+          ) : (
+            debugLog.map((line, i) => (
+              <div
+                key={i}
+                style={{
+                  color: (line.includes("FAILED") || line.includes("ERROR") || line.includes("error body") || line.includes("denied"))
+                    ? "#f87171"
+                    : (line.includes(" ok") || line.includes("OPEN") || line.includes(" done") || line.includes("wired") || line.includes("received"))
+                    ? "#4ade80"
+                    : "#52525b",
+                }}
+              >
+                {line}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
 
       {/* Bottom controls */}
       <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center gap-3 pb-8 z-10">
