@@ -11,11 +11,13 @@ import {
   Moon,
   PanelLeft,
   Sunrise,
+  Radio,
 } from "lucide-react";
 
 const NAV = [
   { to: "/morning", label: "Morning", icon: Sunrise, end: false },
   { to: "/tonight", label: "Tonight", icon: Moon,    end: false },
+  { to: "/voice",   label: "Voice",   icon: Radio,   end: false },
   { to: "/", label: "Home", icon: Home, end: true },
   { to: "/projects", label: "Projects", icon: Layers, end: false },
   { to: "/sessions", label: "Sessions", icon: Activity, end: false },

@@ -8,6 +8,7 @@ import { ProjectDetail } from "./pages/ProjectDetail";
 import { Sessions } from "./pages/Sessions";
 import { Usage } from "./pages/Usage";
 import { Settings } from "./pages/Settings";
+import { VoiceMode } from "./pages/VoiceMode";
 
 export default function App() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
           <Route path="usage" element={<Usage />} />
           <Route path="workspace" element={null} />
           <Route path="settings" element={<Settings />} />
+          <Route path="voice" element={<VoiceMode />} />
         </Route>
       </Routes>
     </BrowserRouter>

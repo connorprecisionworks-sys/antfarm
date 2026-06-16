@@ -645,6 +645,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     @keyframes dotB { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-4px); } }
     @keyframes insightIn { from { opacity: 0; } to { opacity: 1; } }
     .insight-in { animation: insightIn 0.3s ease-out both; }
+    @keyframes orbPulse { 0%,100%{opacity:.7} 50%{opacity:1} }
+    @keyframes orbBreath { 0%,100%{transform:scale(1)} 50%{transform:scale(1.04)} }
 
     @media (prefers-reduced-motion: reduce) {
       .spinner { animation: none; border-top-color: #6366f1; }
@@ -653,6 +655,77 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       .dot { animation: none; }
       .bubble { animation: none; }
     }
+
+    /* ── Voice overlay ── */
+    #voice-overlay {
+      position: fixed; inset: 0; z-index: 300;
+      background: #07080c;
+      display: none; flex-direction: column;
+      align-items: center; justify-content: center; gap: 0;
+      opacity: 0; transition: opacity 0.3s ease;
+    }
+    #voice-overlay.active { display: flex; }
+    #voice-overlay.visible { opacity: 1; }
+    #orb-canvas { display: block; touch-action: none; }
+    #voice-chrome {
+      position: absolute; top: 0; left: 0; right: 0;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: calc(env(safe-area-inset-top) + 14px) 20px 14px;
+    }
+    #voice-indicator {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 11px; font-family: ui-monospace,monospace;
+      letter-spacing: .08em; color: #52525b;
+    }
+    #voice-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: #52525b;
+      transition: background .4s;
+    }
+    #voice-dot.live { background: #22c55e; animation: orbPulse 2s ease-in-out infinite; }
+    #voice-dot.connecting { background: #d4a04d; }
+    #voice-timer-wrap { font-size: 11px; font-family: ui-monospace,monospace; color: #3f3f46; }
+    #voice-timer { color: #52525b; }
+    #voice-cost { color: #3f3f46; margin-left: 6px; }
+    #voice-bottom {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      display: flex; flex-direction: column; align-items: center;
+      padding-bottom: calc(env(safe-area-inset-bottom) + 32px); gap: 16px;
+    }
+    #voice-state-text {
+      font-size: 12px; font-family: ui-monospace,monospace;
+      letter-spacing: .1em; color: #52525b; min-height: 16px;
+      text-transform: uppercase;
+    }
+    #voice-end-btn {
+      background: #18181b; border: 1px solid #27272a;
+      color: #a1a1aa; font-size: 13px; font-weight: 500;
+      padding: 10px 32px; border-radius: 100px; cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+    #voice-end-btn:hover { background: #27272a; color: #e4e4e7; }
+    #voice-captions {
+      position: absolute; bottom: 120px; left: 16px; right: 16px;
+      background: rgba(13,13,15,.85); backdrop-filter: blur(8px);
+      border-radius: 12px; padding: 12px 16px;
+      font-size: 13px; color: #d4d4d8; line-height: 1.5;
+      display: none;
+    }
+    #voice-captions.shown { display: block; }
+    #voice-captions-btn {
+      background: none; border: none; color: #3f3f46;
+      font-size: 11px; font-family: ui-monospace,monospace;
+      letter-spacing: .08em; cursor: pointer; padding: 4px 8px;
+    }
+    #voice-captions-btn.on { color: #7c97e8; }
+
+    /* ── Voice nav tab ── */
+    .tab-voice {
+      background: none; border: none; padding: 0 10px; cursor: pointer;
+      font-size: 13px; color: #52525b; display: flex; align-items: center; gap: 5px;
+      transition: color .15s;
+    }
+    .tab-voice:hover { color: #a1a1aa; }
+    .tab-voice svg { display: block; }
   </style>
 </head>
 <body>
@@ -662,6 +735,37 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     <button class="tab active" id="tab-morning" onclick="switchView('morning')">Morning</button>
     <button class="tab"        id="tab-agents"  onclick="switchView('agents')">Agents</button>
     <span id="nav-status"></span>
+    <button class="tab-voice" onclick="openVoiceOverlay()" title="Talk to Jarvis">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+      Talk
+    </button>
+  </div>
+
+  <!-- ── Voice overlay ─────────────────────────────────────────────────── -->
+  <div id="voice-overlay">
+    <!-- top chrome -->
+    <div id="voice-chrome">
+      <div id="voice-indicator">
+        <span id="voice-dot"></span>
+        <span id="voice-status-text">ready</span>
+      </div>
+      <div id="voice-timer-wrap">
+        <span id="voice-timer"></span><span id="voice-cost"></span>
+      </div>
+    </div>
+    <!-- orb canvas (sized by JS) -->
+    <canvas id="orb-canvas"></canvas>
+    <!-- state label under orb -->
+    <div id="voice-state-text"></div>
+    <!-- bottom controls -->
+    <div id="voice-bottom">
+      <div style="display:flex;gap:12px;align-items:center;">
+        <button id="voice-captions-btn" onclick="toggleCaptions()">CC</button>
+        <button id="voice-end-btn" onclick="closeVoiceOverlay()">End</button>
+      </div>
+    </div>
+    <!-- live captions (hidden by default) -->
+    <div id="voice-captions"></div>
   </div>
 
   <!-- ── Morning view ────────────────────────────────────────────────── -->
@@ -1696,6 +1800,289 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       const btn = document.getElementById('mic-btn');
       if (!btn || !btn.contains(e.target)) stopVoicePlayback();
     }, true);
+
+    // ── Realtime voice (WebRTC) ───────────────────────────────────────────────
+
+    let _RT = {
+      pc: null, dc: null, stream: null, audioCtx: null,
+      micAn: null, outAn: null, orbState: 'idle',
+      sessionStart: null, timerInterval: null, orbRaf: null,
+      captionsOn: false, pendingDispatch: null, micFreqBuf: null, outFreqBuf: null,
+    };
+
+    function setOrbState(s) {
+      _RT.orbState = s;
+      const dot  = document.getElementById('voice-dot');
+      const text = document.getElementById('voice-state-text');
+      if (dot) {
+        dot.className = s === 'live' || s === 'listening' || s === 'speaking' ? 'live'
+                      : s === 'connecting' ? 'connecting' : '';
+      }
+      const STATUS = document.getElementById('voice-status-text');
+      if (STATUS) STATUS.textContent =
+        s === 'connecting' ? 'connecting' : s === 'listening' ? 'live' :
+        s === 'thinking'   ? 'live'       : s === 'speaking'  ? 'live' : 'ready';
+      if (text) text.textContent =
+        s === 'connecting' ? 'CONNECTING...' : s === 'listening' ? 'LISTENING' :
+        s === 'thinking'   ? 'THINKING...'   : s === 'speaking'  ? 'SPEAKING' : '';
+    }
+
+    async function openVoiceOverlay() {
+      const ov = document.getElementById('voice-overlay');
+      ov.classList.add('active');
+      requestAnimationFrame(() => ov.classList.add('visible'));
+      startOrbCanvas();
+      await connectRealtime();
+    }
+
+    function closeVoiceOverlay() {
+      stopRealtime();
+      stopOrbCanvas();
+      const ov = document.getElementById('voice-overlay');
+      ov.classList.remove('visible');
+      setTimeout(() => ov.classList.remove('active'), 320);
+      setOrbState('idle');
+    }
+
+    function toggleCaptions() {
+      _RT.captionsOn = !_RT.captionsOn;
+      const cap = document.getElementById('voice-captions');
+      const btn = document.getElementById('voice-captions-btn');
+      if (cap) cap.classList.toggle('shown', _RT.captionsOn);
+      if (btn) btn.classList.toggle('on', _RT.captionsOn);
+    }
+
+    function updateCaptions(text) {
+      if (!_RT.captionsOn) return;
+      const el = document.getElementById('voice-captions');
+      if (el) el.textContent = text;
+    }
+
+    async function connectRealtime() {
+      setOrbState('connecting');
+      // 1. Mint ephemeral token
+      let token, model;
+      try {
+        const r = await fetch('/api/realtime-token', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const d = await r.json();
+        token = d.token; model = d.model;
+      } catch (e) {
+        setOrbState('idle');
+        document.getElementById('voice-status-text').textContent = 'failed: ' + e.message;
+        return;
+      }
+      // 2. Mic
+      try {
+        _RT.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (_) {
+        setOrbState('idle');
+        document.getElementById('voice-status-text').textContent = 'mic denied';
+        return;
+      }
+      // 3. WebAudio mic analyser
+      _RT.audioCtx = new AudioContext();
+      const micSrc = _RT.audioCtx.createMediaStreamSource(_RT.stream);
+      _RT.micAn = _RT.audioCtx.createAnalyser(); _RT.micAn.fftSize = 256;
+      _RT.micFreqBuf = new Uint8Array(_RT.micAn.frequencyBinCount);
+      micSrc.connect(_RT.micAn);
+      // 4. RTCPeerConnection
+      _RT.pc = new RTCPeerConnection();
+      _RT.pc.ontrack = (e) => {
+        const s = e.streams[0]; if (!s) return;
+        const outSrc = _RT.audioCtx.createMediaStreamSource(s);
+        _RT.outAn = _RT.audioCtx.createAnalyser(); _RT.outAn.fftSize = 256;
+        _RT.outFreqBuf = new Uint8Array(_RT.outAn.frequencyBinCount);
+        outSrc.connect(_RT.outAn);
+        outSrc.connect(_RT.audioCtx.destination);
+      };
+      for (const track of _RT.stream.getTracks()) _RT.pc.addTrack(track, _RT.stream);
+      // 5. Data channel
+      _RT.dc = _RT.pc.createDataChannel('oai-events');
+      _RT.dc.onopen = () => {
+        setOrbState('listening');
+        _RT.sessionStart = Date.now();
+        startSessionTimer();
+      };
+      _RT.dc.onmessage = (e) => { try { handleRealtimeEvent(JSON.parse(e.data)); } catch {} };
+      _RT.dc.onclose = () => setOrbState('idle');
+      // 6. SDP exchange
+      const offer = await _RT.pc.createOffer();
+      await _RT.pc.setLocalDescription(offer);
+      try {
+        const sdpR = await fetch(`https://api.openai.com/v1/realtime?model=${model}`, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/sdp' },
+          body: offer.sdp,
+        });
+        if (!sdpR.ok) throw new Error(await sdpR.text());
+        await _RT.pc.setRemoteDescription({ type: 'answer', sdp: await sdpR.text() });
+      } catch (e) {
+        document.getElementById('voice-status-text').textContent = 'WebRTC failed';
+        stopRealtime();
+      }
+    }
+
+    function handleRealtimeEvent(evt) {
+      switch (evt.type) {
+        case 'input_audio_buffer.speech_started':   setOrbState('listening'); break;
+        case 'response.audio.delta':                setOrbState('speaking');  break;
+        case 'response.audio.done':                 setOrbState('listening'); break;
+        case 'response.function_call_arguments.done':
+          setOrbState('thinking');
+          handleToolCall(evt.name, (() => { try { return JSON.parse(evt.arguments || '{}'); } catch { return {}; } })(), evt.call_id);
+          break;
+        case 'response.done':
+          if (_RT.orbState !== 'thinking') setOrbState('listening');
+          const tx = evt.response?.output?.[0]?.content?.[0]?.transcript;
+          if (tx) updateCaptions(tx);
+          break;
+      }
+    }
+
+    function sendRT(obj) {
+      if (_RT.dc && _RT.dc.readyState === 'open') _RT.dc.send(JSON.stringify(obj));
+    }
+
+    async function handleToolCall(name, args, callId) {
+      let result = 'ok';
+      try {
+        if (name === 'get_brief') {
+          const r = await fetch('/api/morning', { headers: authHeaders() });
+          result = r.ok ? (await r.text()).slice(0, 2000) : 'brief unavailable';
+        } else if (name === 'draft_dispatch') {
+          const r = await fetch('/api/assistant', {
+            method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: args.task || '', now: new Date().toLocaleString(), dateKey: DATE_KEY, briefingJson: BRIEFING_JSON || '{}' }),
+          });
+          const d = await r.json();
+          _RT.pendingDispatch = d;
+          result = d.reply || 'Plan drafted.';
+        } else if (name === 'launch_dispatch') {
+          if (!_RT.pendingDispatch) { result = 'No plan drafted yet. Use draft_dispatch first.'; }
+          else {
+            const r = await fetch('/api/assistant', {
+              method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: 'go', now: new Date().toLocaleString(), dateKey: DATE_KEY, briefingJson: BRIEFING_JSON || '{}' }),
+            });
+            const d = await r.json();
+            _RT.pendingDispatch = null;
+            result = d.reply || "Running.";
+          }
+        }
+      } catch (e) { result = 'Error: ' + e.message; }
+      sendRT({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: callId, output: result } });
+      sendRT({ type: 'response.create' });
+      if (_RT.orbState === 'thinking') setOrbState('listening');
+    }
+
+    function stopRealtime() {
+      if (_RT.timerInterval) { clearInterval(_RT.timerInterval); _RT.timerInterval = null; }
+      if (_RT.dc)     { try { _RT.dc.close();  } catch {} _RT.dc = null; }
+      if (_RT.pc)     { try { _RT.pc.close();  } catch {} _RT.pc = null; }
+      if (_RT.stream) { _RT.stream.getTracks().forEach(t => t.stop()); _RT.stream = null; }
+      if (_RT.audioCtx) { try { _RT.audioCtx.close(); } catch {} _RT.audioCtx = null; }
+      _RT.micAn = null; _RT.outAn = null; _RT.sessionStart = null; _RT.pendingDispatch = null;
+      const t = document.getElementById('voice-timer'); if (t) t.textContent = '';
+      const c = document.getElementById('voice-cost');  if (c) c.textContent = '';
+    }
+
+    function startSessionTimer() {
+      const tEl = document.getElementById('voice-timer');
+      const cEl = document.getElementById('voice-cost');
+      _RT.timerInterval = setInterval(() => {
+        if (!_RT.sessionStart) return;
+        const sec = Math.floor((Date.now() - _RT.sessionStart) / 1000);
+        const m = String(Math.floor(sec / 60)).padStart(2, '0');
+        const s = String(sec % 60).padStart(2, '0');
+        if (tEl) tEl.textContent = m + ':' + s;
+        // gpt-4o-mini-realtime: ~$0.06/min audio in + $0.024/min audio out ≈ $0.084/min
+        if (cEl) cEl.textContent = ' · ~$' + ((sec / 60) * 0.084).toFixed(3);
+      }, 1000);
+    }
+
+    // ── Orb particle canvas ───────────────────────────────────────────────────
+
+    function startOrbCanvas() {
+      const cv = document.getElementById('orb-canvas');
+      if (!cv) return;
+      const DPR = Math.min(window.devicePixelRatio || 1, 2);
+      const SZ = Math.min(window.innerWidth, window.innerHeight, 320);
+      cv.style.width = SZ + 'px'; cv.style.height = SZ + 'px';
+      cv.width = SZ * DPR; cv.height = SZ * DPR;
+      const ctx = cv.getContext('2d');
+      ctx.scale(DPR, DPR);
+      const W = SZ, H = SZ, CX = W / 2, CY = H / 2;
+      const N = 1000, R = SZ * 0.34, FOCAL = 380;
+
+      // Build fibonacci sphere
+      const sph = [];
+      for (let i = 0; i < N; i++) {
+        const ph = Math.acos(1 - 2 * (i + 0.5) / N);
+        const th = Math.PI * (1 + Math.sqrt(5)) * i;
+        sph.push([Math.cos(th) * Math.sin(ph) * R, Math.sin(th) * Math.sin(ph) * R, Math.cos(ph) * R]);
+      }
+      const PX = new Float32Array(N), PY = new Float32Array(N);
+      for (let i = 0; i < N; i++) { PX[i] = CX + sph[i][0]; PY[i] = CY + sph[i][1]; }
+      const PS = new Float32Array(N).map(() => 0.45 + Math.random() * 0.55);
+
+      let ang = 0, breath = 0;
+
+      function getAmp(an, buf) {
+        if (!an || !buf) return 0;
+        an.getByteFrequencyData(buf);
+        let s = 0; for (let i = 0; i < buf.length; i++) s += buf[i];
+        return s / (buf.length * 255);
+      }
+
+      function rot(x, y, z, ax, ay) {
+        const cy = Math.cos(ay), sy = Math.sin(ay);
+        const X = x * cy - z * sy, Z = x * sy + z * cy;
+        const cx = Math.cos(ax), sx = Math.sin(ax);
+        return [X, y * cx - Z * sx, y * sx + Z * cx];
+      }
+
+      function frame() {
+        const st = _RT.orbState;
+        let rsp = 0.004, bsp = 0.007, bamp = 0.05, swirl = 0;
+        if      (st === 'connecting') { rsp = 0.003; bsp = 0.005; bamp = 0.03; }
+        else if (st === 'listening')  { rsp = 0.007; bsp = 0.014; bamp = 0.09; }
+        else if (st === 'thinking')   { rsp = 0.020; bsp = 0.030; bamp = 0.04; swirl = 0.18; }
+        else if (st === 'speaking')   { rsp = 0.009; bsp = 0.022; bamp = 0.07; }
+
+        ang += rsp; breath += bsp;
+        const micAmp = getAmp(_RT.micAn, _RT.micFreqBuf);
+        const outAmp = getAmp(_RT.outAn, _RT.outFreqBuf);
+        const reactAmp = st === 'listening' ? micAmp : st === 'speaking' ? outAmp : 0;
+        const scale = 1 + Math.sin(breath) * bamp + reactAmp * 0.35;
+        const sw = swirl ? Math.sin(breath * 2) * swirl : 0;
+
+        ctx.clearRect(0, 0, W, H);
+        for (let i = 0; i < N; i++) {
+          const base = sph[i];
+          const rp = rot(base[0] * scale, base[1] * scale, base[2] * scale, ang * 0.38 + sw, ang);
+          const depth = FOCAL / (FOCAL - rp[2]);
+          const px = CX + rp[0] * depth, py = CY + rp[1] * depth;
+          const bright = Math.min(0.92, 0.35 + depth * 0.28 + reactAmp * 0.45);
+          ctx.beginPath();
+          ctx.arc(px, py, PS[i] * depth * 0.65, 0, 6.2832);
+          ctx.fillStyle = 'rgba(124,151,232,' + bright.toFixed(2) + ')';
+          ctx.fill();
+        }
+        _RT.orbRaf = requestAnimationFrame(frame);
+      }
+      frame();
+    }
+
+    function stopOrbCanvas() {
+      if (_RT.orbRaf) { cancelAnimationFrame(_RT.orbRaf); _RT.orbRaf = null; }
+      const cv = document.getElementById('orb-canvas');
+      if (cv) { const ctx = cv.getContext('2d'); if (ctx) ctx.clearRect(0, 0, cv.width, cv.height); }
+    }
 
     // ── Init ──────────────────────────────────────────────────────────────────
     loadMorning();
