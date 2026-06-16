@@ -1712,6 +1712,129 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
+// ── Realtime voice session ────────────────────────────────────────────────────
+
+fn read_brief_context() -> String {
+    let brain = brain_path();
+    let mut ctx = String::new();
+    let brief_path = format!("{}/active/today-brief.json", brain);
+    if let Ok(raw) = std::fs::read_to_string(&brief_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(briefing) = v.get("briefing") {
+                ctx.push_str("TODAY'S BRIEFING:\n");
+                ctx.push_str(&briefing.to_string());
+                ctx.push_str("\n\n");
+            }
+        }
+    }
+    let plan_path = format!("{}/active/tomorrow-plan.md", brain);
+    if let Ok(plan) = std::fs::read_to_string(&plan_path) {
+        ctx.push_str("TOMORROW'S PLAN:\n");
+        ctx.push_str(&plan);
+        ctx.push('\n');
+    }
+    ctx
+}
+
+fn realtime_session_body(brief_ctx: &str) -> serde_json::Value {
+    let instructions = format!(
+        "You are Jarvis, Connor's sharp chief of staff and AI operating partner. \
+Warm, decisive, concise. No em dashes. No bullet walls. Short punchy sentences. \
+You know Connor's day cold and can dispatch coding agents to his projects.\n\n\
+ALWAYS confirm before calling launch_dispatch. Say exactly what you will do and \
+wait for a clear go before launching. Drafting is cheap; launching spends real money \
+and writes real code.\n\n{brief_ctx}"
+    );
+    serde_json::json!({
+        "model": "gpt-4o-mini-realtime-preview",
+        "voice": "ash",
+        "instructions": instructions,
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_brief",
+                "description": "Return today's morning brief and tomorrow's plan as text.",
+                "parameters": { "type": "object", "properties": {} }
+            },
+            {
+                "type": "function",
+                "name": "draft_dispatch",
+                "description": "Draft an autonomous agent coding task for one of Connor's repos. Returns a plan summary. Always call this before launch_dispatch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "Concrete coding task for the agent to implement" }
+                    },
+                    "required": ["task"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "launch_dispatch",
+                "description": "Arm and run the previously drafted plan. Only call after Connor explicitly says go.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        ],
+        "tool_choice": "auto"
+    })
+}
+
+fn call_openai_realtime_session(api_key: &str, brief_ctx: &str) -> Result<serde_json::Value, String> {
+    let body = realtime_session_body(brief_ctx);
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post("https://api.openai.com/v1/realtime/sessions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .map_err(|e| format!("realtime session request: {e}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status().as_u16();
+        let t = resp.text().unwrap_or_default();
+        return Err(format!("OpenAI realtime HTTP {s}: {t}"));
+    }
+    resp.json::<serde_json::Value>().map_err(|e| format!("parse realtime session: {e}"))
+}
+
+fn extract_realtime_token_response(session: serde_json::Value) -> String {
+    let token = session.get("client_secret")
+        .and_then(|cs| cs.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let model = session.get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("gpt-4o-mini-realtime-preview")
+        .to_string();
+    let session_id = session.get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or_default()
+        .to_string();
+    serde_json::json!({ "token": token, "model": model, "session_id": session_id }).to_string()
+}
+
+#[tauri::command]
+pub async fn get_realtime_token() -> Result<serde_json::Value, String> {
+    let api_key = openai_api_key().ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
+    let brief_ctx = read_brief_context();
+    let body = realtime_session_body(&brief_ctx);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.openai.com/v1/realtime/sessions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("realtime session: {e}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status().as_u16();
+        let t = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI realtime HTTP {s}: {t}"));
+    }
+    resp.json::<serde_json::Value>().await
+        .map_err(|e| format!("parse realtime session: {e}"))
+}
+
 // ── Desktop Tauri voice commands ─────────────────────────────────────────────
 
 #[tauri::command]
@@ -2086,6 +2209,24 @@ pub fn start(app: tauri::AppHandle) {
                                 }
                             }
                         }
+                    }
+                }
+
+                // ── Realtime voice session token ─────────────────────────────
+
+                "/api/realtime-token" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let api_key = match openai_api_key() {
+                        Some(k) => k,
+                        None => { respond(request, 500, "text/plain", "OPENAI_API_KEY not set".into()); continue; }
+                    };
+                    let brief_ctx = read_brief_context();
+                    match call_openai_realtime_session(&api_key, &brief_ctx) {
+                        Ok(session) => respond(request, 200, "application/json", extract_realtime_token_response(session)),
+                        Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }
 
