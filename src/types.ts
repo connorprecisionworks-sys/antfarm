@@ -161,3 +161,35 @@ export interface WorkspaceEntry {
   project_slug: string | null;
   layout_json: string | null;
 }
+
+export interface DailyTokenPoint {
+  date: string;
+  tokens: number;
+}
+
+export interface WrappedStats {
+  period: string;
+  periodStart: string;
+  periodEnd: string;
+  totalTokens: number;
+  totalCost: number;
+  inputTokens: number;
+  outputTokens: number;
+  linesAdded: number;
+  linesRemoved: number;
+  commits: number;
+  runCount: number;
+  runDone: number;
+  runFailed: number;
+  runKilled: number;
+  busiestDay: string | null;
+  busiestDayTokens: number;
+  currentStreak: number;
+  longestStreak: number;
+  prevPeriodTokens: number;
+  prevPeriodCost: number;
+  dailyTokens: DailyTokenPoint[];
+  topProjectSlug: string | null;
+  topProjectName: string | null;
+  topProjectTokens: number;
+}
