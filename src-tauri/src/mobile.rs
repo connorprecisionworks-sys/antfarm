@@ -1,4 +1,4 @@
-// mobile.rs — read-only Tailscale/local status view for the antfarm harness.
+// mobile.rs — Tailscale/local status + Morning view for the antfarm harness.
 // Binds a tiny_http server on 127.0.0.1:8787. Token-gated (Bearer or ?token=).
 // Token is auto-generated and written to ~/.antfarm/mobile-token on first run.
 
@@ -20,7 +20,6 @@ fn load_or_create_token() -> String {
             return t;
         }
     }
-    // Generate 16 random bytes from /dev/urandom, hex-encode — no extra crate needed.
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         f.read_exact(&mut bytes).ok();
@@ -74,6 +73,32 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn url_decode(s: String) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn respond(request: tiny_http::Request, status: u16, content_type: &str, body: String) {
     let header = tiny_http::Header::from_bytes(b"Content-Type", content_type.as_bytes())
         .unwrap_or_else(|_| {
@@ -83,6 +108,17 @@ fn respond(request: tiny_http::Request, status: u16, content_type: &str, body: S
         .with_status_code(status)
         .with_header(header);
     request.respond(response).ok();
+}
+
+fn claude_path(app: &tauri::AppHandle) -> String {
+    let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
+    let p = dispatch.claude_path.lock().unwrap().clone();
+    drop(dispatch);
+    p
+}
+
+fn brain_path() -> String {
+    format!("{}/Desktop/CD_claude", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
 }
 
 // ── Mobile HTML page ──────────────────────────────────────────────────────────
@@ -97,25 +133,218 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
   <title>Antfarm</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
       background: #0a0a0b; color: #e4e4e7;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+    }
+
+    /* ── Top nav ── */
+    #top-nav {
+      display: flex; align-items: center; gap: 2px;
+      padding: calc(env(safe-area-inset-top) + 10px) 16px 10px;
+      border-bottom: 1px solid #27272a; background: #0d0d0f;
+      flex-shrink: 0; z-index: 10;
+    }
+    .tab {
+      flex: 1; padding: 7px 0; border: none; border-radius: 8px;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      background: transparent; color: #52525b; transition: all 0.15s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .tab.active { background: #1c1c1f; color: #f4f4f5; }
+    #nav-status { font-size: 11px; color: #3f3f46; margin-left: 8px; flex-shrink: 0; }
+
+    /* ── View containers ── */
+    .view { display: none; flex: 1; min-height: 0; flex-direction: column; }
+    .view.active { display: flex; }
+
+    /* ── Morning view ── */
+    #morning-scroll {
+      flex: 1; min-height: 0; overflow-y: auto;
+      padding: 14px 14px 0;
+    }
+    #morning-scroll > * + * { margin-top: 10px; }
+
+    /* loading / error states */
+    .morning-state {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; height: 100%; gap: 14px; color: #52525b;
+      font-size: 13px; padding-bottom: 60px;
+    }
+    .spinner {
+      width: 22px; height: 22px; border: 2.5px solid #3f3f46;
+      border-top-color: #6366f1; border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    /* ── Morning cards ── */
+    .m-date { font-size: 10px; font-weight: 700; color: #52525b; letter-spacing: 0.12em; text-transform: uppercase; }
+    .m-greeting { font-size: 20px; font-weight: 700; color: #f4f4f5; margin-top: 4px; line-height: 1.2; }
+
+    .card {
+      background: #111113; border: 1px solid #27272a; border-radius: 14px;
+      padding: 14px; overflow: hidden;
+    }
+
+    /* health */
+    .health-row { display: flex; align-items: flex-start; gap: 14px; }
+    .recovery-ring { flex-shrink: 0; }
+    .health-stats { flex: 1; min-width: 0; }
+    .metrics-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;
+    }
+    .metric {
+      background: #1a1a1d; border-radius: 8px; padding: 7px 9px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .metric-label { font-size: 9px; color: #52525b; text-transform: uppercase; letter-spacing: 0.06em; }
+    .metric-val { font-size: 12px; font-weight: 700; color: #e4e4e7; font-variant-numeric: tabular-nums; }
+    .health-read { font-size: 11px; color: #a1a1aa; line-height: 1.55; }
+
+    /* insight */
+    .insight-hdr {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .insight-hdr-left { display: flex; align-items: center; gap: 7px; }
+    .insight-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #6366f1; flex-shrink: 0;
+    }
+    .insight-dot.loading { background: #3f3f46; }
+    .insight-lbl { font-size: 10px; font-weight: 700; color: #52525b; text-transform: uppercase; letter-spacing: 0.08em; }
+    .insight-text { font-size: 13px; color: #e4e4e7; line-height: 1.6; }
+    .shimmer-line {
+      height: 14px; border-radius: 6px; margin-bottom: 7px;
+      background: linear-gradient(90deg, #1c1c1f 25%, #27272a 50%, #1c1c1f 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s linear infinite;
+    }
+    .shimmer-line.short { width: 70%; margin-bottom: 0; }
+    .insight-bar {
+      position: absolute; inset-x: 0; top: 0; height: 2px;
+      background: linear-gradient(90deg, transparent 0%, #6366f1 50%, transparent 100%);
+      background-size: 200% 100%;
+      animation: shimmer 1.6s linear infinite;
+    }
+    .insight-card { position: relative; }
+
+    /* day + commitments */
+    .day-line { font-size: 13px; color: #d4d4d8; line-height: 1.55; }
+    .commitments { list-style: none; margin-top: 8px; display: flex; flex-direction: column; gap: 5px; }
+    .commitments li {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: #a1a1aa;
+    }
+    .commitments li::before {
+      content: ''; width: 5px; height: 5px; border-radius: 50%;
+      background: #52525b; flex-shrink: 0;
+    }
+
+    /* tasks */
+    .section-lbl {
+      font-size: 10px; font-weight: 700; color: #52525b;
+      text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;
+    }
+    .task-row {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 7px 0; border-bottom: 1px solid #1c1c1f;
+    }
+    .task-row:last-child { border-bottom: none; }
+    .task-dot {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid #52525b; flex-shrink: 0; margin-top: 1px;
+    }
+    .task-info { display: flex; flex-direction: column; gap: 2px; }
+    .task-text { font-size: 13px; color: #e4e4e7; line-height: 1.4; }
+    .task-detail { font-size: 11px; color: #71717a; }
+
+    /* win / agent note */
+    .win-card { border-color: #3f3a1a; background: #16140a; }
+    .win-label { font-size: 10px; font-weight: 700; color: #78716c; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; }
+    .win-text { font-size: 13px; color: #d4c38a; line-height: 1.5; }
+    .agent-note-card { border-color: #1e2a1e; background: #0d130d; }
+    .agent-note-text { font-size: 12px; color: #86a886; line-height: 1.55; }
+
+    /* lists */
+    .list-card .list-items { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+    .list-item { font-size: 12px; color: #a1a1aa; line-height: 1.5; padding: 3px 0; }
+
+    /* bottom spacer inside scroll */
+    .scroll-pad { height: 14px; flex-shrink: 0; }
+
+    /* ── Morning chat panel ── */
+    #chat-panel {
+      flex-shrink: 0; border-top: 1px solid #27272a;
+      background: #0d0d0f;
       padding-bottom: env(safe-area-inset-bottom);
     }
-    #hdr {
+    #chat-toggle-btn {
       display: flex; align-items: center; justify-content: space-between;
-      padding: calc(env(safe-area-inset-top) + 12px) 16px 12px;
-      border-bottom: 1px solid #27272a; background: #0d0d0f; position: sticky; top: 0; z-index: 10;
+      width: 100%; padding: 11px 16px; border: none; background: transparent;
+      cursor: pointer; -webkit-tap-highlight-color: transparent;
     }
-    #hdr h1 { font-size: 15px; font-weight: 700; color: #f4f4f5; }
-    #status { font-size: 11px; color: #52525b; }
+    .chat-title { font-size: 12px; font-weight: 600; color: #71717a; }
+    .chat-chevron { font-size: 10px; color: #52525b; transition: transform 0.2s; }
+    .chat-chevron.open { transform: rotate(180deg); }
+    #chat-body { display: none; }
+    #chat-body.open { display: flex; flex-direction: column; }
+    #chat-messages {
+      max-height: 180px; overflow-y: auto;
+      padding: 8px 14px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .chat-empty { font-size: 12px; color: #3f3f46; text-align: center; padding: 16px 0; }
+    .msg-row { display: flex; }
+    .msg-row.user { justify-content: flex-end; }
+    .msg-row.agent, .msg-row.error { justify-content: flex-start; }
+    .bubble {
+      max-width: 82%; border-radius: 16px; padding: 8px 12px;
+      font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+      animation: msgIn 0.2s ease-out both;
+    }
+    .bubble.user { background: #4338ca; color: #fff; border-bottom-right-radius: 4px; }
+    .bubble.agent { background: #1c1c1f; color: #e4e4e7; border-bottom-left-radius: 4px; }
+    .bubble.error { background: #1a0a0a; color: #fca5a5; border-bottom-left-radius: 4px; font-size: 12px; }
+    .typing {
+      background: #1c1c1f; border-radius: 16px; border-bottom-left-radius: 4px;
+      padding: 10px 14px; display: flex; align-items: center; gap: 4px;
+    }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #52525b; }
+    .dot:nth-child(1) { animation: dotB 1.2s ease-in-out infinite 0ms; }
+    .dot:nth-child(2) { animation: dotB 1.2s ease-in-out infinite 160ms; }
+    .dot:nth-child(3) { animation: dotB 1.2s ease-in-out infinite 320ms; }
+    #chat-input-row {
+      display: flex; gap: 8px; padding: 8px 14px 10px;
+      border-top: 1px solid #1c1c1f;
+    }
+    #chat-input {
+      flex: 1; background: #1a1a1d; border: 1px solid #3f3f46; border-radius: 10px;
+      color: #e4e4e7; font-size: 13px; padding: 9px 12px; outline: none;
+      font-family: inherit;
+    }
+    #chat-input:focus { border-color: #6366f1; }
+    #chat-input::placeholder { color: #52525b; }
+    #chat-input:disabled { opacity: 0.5; }
+    #chat-send-btn {
+      width: 36px; height: 36px; border: none; border-radius: 10px;
+      background: #4338ca; color: #fff; font-size: 16px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; flex-shrink: 0; -webkit-tap-highlight-color: transparent;
+    }
+    #chat-send-btn:disabled { background: #1c1c1f; color: #3f3f46; cursor: default; }
+
+    /* ── Agents view ── */
+    #view-agents { overflow-y: auto; padding-bottom: env(safe-area-inset-bottom); }
+
     #list { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-    .card {
+    .run-card {
       background: #111113; border: 1px solid #27272a; border-radius: 14px;
       padding: 14px; cursor: pointer; -webkit-tap-highlight-color: transparent;
       transition: background 0.1s;
     }
-    .card:active { background: #1c1c1e; }
+    .run-card:active { background: #1c1c1e; }
     .goal { font-size: 14px; font-weight: 600; color: #f4f4f5; line-height: 1.35; margin-bottom: 8px; }
     .summary { font-size: 12px; color: #a1a1aa; line-height: 1.55; margin-bottom: 8px; }
     .reviewer {
@@ -143,7 +372,6 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     .btn-toss { background: #27272a; color: #a1a1aa; }
     .btn-toss:active { background: #3f3f46; }
 
-    /* Author section */
     #author-section { padding: 12px; border-top: 1px solid #27272a; }
     #author-hdr { font-size: 11px; font-weight: 700; color: #52525b; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
     .author-form { display: flex; flex-direction: column; gap: 8px; }
@@ -186,9 +414,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     .plan-goal { font-size: 13px; font-weight: 600; color: #f4f4f5; margin-bottom: 4px; }
     .plan-meta { font-size: 11px; color: #71717a; margin-bottom: 8px; }
     .btn-arm {
-      background: #1e3a5f; color: #7dd3fc;
-      border: none; border-radius: 9px; padding: 8px 0;
-      font-size: 13px; font-weight: 600; cursor: pointer;
+      background: #1e3a5f; color: #7dd3fc; border: none; border-radius: 9px;
+      padding: 8px 0; font-size: 13px; font-weight: 600; cursor: pointer;
       width: 100%; -webkit-tap-highlight-color: transparent;
     }
     .btn-arm:active { background: #164e63; }
@@ -202,46 +429,95 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     #ov-hdr {
       display: flex; align-items: center; gap: 10px;
       padding: calc(env(safe-area-inset-top) + 12px) 16px 12px;
-      border-bottom: 1px solid #27272a; background: #0d0d0f; shrink: 0;
+      border-bottom: 1px solid #27272a; background: #0d0d0f;
     }
     #ov-title { flex: 1; font-size: 13px; font-weight: 600; color: #e4e4e7; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     #ov-close {
       background: #27272a; border: none; color: #a1a1aa;
-      padding: 6px 16px; border-radius: 8px; font-size: 13px; cursor: pointer;
-      flex-shrink: 0;
+      padding: 6px 16px; border-radius: 8px; font-size: 13px; cursor: pointer; flex-shrink: 0;
     }
     #ov-body { flex: 1; overflow: auto; padding: 12px 14px; }
-    #ov-pre {
-      font-family: "Menlo", "SF Mono", monospace; font-size: 11px;
-      color: #a1a1aa; white-space: pre; line-height: 1.5;
+    #ov-pre { font-family: "Menlo", "SF Mono", monospace; font-size: 11px; color: #a1a1aa; white-space: pre; line-height: 1.5; }
+
+    /* ── Keyframes ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    @keyframes msgIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes dotB { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-4px); } }
+    @keyframes insightIn { from { opacity: 0; } to { opacity: 1; } }
+    .insight-in { animation: insightIn 0.3s ease-out both; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .spinner { animation: none; border-top-color: #6366f1; }
+      .shimmer-line { animation: none; background: #1c1c1f; }
+      .insight-bar { animation: none; background: #6366f1; opacity: 0.4; }
+      .dot { animation: none; }
+      .bubble { animation: none; }
     }
   </style>
 </head>
 <body>
-  <div id="hdr">
-    <h1>Antfarm Agents</h1>
-    <span id="status">connecting…</span>
-  </div>
-  <div id="list"></div>
 
-  <div id="author-section">
-    <div id="author-hdr">Author a plan</div>
-    <div class="author-form">
-      <textarea id="author-desc" placeholder="Describe what you want the agent to build…" rows="3"></textarea>
-      <select id="author-project">
-        <option value="">— pick project —</option>
-      </select>
-      <input type="text" id="author-path" placeholder="or paste a repo path">
-      <button class="btn-generate" id="btn-generate" onclick="generatePlan()" disabled>Generate plan</button>
+  <!-- sticky nav -->
+  <div id="top-nav">
+    <button class="tab active" id="tab-morning" onclick="switchView('morning')">Morning</button>
+    <button class="tab"        id="tab-agents"  onclick="switchView('agents')">Agents</button>
+    <span id="nav-status"></span>
+  </div>
+
+  <!-- ── Morning view ────────────────────────────────────────────────── -->
+  <div id="view-morning" class="view active">
+    <div id="morning-scroll">
+      <div id="morning-state" class="morning-state">
+        <div class="spinner"></div>
+        <span>Pulling your day...</span>
+      </div>
+      <div id="morning-content" style="display:none"></div>
     </div>
-    <div id="author-result-area"></div>
+
+    <!-- docked chat -->
+    <div id="chat-panel">
+      <button id="chat-toggle-btn" onclick="toggleChat()">
+        <span class="chat-title">Morning agent</span>
+        <span class="chat-chevron" id="chat-chevron">▲</span>
+      </button>
+      <div id="chat-body">
+        <div id="chat-messages">
+          <div class="chat-empty" id="chat-empty">Ask Jarvis a follow-up...</div>
+        </div>
+        <div id="chat-input-row">
+          <input id="chat-input" type="text" placeholder="Ask Jarvis..."
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}">
+          <button id="chat-send-btn" onclick="sendChat()" disabled>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 
-  <div id="plans-section">
-    <div id="plans-hdr">Start a run</div>
-    <div id="plans-list"><div class="empty" style="padding:20px 0;font-size:12px;">Loading plans…</div></div>
+  <!-- ── Agents view ─────────────────────────────────────────────────── -->
+  <div id="view-agents" class="view">
+    <div id="list"></div>
+
+    <div id="author-section">
+      <div id="author-hdr">Author a plan</div>
+      <div class="author-form">
+        <textarea id="author-desc" placeholder="Describe what you want the agent to build…" rows="3"></textarea>
+        <select id="author-project"><option value="">— pick project —</option></select>
+        <input type="text" id="author-path" placeholder="or paste a repo path">
+        <button class="btn-generate" id="btn-generate" onclick="generatePlan()" disabled>Generate plan</button>
+      </div>
+      <div id="author-result-area"></div>
+    </div>
+
+    <div id="plans-section">
+      <div id="plans-hdr">Start a run</div>
+      <div id="plans-list"><div class="empty" style="padding:20px 0;font-size:12px;">Loading plans…</div></div>
+    </div>
   </div>
 
+  <!-- diff overlay (shared) -->
   <div id="overlay">
     <div id="ov-hdr">
       <span id="ov-title"></span>
@@ -251,13 +527,317 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
   </div>
 
   <script>
-    // ── Token handling ─────────────────────────────────────────────────────
+    // ── Token ─────────────────────────────────────────────────────────────────
     const params = new URLSearchParams(location.search);
     const urlToken = params.get('token');
     if (urlToken) localStorage.setItem('af-token', urlToken);
     const TOKEN = localStorage.getItem('af-token') || '';
 
-    // ── Status chip colours (mirrors the desktop AgentsView) ──────────────
+    function authHeaders() {
+      return { 'Authorization': 'Bearer ' + TOKEN };
+    }
+
+    // ── View switching ────────────────────────────────────────────────────────
+    let CURRENT_VIEW = 'morning';
+
+    function switchView(v) {
+      CURRENT_VIEW = v;
+      document.getElementById('view-morning').classList.toggle('active', v === 'morning');
+      document.getElementById('view-agents').classList.toggle('active', v === 'agents');
+      document.getElementById('tab-morning').classList.toggle('active', v === 'morning');
+      document.getElementById('tab-agents').classList.toggle('active', v === 'agents');
+      if (v === 'agents' && !AGENTS_LOADED) {
+        fetchRuns(); fetchProjects(); fetchPlans();
+        AGENTS_LOADED = true;
+      }
+    }
+
+    // ── Morning state ─────────────────────────────────────────────────────────
+    let BRIEFING = null;
+    let BRIEFING_JSON = '';
+    const DATE_KEY = new Date().toISOString().slice(0, 10);
+    let CHAT_MSGS = [];
+    let CHAT_THINKING = false;
+    let CHAT_OPEN = false;
+
+    function esc(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function parseBriefing(raw) {
+      const stripped = raw
+        .replace(/^```json\s*/im, '').replace(/^```\s*/im, '').replace(/\s*```$/im, '').trim();
+      const s = stripped.indexOf('{');
+      const e = stripped.lastIndexOf('}');
+      if (s === -1 || e < s) return null;
+      try { return JSON.parse(stripped.slice(s, e + 1)); } catch { return null; }
+    }
+
+    function recoveryColor(pct) {
+      return pct >= 67 ? '#3a9e62' : pct >= 34 ? '#d4a04d' : '#d65b48';
+    }
+
+    function recoveryRingSvg(pct) {
+      const r = 36, circ = 2 * Math.PI * r;
+      const color = recoveryColor(pct);
+      const offset = (circ * (1 - Math.min(100, Math.max(0, pct)) / 100)).toFixed(2);
+      return `<svg class="recovery-ring" width="80" height="80" viewBox="0 0 88 88">
+        <circle cx="44" cy="44" r="${r}" fill="none" stroke="#27272a" stroke-width="7"/>
+        <circle cx="44" cy="44" r="${r}" fill="none" stroke="${color}" stroke-width="7"
+          stroke-dasharray="${circ.toFixed(2)}" stroke-dashoffset="${offset}"
+          stroke-linecap="round" transform="rotate(-90 44 44)"/>
+        <text x="44" y="49" text-anchor="middle" fill="${color}" font-size="20" font-weight="700">${pct}</text>
+      </svg>`;
+    }
+
+    function renderBriefing(b) {
+      const h = b.health || {};
+      const pct = h.recovery || 0;
+
+      let html = '';
+
+      // Date + greeting
+      html += `<p class="m-date">${esc(b.date_label || '')}</p>`;
+      html += `<h2 class="m-greeting">${esc(b.greeting || 'Good morning.')}</h2>`;
+
+      // Health card
+      html += `<div class="card">
+        <div class="health-row">
+          ${recoveryRingSvg(pct)}
+          <div class="health-stats">
+            <div class="metrics-grid">
+              <div class="metric"><span class="metric-label">Sleep</span><span class="metric-val">${h.sleep_hours || 0}h · ${h.sleep_perf || 0}%</span></div>
+              <div class="metric"><span class="metric-label">HRV</span><span class="metric-val">${h.hrv || 0}ms</span></div>
+              <div class="metric"><span class="metric-label">RHR</span><span class="metric-val">${h.rhr || 0}bpm</span></div>
+              <div class="metric"><span class="metric-label">Strain</span><span class="metric-val">${h.strain || 0}</span></div>
+            </div>
+            <p class="health-read">${esc(h.read || '')}</p>
+          </div>
+        </div>
+      </div>`;
+
+      // Insight card (populated by loadInsight())
+      html += `<div class="card insight-card" id="insight-card">
+        <div id="insight-bar-el" class="insight-bar"></div>
+        <div class="insight-hdr">
+          <div class="insight-hdr-left">
+            <span class="insight-dot loading" id="insight-dot"></span>
+            <span class="insight-lbl">Right now</span>
+          </div>
+        </div>
+        <div id="insight-body">
+          <div class="shimmer-line"></div>
+          <div class="shimmer-line short"></div>
+        </div>
+      </div>`;
+
+      // Day line + commitments
+      if (b.day_line) {
+        html += `<div class="card">
+          <p class="day-line">${esc(b.day_line)}</p>`;
+        if (b.commitments && b.commitments.length) {
+          html += `<ul class="commitments">${b.commitments.map(c => `<li>${esc(c)}</li>`).join('')}</ul>`;
+        }
+        if (b.week_ahead) {
+          html += `<p style="font-size:11px;color:#71717a;margin-top:8px;line-height:1.5">${esc(b.week_ahead)}</p>`;
+        }
+        html += `</div>`;
+      }
+
+      // Tasks
+      if (b.tasks && b.tasks.length) {
+        html += `<div class="card">
+          <div class="section-lbl">The Plan</div>`;
+        b.tasks.forEach(t => {
+          html += `<div class="task-row">
+            <span class="task-dot"></span>
+            <div class="task-info">
+              <span class="task-text">${esc(t.text || '')}</span>
+              ${t.detail ? `<span class="task-detail">${esc(t.detail)}</span>` : ''}
+            </div>
+          </div>`;
+        });
+        html += `</div>`;
+      }
+
+      // Personal items (if present)
+      if (b.personal_items && b.personal_items.length) {
+        html += `<div class="card list-card">
+          <div class="section-lbl">Personal</div>
+          <div class="list-items">${b.personal_items.map(i => `<div class="list-item">${esc(i)}</div>`).join('')}</div>
+        </div>`;
+      }
+
+      // Agent moves (if present)
+      if (b.agent_moves && b.agent_moves.length) {
+        html += `<div class="card list-card">
+          <div class="section-lbl">Agent moves</div>
+          <div class="list-items">${b.agent_moves.map(m => `<div class="list-item">${esc(m)}</div>`).join('')}</div>
+        </div>`;
+      }
+
+      // Win line (if present)
+      if (b.win_line) {
+        html += `<div class="card win-card">
+          <div class="win-label">Win</div>
+          <p class="win-text">${esc(b.win_line)}</p>
+        </div>`;
+      }
+
+      // Agent note
+      if (b.agent_note) {
+        html += `<div class="card agent-note-card">
+          <p class="agent-note-text">${esc(b.agent_note)}</p>
+        </div>`;
+      }
+
+      html += `<div class="scroll-pad"></div>`;
+
+      document.getElementById('morning-content').innerHTML = html;
+      document.getElementById('morning-state').style.display = 'none';
+      document.getElementById('morning-content').style.display = 'block';
+    }
+
+    function showMorningError(msg) {
+      const el = document.getElementById('morning-state');
+      el.innerHTML = `
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <p style="color:#ef4444;font-size:13px">Briefing failed</p>
+        <p style="font-size:11px;color:#71717a;max-width:260px;text-align:center;word-break:break-all">${esc(msg)}</p>
+        <button onclick="loadMorning()" style="margin-top:4px;font-size:12px;color:#6366f1;background:none;border:none;cursor:pointer;text-decoration:underline">Try again</button>`;
+      el.style.display = 'flex';
+    }
+
+    // ── Morning data fetching ─────────────────────────────────────────────────
+
+    async function loadMorning() {
+      document.getElementById('morning-state').innerHTML = `<div class="spinner"></div><span>Pulling your day...</span>`;
+      document.getElementById('morning-state').style.display = 'flex';
+      document.getElementById('morning-content').style.display = 'none';
+      // fire-and-forget whoop refresh
+      fetch('/api/refresh-whoop', { method: 'POST', headers: authHeaders() }).catch(() => {});
+      try {
+        const now = encodeURIComponent(new Date().toLocaleString());
+        const r = await fetch('/api/morning?now=' + now, { headers: authHeaders() });
+        const text = await r.text();
+        if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
+        const b = parseBriefing(text);
+        if (!b) throw new Error('Could not parse briefing JSON.\n\n' + text.slice(0, 200));
+        BRIEFING = b;
+        BRIEFING_JSON = JSON.stringify(b);
+        renderBriefing(b);
+        document.getElementById('chat-send-btn').disabled = false;
+        loadInsight();
+      } catch (e) {
+        showMorningError(e.message);
+      }
+    }
+
+    async function loadInsight() {
+      const doneSummary = 'Viewing morning briefing on phone. Time: ' + new Date().toLocaleTimeString() + '.';
+      try {
+        const r = await fetch('/api/morning-insight', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ doneSummary, now: new Date().toLocaleString() }),
+        });
+        const text = await r.text();
+        if (!r.ok) return;
+        const bodyEl = document.getElementById('insight-body');
+        const dotEl  = document.getElementById('insight-dot');
+        const barEl  = document.getElementById('insight-bar-el');
+        if (bodyEl) { bodyEl.innerHTML = `<p class="insight-text insight-in">${esc(text)}</p>`; }
+        if (dotEl) { dotEl.classList.remove('loading'); }
+        if (barEl) { barEl.style.display = 'none'; }
+      } catch { /* keep shimmer */ }
+    }
+
+    // ── Morning chat ──────────────────────────────────────────────────────────
+
+    function toggleChat() {
+      CHAT_OPEN = !CHAT_OPEN;
+      document.getElementById('chat-body').classList.toggle('open', CHAT_OPEN);
+      document.getElementById('chat-chevron').classList.toggle('open', CHAT_OPEN);
+    }
+
+    function renderChat() {
+      const container = document.getElementById('chat-messages');
+      const emptyEl   = document.getElementById('chat-empty');
+      if (CHAT_MSGS.length === 0 && !CHAT_THINKING) {
+        if (emptyEl) emptyEl.style.display = 'block';
+        // remove any bubbles
+        container.querySelectorAll('.msg-row,.typing-row').forEach(el => el.remove());
+        return;
+      }
+      if (emptyEl) emptyEl.style.display = 'none';
+      // rebuild messages
+      const rows = container.querySelectorAll('.msg-row,.typing-row');
+      rows.forEach(el => el.remove());
+      CHAT_MSGS.forEach(m => {
+        const div = document.createElement('div');
+        div.className = 'msg-row ' + m.role;
+        div.innerHTML = `<div class="bubble ${m.role}">${esc(m.text)}</div>`;
+        container.appendChild(div);
+      });
+      if (CHAT_THINKING) {
+        const div = document.createElement('div');
+        div.className = 'msg-row agent typing-row';
+        div.innerHTML = `<div class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
+        container.appendChild(div);
+      }
+      container.scrollTop = container.scrollHeight;
+    }
+
+    async function sendChat() {
+      const input = document.getElementById('chat-input');
+      const text  = (input.value || '').trim();
+      if (!text || CHAT_THINKING || !BRIEFING_JSON) return;
+      input.value = '';
+
+      // open chat panel if closed
+      if (!CHAT_OPEN) toggleChat();
+
+      CHAT_MSGS.push({ role: 'user', text });
+      CHAT_THINKING = true;
+      renderChat();
+
+      try {
+        const r = await fetch('/api/morning-chat', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: text,
+            now: new Date().toLocaleString(),
+            dateKey: DATE_KEY,
+            briefingJson: BRIEFING_JSON,
+          }),
+        });
+        const reply = await r.text();
+        if (!r.ok) throw new Error(reply || 'HTTP ' + r.status);
+        CHAT_MSGS.push({ role: 'agent', text: reply });
+      } catch (e) {
+        CHAT_MSGS.push({ role: 'error', text: e.message });
+      }
+
+      CHAT_THINKING = false;
+      renderChat();
+      setTimeout(() => input.focus(), 50);
+    }
+
+    // ── Morning status (top-right) ────────────────────────────────────────────
+
+    function setNavStatus(text) {
+      document.getElementById('nav-status').textContent = text;
+    }
+
+    // ── Agents view (existing logic) ──────────────────────────────────────────
+
+    let AGENTS_LOADED = false;
+    let ENTRIES = [];
+
     const CHIP = {
       running:     { bg: '#3730a3', fg: '#a5b4fc' },
       done:        { bg: '#14532d', fg: '#86efac' },
@@ -281,17 +861,6 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       return (usd > 0.0001) ? '$' + usd.toFixed(4) : '—';
     }
 
-    function esc(s) {
-      if (s == null) return '';
-      return String(s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
-
-    // ── Global entry list (indexed by cards' onclick) ─────────────────────
-    let ENTRIES = [];
-
-    // ── Render ────────────────────────────────────────────────────────────
     function render(plans) {
       const list = document.getElementById('list');
       ENTRIES = [];
@@ -312,15 +881,14 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       list.innerHTML = ENTRIES.map(({ run }, i) => {
         const label = run.status.replace(/_/g, ' ');
         const reviewBlock = run.reviewNotes
-          ? `<div class="reviewer"><b>Reviewer:</b> ${esc(run.reviewNotes)}</div>`
-          : '';
+          ? `<div class="reviewer"><b>Reviewer:</b> ${esc(run.reviewNotes)}</div>` : '';
         const actionable = run.worktree && !DONE.has(run.status);
         const actionsBlock = actionable ? `
           <div class="actions">
             <button class="btn btn-merge" onclick="event.stopPropagation();mergeRun(${i})">Merge</button>
-            <button class="btn btn-toss" onclick="event.stopPropagation();tossRun(${i})">Toss</button>
+            <button class="btn btn-toss"  onclick="event.stopPropagation();tossRun(${i})">Toss</button>
           </div>` : '';
-        return `<div class="card" onclick="showDiff(${i})">
+        return `<div class="run-card" onclick="showDiff(${i})">
           <div class="goal">${esc(run.goal || 'Untitled run')}</div>
           ${run.summary ? `<div class="summary">${esc(run.summary)}</div>` : ''}
           ${reviewBlock}
@@ -334,36 +902,24 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       }).join('');
     }
 
-    // ── Poll ──────────────────────────────────────────────────────────────
     async function fetchRuns() {
       try {
-        const r = await fetch('/api/runs', {
-          headers: { 'Authorization': 'Bearer ' + TOKEN }
-        });
-        if (!r.ok) {
-          document.getElementById('status').textContent = 'auth error ' + r.status;
-          return;
-        }
+        const r = await fetch('/api/runs', { headers: authHeaders() });
+        if (!r.ok) { setNavStatus('auth err'); return; }
         render(await r.json());
-        document.getElementById('status').textContent =
-          'updated ' + new Date().toLocaleTimeString();
-      } catch (e) {
-        document.getElementById('status').textContent = 'error';
-      }
+        if (CURRENT_VIEW === 'agents') setNavStatus(new Date().toLocaleTimeString());
+      } catch { setNavStatus('error'); }
     }
 
-    // ── Diff overlay ──────────────────────────────────────────────────────
     async function showDiff(i) {
       const { planId, run } = ENTRIES[i];
       document.getElementById('ov-title').textContent = run.goal || run.runId;
       document.getElementById('ov-pre').textContent = 'Loading…';
       document.getElementById('overlay').classList.add('open');
       try {
-        const url = '/api/diff?plan=' + encodeURIComponent(planId)
-                  + '&run=' + encodeURIComponent(run.runId);
-        const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + TOKEN } });
-        const text = await r.text();
-        document.getElementById('ov-pre').textContent = text || 'No diff available.';
+        const url = '/api/diff?plan=' + encodeURIComponent(planId) + '&run=' + encodeURIComponent(run.runId);
+        const r = await fetch(url, { headers: authHeaders() });
+        document.getElementById('ov-pre').textContent = (await r.text()) || 'No diff available.';
       } catch (e) {
         document.getElementById('ov-pre').textContent = 'Error: ' + e.message;
       }
@@ -373,60 +929,41 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       document.getElementById('overlay').classList.remove('open');
     }
 
-    // ── Actions ───────────────────────────────────────────────────────────
     async function mergeRun(i) {
       const { planId, run } = ENTRIES[i];
       if (!window.confirm('Merge this run to main?')) return;
-      const url = '/api/merge?plan=' + encodeURIComponent(planId)
-                + '&run=' + encodeURIComponent(run.runId);
+      const url = '/api/merge?plan=' + encodeURIComponent(planId) + '&run=' + encodeURIComponent(run.runId);
       try {
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + TOKEN }
-        });
+        const r = await fetch(url, { method: 'POST', headers: authHeaders() });
         const text = await r.text();
         if (!r.ok) { alert(text); return; }
         fetchRuns();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
+      } catch (e) { alert('Error: ' + e.message); }
     }
 
     async function tossRun(i) {
       const { planId, run } = ENTRIES[i];
-      if (!window.confirm('Toss this run? This deletes its worktree and branch.')) return;
-      const url = '/api/toss?plan=' + encodeURIComponent(planId)
-                + '&run=' + encodeURIComponent(run.runId);
+      if (!window.confirm('Toss this run?')) return;
+      const url = '/api/toss?plan=' + encodeURIComponent(planId) + '&run=' + encodeURIComponent(run.runId);
       try {
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + TOKEN }
-        });
+        const r = await fetch(url, { method: 'POST', headers: authHeaders() });
         const text = await r.text();
         if (!r.ok) { alert(text); return; }
         fetchRuns();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
+      } catch (e) { alert('Error: ' + e.message); }
     }
 
-    fetchRuns();
-    setInterval(fetchRuns, 5000);
-
-    // ── Author a plan ──────────────────────────────────────────────────────
     async function fetchProjects() {
       try {
-        const r = await fetch('/api/projects', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+        const r = await fetch('/api/projects', { headers: authHeaders() });
         if (!r.ok) return;
         const projs = await r.json();
         const sel = document.getElementById('author-project');
         projs.forEach(p => {
           const opt = document.createElement('option');
-          opt.value = p.path;
-          opt.textContent = p.name;
-          sel.appendChild(opt);
+          opt.value = p.path; opt.textContent = p.name; sel.appendChild(opt);
         });
-      } catch (e) { /* ignore */ }
+      } catch { /* ignore */ }
     }
 
     function updateGenerateBtn() {
@@ -446,16 +983,13 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       const manualPath = document.getElementById('author-path').value.trim();
       const projectPath = proj || manualPath;
       if (!desc || !projectPath) return;
-
       const btn = document.getElementById('btn-generate');
-      btn.disabled = true;
-      btn.textContent = 'Generating… (~30s)';
+      btn.disabled = true; btn.textContent = 'Generating… (~30s)';
       document.getElementById('author-result-area').innerHTML = '';
-
       try {
         const r = await fetch('/api/author', {
           method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({ description: desc, projectPath }),
         });
         const text = await r.text();
@@ -469,30 +1003,24 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         document.getElementById('author-result-area').innerHTML =
           `<div class="author-result"><div class="author-errors"><div>${esc(e.message)}</div></div></div>`;
       } finally {
-        btn.textContent = 'Generate plan';
-        updateGenerateBtn();
+        btn.textContent = 'Generate plan'; updateGenerateBtn();
       }
     }
 
     function renderAuthorResult(result) {
-      const v = result.validation;
-      const s = v.summary;
+      const v = result.validation, s = v.summary;
       let html = '<div class="author-result">';
       html += `<div style="font-size:11px;font-weight:600;color:#a1a1aa;margin-bottom:8px">${esc(s.planId)} · ${s.runCount} run${s.runCount !== 1 ? 's' : ''} · $${s.perNightUsd ? s.perNightUsd.toFixed(2) : '?'} night cap</div>`;
-      if (v.errors && v.errors.length) {
-        html += `<div class="author-errors">${v.errors.map(e => `<div>${esc(e)}</div>`).join('')}</div>`;
-      }
-      if (v.warnings && v.warnings.length) {
-        html += `<div class="author-warnings">${v.warnings.map(w => `<div>${esc(w)}</div>`).join('')}</div>`;
-      }
+      if (v.errors && v.errors.length) html += `<div class="author-errors">${v.errors.map(e => `<div>${esc(e)}</div>`).join('')}</div>`;
+      if (v.warnings && v.warnings.length) html += `<div class="author-warnings">${v.warnings.map(w => `<div>${esc(w)}</div>`).join('')}</div>`;
       if (s.runs && s.runs.length) {
         s.runs.forEach(run => {
           html += `<div class="author-run"><div class="author-run-goal">${esc(run.goal)}</div><div class="author-run-meta">${esc(run.projectPath)}${run.pathExists ? (run.isGit ? ' · git' : ' · no git') : ' · ⚠ missing'}</div></div>`;
         });
       }
       if (v.ok) {
-        const escapedPath = result.planPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        html += `<button class="btn-arm" style="margin-top:10px" onclick="armAuthoredPlan('${escapedPath}')">Arm &amp; start</button>`;
+        const ep = result.planPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        html += `<button class="btn-arm" style="margin-top:10px" onclick="armAuthoredPlan('${ep}')">Arm &amp; start</button>`;
       }
       html += '</div>';
       document.getElementById('author-result-area').innerHTML = html;
@@ -503,7 +1031,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       try {
         const r = await fetch('/api/arm', {
           method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: planPath }),
         });
         const text = await r.text();
@@ -513,22 +1041,16 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         document.getElementById('author-project').selectedIndex = 0;
         document.getElementById('author-path').value = '';
         updateGenerateBtn();
-        alert('Armed! Plan started.');
-        fetchRuns();
-        fetchPlans();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
+        alert('Armed! Plan started.'); fetchRuns(); fetchPlans();
+      } catch (e) { alert('Error: ' + e.message); }
     }
-
-    fetchProjects();
 
     async function fetchPlans() {
       try {
-        const r = await fetch('/api/plans', { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+        const r = await fetch('/api/plans', { headers: authHeaders() });
         if (!r.ok) return;
         renderPlans(await r.json());
-      } catch (e) { /* ignore */ }
+      } catch { /* ignore */ }
     }
 
     function renderPlans(plans) {
@@ -554,18 +1076,22 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       try {
         const r = await fetch('/api/arm', {
           method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: p.path }),
         });
         const text = await r.text();
         if (!r.ok) { alert('Error: ' + text); return; }
-        alert('Armed! Plan started.');
-        fetchRuns();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
+        alert('Armed! Plan started.'); fetchRuns();
+      } catch (e) { alert('Error: ' + e.message); }
     }
-    fetchPlans();
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    loadMorning();
+    // agents view polls lazily (only starts when switched to)
+    // but keep background poll running for badge-style awareness
+    setInterval(() => {
+      if (AGENTS_LOADED) fetchRuns();
+    }, 10000);
   </script>
 </body>
 </html>
@@ -593,80 +1119,59 @@ pub fn start(app: tauri::AppHandle) {
                     respond(request, 200, "text/html; charset=utf-8", MOBILE_HTML.to_string());
                 }
                 "/api/runs" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     match crate::harness::list_plan_states() {
                         Ok(plans) => {
-                            let json = serde_json::to_string(&plans)
-                                .unwrap_or_else(|e| format!(r#"{{"error":"{e}"}}"#));
+                            let json = serde_json::to_string(&plans).unwrap_or_else(|e| format!(r#"{{"error":"{e}"}}"#));
                             respond(request, 200, "application/json", json);
                         }
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }
                 "/api/diff" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     let plan = query_param(&url, "plan").unwrap_or_default();
-                    let run = query_param(&url, "run").unwrap_or_default();
+                    let run  = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::harness_run_diff(plan, run) {
                         Ok(diff) => respond(request, 200, "text/plain; charset=utf-8", diff),
-                        Err(e) => respond(request, 500, "text/plain", e),
+                        Err(e)   => respond(request, 500, "text/plain", e),
                     }
                 }
                 "/api/summary" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     let plan = query_param(&url, "plan").unwrap_or_default();
-                    let run = query_param(&url, "run").unwrap_or_default();
+                    let run  = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::harness_run_summary(plan, run) {
                         Ok(s) => respond(request, 200, "text/plain; charset=utf-8", s),
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }
                 "/api/merge" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     if *request.method() != tiny_http::Method::Post {
-                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
-                        continue;
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
                     }
                     let plan = query_param(&url, "plan").unwrap_or_default();
-                    let run = query_param(&url, "run").unwrap_or_default();
+                    let run  = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::accept_run(plan, run) {
                         Ok(msg) => respond(request, 200, "text/plain", msg),
-                        Err(e) => respond(request, 409, "text/plain", e),
+                        Err(e)  => respond(request, 409, "text/plain", e),
                     }
                 }
                 "/api/toss" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     if *request.method() != tiny_http::Method::Post {
-                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
-                        continue;
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
                     }
                     let plan = query_param(&url, "plan").unwrap_or_default();
-                    let run = query_param(&url, "run").unwrap_or_default();
+                    let run  = query_param(&url, "run").unwrap_or_default();
                     match crate::harness::reject_run(plan, run) {
-                        Ok(()) => respond(request, 200, "text/plain", "tossed".into()),
-                        Err(e) => respond(request, 500, "text/plain", e),
+                        Ok(())  => respond(request, 200, "text/plain", "tossed".into()),
+                        Err(e)  => respond(request, 500, "text/plain", e),
                     }
                 }
                 "/api/projects" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     let projects = crate::list_projects_pub();
                     let mut result: Vec<serde_json::Value> = Vec::new();
                     for proj in projects {
@@ -683,13 +1188,9 @@ pub fn start(app: tauri::AppHandle) {
                     respond(request, 200, "application/json", json);
                 }
                 "/api/author" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     if *request.method() != tiny_http::Method::Post {
-                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
-                        continue;
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
                     }
                     let mut body = String::new();
                     let _ = request.as_reader().read_to_string(&mut body);
@@ -702,29 +1203,19 @@ pub fn start(app: tauri::AppHandle) {
                         .filter(|s| !s.trim().is_empty());
                     let (desc, proj_path) = match (description, project_path) {
                         (Some(d), Some(p)) => (d, p),
-                        _ => {
-                            respond(request, 400, "text/plain", "missing description or projectPath".into());
-                            continue;
-                        }
+                        _ => { respond(request, 400, "text/plain", "missing description or projectPath".into()); continue; }
                     };
-                    let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
-                    let claude = dispatch.claude_path.lock().unwrap().clone();
-                    drop(dispatch);
+                    let claude = claude_path(&app);
                     match crate::harness::author_plan_core(claude, desc, proj_path) {
-                        Ok(result) => {
-                            match serde_json::to_string(&result) {
-                                Ok(json) => respond(request, 200, "application/json", json),
-                                Err(e) => respond(request, 500, "text/plain", e.to_string()),
-                            }
-                        }
+                        Ok(result) => match serde_json::to_string(&result) {
+                            Ok(json) => respond(request, 200, "application/json", json),
+                            Err(e)   => respond(request, 500, "text/plain", e.to_string()),
+                        },
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }
                 "/api/plans" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     let authored_dir = home().join(".antfarm/plans-authored");
                     let mut result: Vec<serde_json::Value> = Vec::new();
                     if let Ok(entries) = std::fs::read_dir(&authored_dir) {
@@ -732,27 +1223,20 @@ pub fn start(app: tauri::AppHandle) {
                             let path = entry.path();
                             if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
                             let path_str = path.to_string_lossy().into_owned();
-                            let plan_id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                            let plan_id  = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                             match crate::harness::validate_plan_file(path_str.clone()) {
                                 Ok(v) => {
                                     let goal_preview = v.summary.runs.first().map(|r| r.goal.clone()).unwrap_or_default();
                                     result.push(serde_json::json!({
-                                        "planId": plan_id,
-                                        "path": path_str,
-                                        "ok": v.ok,
-                                        "runCount": v.summary.run_count,
-                                        "perNightUsd": v.summary.per_night_usd,
-                                        "goalPreview": goal_preview,
+                                        "planId": plan_id, "path": path_str,
+                                        "ok": v.ok, "runCount": v.summary.run_count,
+                                        "perNightUsd": v.summary.per_night_usd, "goalPreview": goal_preview,
                                     }));
                                 }
                                 Err(_) => {
                                     result.push(serde_json::json!({
-                                        "planId": plan_id,
-                                        "path": path_str,
-                                        "ok": false,
-                                        "runCount": 0,
-                                        "perNightUsd": 0.0,
-                                        "goalPreview": "",
+                                        "planId": plan_id, "path": path_str,
+                                        "ok": false, "runCount": 0, "perNightUsd": 0.0, "goalPreview": "",
                                     }));
                                 }
                             }
@@ -762,15 +1246,10 @@ pub fn start(app: tauri::AppHandle) {
                     respond(request, 200, "application/json", json);
                 }
                 "/api/arm" => {
-                    if !auth {
-                        respond(request, 401, "text/plain", "401 Unauthorized".into());
-                        continue;
-                    }
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
                     if *request.method() != tiny_http::Method::Post {
-                        respond(request, 405, "text/plain", "405 Method Not Allowed".into());
-                        continue;
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
                     }
-                    // Read body
                     let mut body = String::new();
                     let _ = request.as_reader().read_to_string(&mut body);
                     let path = match serde_json::from_str::<serde_json::Value>(&body)
@@ -780,7 +1259,6 @@ pub fn start(app: tauri::AppHandle) {
                         Some(p) => p,
                         None => { respond(request, 400, "text/plain", "missing path".into()); continue; }
                     };
-                    // Validate first
                     match crate::harness::validate_plan_file(path.clone()) {
                         Err(e) => { respond(request, 400, "text/plain", format!("read error: {e}")); continue; }
                         Ok(v) if !v.ok => {
@@ -790,21 +1268,78 @@ pub fn start(app: tauri::AppHandle) {
                         }
                         Ok(_) => {}
                     }
-                    // Arm it
                     let harness: tauri::State<crate::harness::HarnessState> = app.state();
-                    let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
-                    let claude = dispatch.claude_path.lock().unwrap().clone();
-                    let aborts = harness.aborts.clone();
+                    let claude  = claude_path(&app);
+                    let aborts  = harness.aborts.clone();
                     drop(harness);
-                    drop(dispatch);
                     match crate::harness::arm_plan_from_path(app.clone(), claude, aborts, path) {
-                        Ok(plan_id) => {
-                            let json = serde_json::json!({ "planId": plan_id }).to_string();
-                            respond(request, 200, "application/json", json);
-                        }
-                        Err(e) => respond(request, 500, "text/plain", e),
+                        Ok(plan_id) => respond(request, 200, "application/json", serde_json::json!({ "planId": plan_id }).to_string()),
+                        Err(e)      => respond(request, 500, "text/plain", e),
                     }
                 }
+
+                // ── Morning endpoints ────────────────────────────────────────
+
+                "/api/morning" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    let now = url_decode(query_param(&url, "now").unwrap_or_default());
+                    let claude = claude_path(&app);
+                    let brain  = brain_path();
+                    match crate::morning::run_morning(brain, claude, now) {
+                        Ok(text) => respond(request, 200, "text/plain; charset=utf-8", text),
+                        Err(e)   => respond(request, 500, "text/plain", e),
+                    }
+                }
+                "/api/morning-chat" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                    let message      = v.get("message").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let now          = v.get("now").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let date_key     = v.get("dateKey").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let briefing_json = v.get("briefingJson").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    if message.is_empty() {
+                        respond(request, 400, "text/plain", "missing message".into()); continue;
+                    }
+                    let claude = claude_path(&app);
+                    let brain  = brain_path();
+                    match crate::morning::morning_chat_turn(&claude, &brain, &date_key, &briefing_json, &message, &now) {
+                        Ok(reply) => respond(request, 200, "text/plain; charset=utf-8", reply),
+                        Err(e)    => respond(request, 500, "text/plain", e),
+                    }
+                }
+                "/api/morning-insight" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                    let done_summary = v.get("doneSummary").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let now          = v.get("now").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let claude = claude_path(&app);
+                    let brain  = brain_path();
+                    match crate::morning::run_insight(claude, brain, done_summary, now) {
+                        Ok(text) => respond(request, 200, "text/plain; charset=utf-8", text),
+                        Err(e)   => respond(request, 500, "text/plain", e),
+                    }
+                }
+                "/api/refresh-whoop" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    match crate::morning::refresh_whoop_blocking() {
+                        Ok(msg) => respond(request, 200, "text/plain", msg),
+                        Err(e)  => respond(request, 500, "text/plain", e),
+                    }
+                }
+
                 _ => {
                     respond(request, 404, "text/plain", "404 Not Found".into());
                 }

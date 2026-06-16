@@ -59,7 +59,7 @@ pub async fn generate_morning_briefing(
         .map_err(|e| format!("task panicked: {e}"))?
 }
 
-fn run_morning(brain: String, claude: String, now: String) -> Result<String, String> {
+pub(crate) fn run_morning(brain: String, claude: String, now: String) -> Result<String, String> {
     let prompt = format!("Current local date and time: {now}.\n\n{MORNING_PROMPT}");
 
     let mut child = Command::new(&claude)
@@ -159,6 +159,31 @@ pub async fn refresh_whoop() -> Result<String, String> {
     .map_err(|e| format!("task panicked: {e}"))?
 }
 
+// Sync version of refresh_whoop for use from the mobile HTTP server thread.
+pub(crate) fn refresh_whoop_blocking() -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cmd = format!(
+        "node {}/Desktop/CD_claude/tools-built/whoop-report/whoop-fetch.cjs",
+        home
+    );
+    let mut child = Command::new("/bin/zsh")
+        .args(["-lc", &cmd])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn whoop-fetch: {e}"))?;
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        child.wait().ok();
+        tx.send(()).ok();
+    });
+    match rx.recv_timeout(Duration::from_secs(90)) {
+        Ok(()) => Ok("ok".into()),
+        Err(_) => Err("whoop-fetch timed out after 90s".into()),
+    }
+}
+
 // ── Right-now insight ────────────────────────────────────────────────────────
 
 const INSIGHT_PROMPT: &str = r#"You are Connor's live morning coach. Give ONE short, specific recommendation for what to do RIGHT NOW based on his current state. It is SUMMER (no school).
@@ -186,7 +211,7 @@ pub async fn morning_insight(
         .map_err(|e| format!("task panicked: {e}"))?
 }
 
-fn run_insight(claude: String, brain: String, done_summary: String, now: String) -> Result<String, String> {
+pub(crate) fn run_insight(claude: String, brain: String, done_summary: String, now: String) -> Result<String, String> {
     let base = INSIGHT_PROMPT.replace("{done_summary}", &done_summary);
     let prompt = format!("Current local date and time: {now}.\n\n{base}");
     let args = vec![
@@ -276,6 +301,25 @@ fn morning_turn_core(
     };
 
     crate::chat::run_headless(claude, args, brain)
+}
+
+// Full chat turn for the mobile HTTP server: calls morning_turn_core + persists session.
+pub(crate) fn morning_chat_turn(
+    claude: &str,
+    brain: &str,
+    date_key: &str,
+    briefing_json: &str,
+    message: &str,
+    now: &str,
+) -> Result<String, String> {
+    let (reply, new_sid) = morning_turn_core(claude, brain, date_key, briefing_json, message, now)?;
+    if let Some(sid) = new_sid {
+        save_morning_session_id(date_key, &sid);
+    }
+    if reply.is_empty() {
+        return Err("morning chat: empty reply".into());
+    }
+    Ok(reply)
 }
 
 #[tauri::command]
