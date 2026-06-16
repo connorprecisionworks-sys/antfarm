@@ -2307,6 +2307,40 @@ pub async fn tool_launch_dispatch(
     ))
 }
 
+// Fallback: simple Jarvis chat completion for classic voice mode
+#[tauri::command]
+pub async fn jarvis_chat(message: String) -> Result<String, String> {
+    let api_key = openai_api_key().ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
+    let brief = read_brief_context();
+    let body = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": format!(
+                "You are Jarvis, a concise AI chief of staff. Speak conversationally. \
+                 Keep replies to 2-3 sentences unless detail is requested.\n\nContext:\n{brief}"
+            )},
+            {"role": "user", "content": &message}
+        ],
+        "max_tokens": 300
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(&api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("jarvis_chat: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("jarvis_chat API: {}", resp.text().await.unwrap_or_default()));
+    }
+    let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    val["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "jarvis_chat: no content".into())
+}
+
 // ── Desktop Tauri voice commands ─────────────────────────────────────────────
 
 #[tauri::command]

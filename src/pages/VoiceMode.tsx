@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router-dom";
+import { useVoice } from "../lib/useVoice";
 
 // gpt-4o-mini-realtime audio pricing ($/min): in $0.06 + out $0.024 ≈ $0.084
 const COST_PER_MIN = 0.084;
 
 type OrbState = "idle" | "connecting" | "listening" | "thinking" | "speaking";
+type Mode = "realtime" | "fallback";
 
 interface RealtimeTokenResponse {
   token: string;
@@ -29,13 +31,34 @@ export function VoiceMode() {
   const sessionStartRef = useRef<number | null>(null);
   const orbStateRef = useRef<OrbState>("idle");
 
-  const [orbState, setOrbStateReact] = useState<OrbState>("idle");
-  const [status, setStatus]          = useState("ready");
-  const [elapsed, setElapsed]        = useState("");
-  const [cost, setCost]              = useState("");
-  const [captions, setCaptions]      = useState("");
-  const [captionsOn, setCaptionsOn]  = useState(false);
-  const [error, setError]            = useState("");
+  const [mode, setMode]               = useState<Mode>("realtime");
+  const [orbState, setOrbStateReact]  = useState<OrbState>("idle");
+  const [status, setStatus]           = useState("ready");
+  const [elapsed, setElapsed]         = useState("");
+  const [cost, setCost]               = useState("");
+  const [captions, setCaptions]       = useState("");
+  const [captionsOn, setCaptionsOn]   = useState(false);
+  const [error, setError]             = useState("");
+  const [errorKind, setErrorKind]     = useState<"mic" | "network" | "">("");
+  const [planPending, setPlanPending] = useState(false);
+  const [fbHolding, setFbHolding]     = useState(false);
+
+  // Fallback voice hook (batch STT + TTS via Tauri)
+  const voice = useVoice({
+    voice: "ash",
+    onTranscript: async (text) => {
+      setStatus("thinking…");
+      try {
+        const reply = await invoke<string>("jarvis_chat", { message: text });
+        setCaptions(reply);
+        await voice.speak(reply);
+      } catch (e) {
+        setError("Jarvis: " + String(e));
+      } finally {
+        setStatus("ready");
+      }
+    },
+  });
 
   function setOrbState(s: OrbState) {
     orbStateRef.current = s;
@@ -137,8 +160,10 @@ export function VoiceMode() {
         result = await invoke<string>("tool_get_brief");
       } else if (name === "draft_dispatch") {
         result = await invoke<string>("tool_draft_dispatch", { task: args.task || "" });
+        setPlanPending(true);
       } else if (name === "launch_dispatch") {
         result = await invoke<string>("tool_launch_dispatch");
+        setPlanPending(false);
       }
     } catch (e) { result = "Error: " + String(e); }
     sendRT({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output: result } });
@@ -172,7 +197,7 @@ export function VoiceMode() {
   }
 
   const connect = useCallback(async () => {
-    setError("");
+    setError(""); setErrorKind("");
     setOrbState("connecting");
     startOrb();
 
@@ -182,6 +207,7 @@ export function VoiceMode() {
     } catch (e) {
       setOrbState("idle");
       setError("Token failed: " + String(e));
+      setErrorKind("network");
       stopOrb();
       return;
     }
@@ -189,9 +215,16 @@ export function VoiceMode() {
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch {
+    } catch (e) {
       setOrbState("idle");
-      setError("Mic permission denied");
+      const msg = String(e);
+      if (msg.includes("NotAllowed") || msg.includes("Permission")) {
+        setError("Mic access denied — check System Preferences → Privacy → Microphone.");
+        setErrorKind("mic");
+      } else {
+        setError("Mic unavailable: " + msg);
+        setErrorKind("network");
+      }
       stopOrb();
       return;
     }
@@ -247,6 +280,7 @@ export function VoiceMode() {
       await pc.setRemoteDescription({ type: "answer", sdp: await sdpR.text() });
     } catch (e) {
       setError("WebRTC failed: " + String(e));
+      setErrorKind("network");
       disconnect();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -265,11 +299,31 @@ export function VoiceMode() {
     stopOrb();
   }, [stopOrb]);
 
-  // Auto-connect on mount
+  function switchToFallback() {
+    disconnect();
+    setMode("fallback");
+    setError(""); setErrorKind("");
+    setStatus("ready");
+    startOrb();
+  }
+
+  // Auto-connect realtime on mount
   useEffect(() => {
-    connect();
-    return () => disconnect();
-  }, [connect, disconnect]);
+    if (mode === "realtime") {
+      connect();
+      return () => disconnect();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  // Keep orb breathing during fallback voice state
+  useEffect(() => {
+    if (mode !== "fallback") return;
+    if (voice.state === "recording") setOrbState("listening");
+    else if (voice.state === "transcribing") setOrbState("thinking");
+    else if (voice.state === "speaking") setOrbState("speaking");
+    else setOrbState("idle");
+  }, [mode, voice.state]);
 
   const dotColor =
     orbState === "listening" || orbState === "speaking" ? "bg-emerald-400"
@@ -277,16 +331,36 @@ export function VoiceMode() {
     : orbState === "connecting" ? "bg-amber-400"
     : "bg-zinc-600";
 
+  // ── Fallback press-to-talk handlers ────────────────────────────────────────
+
+  function fbPointerDown() {
+    if (voice.state !== "idle") return;
+    setFbHolding(true);
+    voice.startRecording();
+  }
+
+  function fbPointerUp() {
+    if (!fbHolding) return;
+    setFbHolding(false);
+    voice.stopRecording();
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+
+  const isLive = mode === "realtime" && (orbState === "listening" || orbState === "speaking" || orbState === "thinking");
+
   return (
     <div
-      className="h-full flex flex-col items-center justify-center"
+      className="h-full flex flex-col items-center justify-center relative overflow-hidden"
       style={{ background: "#07080c" }}
     >
       {/* Top chrome */}
-      <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-6 py-4">
+      <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-6 py-4 z-10">
         <div className="flex items-center gap-2">
-          <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor} ${orbState === "listening" || orbState === "speaking" ? "animate-pulse" : ""}`} />
-          <span className="text-xs font-mono text-zinc-500 tracking-wider">{status}</span>
+          <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor} ${isLive ? "animate-pulse" : ""}`} />
+          <span className="text-xs font-mono text-zinc-500 tracking-wider">
+            {mode === "fallback" ? "CLASSIC" : status.toUpperCase()}
+          </span>
         </div>
         <div className="flex items-center gap-3 text-xs font-mono text-zinc-600">
           {elapsed && <span>{elapsed}</span>}
@@ -302,19 +376,75 @@ export function VoiceMode() {
         {orbState === "connecting" ? "CONNECTING..." : orbState === "listening" ? "LISTENING" : orbState === "thinking" ? "THINKING..." : orbState === "speaking" ? "SPEAKING" : ""}
       </p>
 
-      {/* Error */}
+      {/* Plan pending banner */}
+      {planPending && (
+        <div className="mt-3 px-4 py-2 rounded-xl text-xs font-mono text-amber-300 border border-amber-500/30 bg-amber-950/40 tracking-wide">
+          PLAN READY — say "go" to launch
+        </div>
+      )}
+
+      {/* Error block */}
       {error && (
-        <p className="mt-3 text-xs text-red-400 font-mono max-w-xs text-center">{error}</p>
+        <div className="mt-4 flex flex-col items-center gap-2">
+          <p className="text-xs text-red-400 font-mono max-w-xs text-center">{error}</p>
+          <div className="flex items-center gap-2 mt-1">
+            {errorKind === "mic" ? (
+              <button
+                onClick={() => { setError(""); setErrorKind(""); connect(); }}
+                className="text-xs font-mono px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors"
+              >
+                Retry
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={() => { setError(""); setErrorKind(""); connect(); }}
+                  className="text-xs font-mono px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors"
+                >
+                  Retry
+                </button>
+                <button
+                  onClick={switchToFallback}
+                  className="text-xs font-mono px-3 py-1.5 rounded-lg border border-indigo-700/60 text-indigo-400 hover:text-indigo-300 transition-colors"
+                >
+                  Classic Voice
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Bottom controls */}
-      <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center gap-3 pb-8">
+      <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center gap-3 pb-8 z-10">
         {captionsOn && captions && (
           <div className="mx-6 rounded-xl px-4 py-3 text-sm text-zinc-200 leading-relaxed max-w-md text-center"
             style={{ background: "rgba(13,13,15,.85)" }}>
             {captions}
           </div>
         )}
+
+        {/* Fallback press-to-talk */}
+        {mode === "fallback" && (
+          <button
+            onPointerDown={fbPointerDown}
+            onPointerUp={fbPointerUp}
+            onPointerLeave={fbPointerUp}
+            className={`w-16 h-16 rounded-full border-2 flex items-center justify-center transition-all select-none ${
+              fbHolding
+                ? "border-indigo-400 bg-indigo-900/40 scale-110"
+                : "border-zinc-700 bg-zinc-900 hover:border-zinc-500"
+            }`}
+            style={{ touchAction: "none" }}
+          >
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" className={fbHolding ? "text-indigo-300" : "text-zinc-500"}>
+              <path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="22"/>
+            </svg>
+          </button>
+        )}
+
         <div className="flex items-center gap-4">
           <button
             onClick={() => setCaptionsOn((v) => !v)}
@@ -322,8 +452,20 @@ export function VoiceMode() {
           >
             CC
           </button>
+          {mode === "realtime" && !error && (
+            <button
+              onClick={switchToFallback}
+              className="text-xs font-mono px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-700 hover:text-zinc-500 transition-colors"
+            >
+              Classic
+            </button>
+          )}
           <button
-            onClick={() => { disconnect(); navigate(-1); }}
+            onClick={() => {
+              disconnect();
+              voice.stopAll();
+              navigate(-1);
+            }}
             className="px-8 py-2.5 rounded-full text-sm font-medium text-zinc-200 border border-zinc-800 hover:border-zinc-600 transition-colors"
             style={{ background: "#18181b" }}
           >
