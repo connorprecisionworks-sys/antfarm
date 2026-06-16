@@ -5,6 +5,7 @@ mod dispatch;
 mod harness;
 mod mobile;
 mod morning;
+mod planning;
 mod pty;
 
 use chrono::{Datelike, Local, Timelike, Weekday};
@@ -1963,6 +1964,9 @@ fn main() {
             morning::morning_chat_send,
             morning::morning_insight,
             morning::refresh_whoop,
+            planning::plan_chat_send,
+            planning::lock_tomorrow_plan,
+            planning::get_tomorrow_plan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

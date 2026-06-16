@@ -8,12 +8,14 @@ import {
   BarChart2,
   Settings,
   Hexagon,
+  Moon,
   PanelLeft,
   Sunrise,
 } from "lucide-react";
 
 const NAV = [
   { to: "/morning", label: "Morning", icon: Sunrise, end: false },
+  { to: "/tonight", label: "Tonight", icon: Moon,    end: false },
   { to: "/", label: "Home", icon: Home, end: true },
   { to: "/projects", label: "Projects", icon: Layers, end: false },
   { to: "/sessions", label: "Sessions", icon: Activity, end: false },
@@ -23,7 +25,8 @@ const NAV = [
 ];
 
 export function Sidebar() {
-  const [liveCount, setLiveCount] = useState(0);
+  const [liveCount, setLiveCount]     = useState(0);
+  const [showPlanNudge, setShowPlanNudge] = useState(false);
 
   useEffect(() => {
     function refresh() {
@@ -33,6 +36,18 @@ export function Sidebar() {
     }
     refresh();
     const id = setInterval(refresh, 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    function checkPlan() {
+      if (new Date().getHours() < 20) { setShowPlanNudge(false); return; }
+      invoke<{ locked: boolean }>("get_tomorrow_plan")
+        .then((p) => setShowPlanNudge(!p.locked))
+        .catch(() => setShowPlanNudge(false));
+    }
+    checkPlan();
+    const id = setInterval(checkPlan, 60_000);
     return () => clearInterval(id);
   }, []);
 
@@ -66,6 +81,9 @@ export function Sidebar() {
               <span className="text-xs bg-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded-full leading-none tabular-nums">
                 {liveCount}
               </span>
+            )}
+            {label === "Tonight" && showPlanNudge && (
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
             )}
           </NavLink>
         ))}

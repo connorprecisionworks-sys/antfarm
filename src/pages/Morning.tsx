@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronRight, RefreshCw, Send, X } from "lucide-react";
+import { ChevronRight, Moon, RefreshCw, Send, X } from "lucide-react";
 import { Project, RepoPath } from "../types";
 
 // ── Animation styles ──────────────────────────────────────────────────────────
@@ -122,6 +123,7 @@ interface MorningBriefing {
   commitments: string[];
   tasks: MorningTask[];
   agent_note?: string;
+  auto_planned?: boolean;
 }
 
 interface AuthorResult {
@@ -649,6 +651,16 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
 
   return (
     <div className="max-w-2xl mx-auto space-y-4">
+      {/* Auto-planned note */}
+      {briefing.auto_planned && (
+        <div className="rounded-lg border border-amber-900/40 bg-amber-950/20 px-3 py-2 flex items-center gap-2">
+          <Moon size={12} strokeWidth={1.75} className="text-amber-400 shrink-0" />
+          <p className="text-xs text-amber-400">
+            Auto-planned from yesterday. You didn't lock a plan last night.
+          </p>
+        </div>
+      )}
+
       {/* Date + greeting */}
       <div>
         <p className="text-[11px] font-medium text-zinc-500 uppercase tracking-widest">
@@ -937,8 +949,18 @@ export function Morning() {
   const [projects, setProjects]         = useState<Project[]>([]);
   const [briefingJson, setBriefingJson] = useState<string>("");
   const [whoopState, setWhoopState]     = useState<WhoopState>("idle");
+  const [showPlanNudge, setShowPlanNudge] = useState(false);
+  const navigate = useNavigate();
 
   const dateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
+
+  // After 20:00, check if tomorrow's plan is locked; nudge if not
+  useEffect(() => {
+    if (new Date().getHours() < 20) return;
+    invoke<{ locked: boolean }>("get_tomorrow_plan")
+      .then((p) => setShowPlanNudge(!p.locked))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     invoke<Project[]>("list_projects").then(setProjects).catch(() => {});
@@ -1033,6 +1055,18 @@ export function Morning() {
           )}
         </div>
       </div>
+
+      {/* Evening nudge: plan tomorrow before bed */}
+      {showPlanNudge && (
+        <button
+          onClick={() => navigate("/tonight")}
+          className="shrink-0 flex items-center gap-2 px-6 py-2 bg-amber-950/30 border-b border-amber-900/30 text-xs text-amber-400 hover:bg-amber-950/50 transition-colors text-left w-full"
+        >
+          <Moon size={12} strokeWidth={1.75} className="shrink-0" />
+          <span>Plan tomorrow before bed</span>
+          <span className="ml-auto text-amber-600">Tonight →</span>
+        </button>
+      )}
 
       {/* Cards area */}
       <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">

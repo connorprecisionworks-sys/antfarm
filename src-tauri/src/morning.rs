@@ -36,12 +36,14 @@ Output ONLY this JSON object. No prose, no code fences, nothing else:
   "tasks": [
     { "id": "t1", "text": "<e.g. Get the Roastlytics demo ready for Scotty>", "detail": "<time estimate or context, 8 words max>" }
   ],
-  "agent_note": "<one proactive line: a habit reminder, demo prep nudge, or offer to run an agent swarm. Omit this field entirely if nothing useful to say.>"
+  "agent_note": "<one proactive line: a habit reminder, demo prep nudge, or offer to run an agent swarm. Omit this field entirely if nothing useful to say.>",
+  "auto_planned": false
 }
 
 Rules:
 - tasks: 3-5 of today's REAL priorities, written like a founder's sticky note — concrete outcomes in plain English (e.g. 'Get the Roastlytics demo ready for Scotty', 'Prep for the 2pm Jake call'). Translate anything technical in the brain into the human GOAL it serves. NEVER output internal engineering substeps or workflow jargon: no 'build', 'test', 'deploy', 'green', 'git push', 'npm run build', 'merge', 'commit', migration/RPC/commit-hash names, or Claude Code/harness steps. If a brain note is a dev task, name the goal, not the steps. Order by leverage, factoring in recovery.
 - commitments: only hard-scheduled items with times. Use [] if none.
+- active/tomorrow-plan.md may contain a LOCKED plan with header 'Plan for <date> (LOCKED ...)'. If that date matches today's date, use it as the backbone of commitments + tasks (do not re-derive from scratch) and set auto_planned to false. If missing or the date does not match today, auto-generate from active/now.md + recent brain context and set auto_planned to true.
 - If whoop-today.json is missing or fetched_at date is not today: set all health numbers to 0, read = "No Whoop data for today."
 - Output ONLY the JSON. Nothing else."#;
 
