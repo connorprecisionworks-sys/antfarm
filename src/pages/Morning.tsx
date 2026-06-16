@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronRight, Moon, RefreshCw, Send, X } from "lucide-react";
+import { useVoice } from "../lib/useVoice";
 import { Project, RepoPath } from "../types";
 
 // ── Animation styles ──────────────────────────────────────────────────────────
@@ -815,8 +816,11 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput]       = useState("");
   const [thinking, setThinking] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef  = useRef<HTMLInputElement>(null);
+  const scrollRef  = useRef<HTMLDivElement>(null);
+  const inputRef   = useRef<HTMLInputElement>(null);
+  const thinkingRef = useRef(false);
+
+  useEffect(() => { thinkingRef.current = thinking; }, [thinking]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -831,11 +835,10 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
     });
   }
 
-  async function send() {
-    const text = input.trim();
-    if (!text || thinking) return;
-    setInput("");
+  async function sendText(text: string) {
+    if (!text || thinkingRef.current) return;
     setThinking(true);
+    thinkingRef.current = true;
     if (!expanded) { setExpanded(true); lsSet(CHAT_EXPANDED_KEY, "true"); }
     setMessages((prev) => [...prev, { id: newChatId(), role: "user", text }]);
     try {
@@ -846,13 +849,35 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         now: nowString(),
       });
       setMessages((prev) => [...prev, { id: newChatId(), role: "agent", text: reply }]);
+      return reply;
     } catch (e) {
       setMessages((prev) => [...prev, { id: newChatId(), role: "error", text: String(e) }]);
+      return null;
     } finally {
       setThinking(false);
-      setTimeout(() => inputRef.current?.focus(), 50);
+      thinkingRef.current = false;
     }
   }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || thinking) return;
+    setInput("");
+    await sendText(text);
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }
+
+  const onTranscript = useCallback(async (transcript: string) => {
+    setInput("");
+    const reply = await sendText(transcript);
+    if (reply) await speak(reply);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [briefingJson, dateKey, expanded]);
+
+  const { state: voiceState, isSupported: voiceSupported, startRecording, stopRecording, speak } =
+    useVoice({ voice: "ash", onTranscript });
+
+  const isMicActive = voiceState === "recording" || voiceState === "transcribing" || voiceState === "speaking";
 
   const bodyTransition = reducedMotion
     ? "none"
@@ -903,6 +928,43 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         </div>
 
         <div className="flex gap-2 items-center px-4 py-2.5 border-t border-zinc-800/50">
+          {voiceSupported && (
+            <button
+              onMouseDown={startRecording}
+              onMouseUp={stopRecording}
+              onTouchStart={(e) => { e.preventDefault(); startRecording(); }}
+              onTouchEnd={stopRecording}
+              disabled={thinking && !isMicActive}
+              className={`shrink-0 w-8 h-8 flex items-center justify-center rounded-lg transition-colors ${
+                voiceState === "recording"
+                  ? "bg-red-600 hover:bg-red-500"
+                  : voiceState === "speaking"
+                  ? "bg-indigo-700 hover:bg-indigo-600"
+                  : voiceState === "transcribing"
+                  ? "bg-zinc-700 cursor-wait"
+                  : "bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed"
+              }`}
+              aria-label={voiceState === "recording" ? "Recording…" : voiceState === "speaking" ? "Speaking…" : "Voice input"}
+            >
+              {voiceState === "speaking" ? (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-white">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                </svg>
+              ) : voiceState === "transcribing" ? (
+                <svg className="animate-spin w-3.5 h-3.5 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                </svg>
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={voiceState === "recording" ? "text-white" : "text-zinc-300"}>
+                  <rect x="9" y="2" width="6" height="11" rx="3" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </svg>
+              )}
+            </button>
+          )}
           <input
             ref={inputRef}
             type="text"
@@ -910,7 +972,13 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
             disabled={thinking}
-            placeholder={thinking ? "Thinking..." : "Ask Jarvis..."}
+            placeholder={
+              voiceState === "recording" ? "Recording…"
+              : voiceState === "transcribing" ? "Transcribing…"
+              : voiceState === "speaking" ? "Speaking…"
+              : thinking ? "Thinking…"
+              : "Ask Jarvis…"
+            }
             className="flex-1 text-xs bg-transparent border border-zinc-700/50 rounded-lg px-3 py-2 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500/60 disabled:opacity-50 transition-colors"
           />
           <button

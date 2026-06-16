@@ -1964,6 +1964,8 @@ fn main() {
             morning::morning_chat_send,
             morning::morning_insight,
             morning::refresh_whoop,
+            mobile::voice_stt,
+            mobile::voice_tts,
             planning::plan_chat_send,
             planning::lock_tomorrow_plan,
             planning::get_tomorrow_plan,

@@ -1674,6 +1674,27 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
+// ── Desktop Tauri voice commands ─────────────────────────────────────────────
+
+#[tauri::command]
+pub fn voice_stt(audio_base64: String, content_type: String) -> Result<String, String> {
+    use base64::Engine;
+    let audio_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&audio_base64)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let api_key = openai_api_key().ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
+    call_openai_stt(audio_bytes, content_type, &api_key)
+}
+
+#[tauri::command]
+pub fn voice_tts(text: String, voice: Option<String>) -> Result<String, String> {
+    use base64::Engine;
+    let api_key = openai_api_key().ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
+    let v = voice.as_deref().unwrap_or(VOICE_JARVIS);
+    let bytes = call_openai_tts(&text, v, &api_key)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 pub fn start(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let token = load_or_create_token();
