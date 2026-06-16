@@ -1630,21 +1630,59 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     const VOICE_DISPATCH = 'onyx';
     let _lastReplyVoice  = VOICE_JARVIS;
 
-    async function playVoiceTTS(text, voice = VOICE_JARVIS) {
-      setVoiceState('speaking');
-      try {
-        const r = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text, voice }),
-        });
-        if (!r.ok) throw new Error(await r.text());
-        const url = URL.createObjectURL(await r.blob());
+    const TTS_CHUNK_CHARS = 600;
+
+    function splitTtsChunks(text) {
+      if (text.length <= TTS_CHUNK_CHARS) return [text];
+      const chunks = [];
+      // Split on sentence boundaries; keep the delimiter with preceding text
+      const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
+      let current = '';
+      for (const s of sentences) {
+        if ((current + s).length > TTS_CHUNK_CHARS && current) {
+          chunks.push(current.trim());
+          current = s;
+        } else {
+          current += s;
+        }
+      }
+      if (current.trim()) chunks.push(current.trim());
+      return chunks;
+    }
+
+    async function fetchTtsBlob(text, voice) {
+      const r = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice }),
+      });
+      if (!r.ok) throw new Error(await r.text() || 'TTS HTTP ' + r.status);
+      return r.blob();
+    }
+
+    async function playBlob(blob) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
         _currentAudio = new Audio(url);
-        _currentAudio.onended = () => { URL.revokeObjectURL(url); _currentAudio = null; setVoiceState('idle'); };
-        _currentAudio.onerror = () => { URL.revokeObjectURL(url); _currentAudio = null; setVoiceState('idle'); };
-        _currentAudio.play();
-      } catch (_) { setVoiceState('idle'); }
+        _currentAudio.onended  = () => { URL.revokeObjectURL(url); _currentAudio = null; resolve(); };
+        _currentAudio.onerror  = () => { URL.revokeObjectURL(url); _currentAudio = null; reject(new Error('audio error')); };
+        _currentAudio.play().catch(reject);
+      });
+    }
+
+    async function playVoiceTTS(text, voice = VOICE_JARVIS) {
+      if (!text.trim()) return;
+      setVoiceState('speaking');
+      const chunks = splitTtsChunks(text);
+      try {
+        for (const chunk of chunks) {
+          if (_voiceState !== 'speaking') break; // stopped by tap
+          const blob = await fetchTtsBlob(chunk, voice);
+          if (_voiceState !== 'speaking') break;
+          await playBlob(blob);
+        }
+      } catch (_) { /* ignore — user may have tapped to stop */ }
+      if (_voiceState === 'speaking') setVoiceState('idle');
     }
 
     function stopVoicePlayback() {

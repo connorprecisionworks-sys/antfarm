@@ -767,7 +767,7 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
 
 // ── Chat panel ────────────────────────────────────────────────────────────────
 
-function MessageBubble({ msg }: { msg: ChatMsg }) {
+function MessageBubble({ msg, speaking }: { msg: ChatMsg; speaking?: boolean }) {
   const isUser  = msg.role === "user";
   const isError = msg.role === "error";
   return (
@@ -782,6 +782,13 @@ function MessageBubble({ msg }: { msg: ChatMsg }) {
         }`}
       >
         {msg.text}
+        {speaking && (
+          <span className="inline-flex items-center gap-0.5 ml-1.5 align-middle">
+            <span className="dot-b1 w-1 h-1 rounded-full bg-indigo-400 inline-block" />
+            <span className="dot-b2 w-1 h-1 rounded-full bg-indigo-400 inline-block" />
+            <span className="dot-b3 w-1 h-1 rounded-full bg-indigo-400 inline-block" />
+          </span>
+        )}
       </div>
     </div>
   );
@@ -813,9 +820,10 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
     const raw = lsGet(CHAT_EXPANDED_KEY);
     return raw === null ? true : raw === "true";
   });
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
-  const [input, setInput]       = useState("");
-  const [thinking, setThinking] = useState(false);
+  const [messages, setMessages]     = useState<ChatMsg[]>([]);
+  const [input, setInput]           = useState("");
+  const [thinking, setThinking]     = useState(false);
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
   const scrollRef  = useRef<HTMLDivElement>(null);
   const inputRef   = useRef<HTMLInputElement>(null);
   const thinkingRef = useRef(false);
@@ -835,12 +843,13 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
     });
   }
 
-  async function sendText(text: string) {
-    if (!text || thinkingRef.current) return;
+  async function sendText(text: string, agentMsgId?: string): Promise<string | null> {
+    if (!text || thinkingRef.current) return null;
     setThinking(true);
     thinkingRef.current = true;
     if (!expanded) { setExpanded(true); lsSet(CHAT_EXPANDED_KEY, "true"); }
     setMessages((prev) => [...prev, { id: newChatId(), role: "user", text }]);
+    const replyId = agentMsgId ?? newChatId();
     try {
       const reply = await invoke<string>("morning_chat_send", {
         dateKey,
@@ -848,10 +857,10 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         message: text,
         now: nowString(),
       });
-      setMessages((prev) => [...prev, { id: newChatId(), role: "agent", text: reply }]);
+      setMessages((prev) => [...prev, { id: replyId, role: "agent", text: reply }]);
       return reply;
     } catch (e) {
-      setMessages((prev) => [...prev, { id: newChatId(), role: "error", text: String(e) }]);
+      setMessages((prev) => [...prev, { id: replyId, role: "error", text: String(e) }]);
       return null;
     } finally {
       setThinking(false);
@@ -869,12 +878,17 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
 
   const onTranscript = useCallback(async (transcript: string) => {
     setInput("");
-    const reply = await sendText(transcript);
-    if (reply) await speak(reply);
+    const msgId = newChatId();
+    const reply = await sendText(transcript, msgId);
+    if (reply) {
+      setSpeakingId(msgId);
+      await speak(reply);
+      setSpeakingId(null);
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [briefingJson, dateKey, expanded]);
 
-  const { state: voiceState, isSupported: voiceSupported, startRecording, stopRecording, speak } =
+  const { state: voiceState, isSupported: voiceSupported, startRecording, stopRecording, speak, stopAll } =
     useVoice({ voice: "ash", onTranscript });
 
   const isMicActive = voiceState === "recording" || voiceState === "transcribing" || voiceState === "speaking";
@@ -923,17 +937,17 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
               Ask Jarvis a follow-up...
             </p>
           )}
-          {messages.map((msg) => <MessageBubble key={msg.id} msg={msg} />)}
+          {messages.map((msg) => <MessageBubble key={msg.id} msg={msg} speaking={msg.id === speakingId} />)}
           {thinking && <TypingIndicator />}
         </div>
 
         <div className="flex gap-2 items-center px-4 py-2.5 border-t border-zinc-800/50">
           {voiceSupported && (
             <button
-              onMouseDown={startRecording}
-              onMouseUp={stopRecording}
-              onTouchStart={(e) => { e.preventDefault(); startRecording(); }}
-              onTouchEnd={stopRecording}
+              onMouseDown={() => { if (voiceState === "speaking") { stopAll(); setSpeakingId(null); } else startRecording(); }}
+              onMouseUp={() => { if (voiceState === "recording") stopRecording(); }}
+              onTouchStart={(e) => { e.preventDefault(); if (voiceState === "speaking") { stopAll(); setSpeakingId(null); } else startRecording(); }}
+              onTouchEnd={() => { if (voiceState === "recording") stopRecording(); }}
               disabled={thinking && !isMicActive}
               className={`shrink-0 w-8 h-8 flex items-center justify-center rounded-lg transition-colors ${
                 voiceState === "recording"
