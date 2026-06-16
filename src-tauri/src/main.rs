@@ -1873,6 +1873,490 @@ fn list_slash_commands() -> Vec<SlashCommand> {
     cmds
 }
 
+// ── Wrapped stats ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DailyTokenPoint {
+    date: String,
+    tokens: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WrappedStats {
+    period: String,
+    period_start: String,
+    period_end: String,
+    total_tokens: u64,
+    total_cost: f64,
+    input_tokens: u64,
+    output_tokens: u64,
+    lines_added: i64,
+    lines_removed: i64,
+    commits: u32,
+    run_count: u32,
+    run_done: u32,
+    run_failed: u32,
+    run_killed: u32,
+    busiest_day: Option<String>,
+    busiest_day_tokens: u64,
+    current_streak: u32,
+    longest_streak: u32,
+    prev_period_tokens: u64,
+    prev_period_cost: f64,
+    daily_tokens: Vec<DailyTokenPoint>,
+    top_project_slug: Option<String>,
+    top_project_name: Option<String>,
+    top_project_tokens: u64,
+}
+
+fn streak_from_days(all_days: &HashMap<String, DayBucket>) -> u32 {
+    let today = Local::now();
+    let mut streak = 0u32;
+    let mut i = 0i64;
+    loop {
+        let d = (today - chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
+        if all_days.get(&d).map(|b| b.total_tokens() > 0).unwrap_or(false) {
+            streak += 1;
+            i += 1;
+        } else if i == 0 {
+            i = 1; // today has no activity yet — check yesterday
+        } else {
+            break;
+        }
+    }
+    streak
+}
+
+fn longest_run(dates: &std::collections::BTreeSet<String>) -> u32 {
+    if dates.is_empty() {
+        return 0;
+    }
+    let v: Vec<&String> = dates.iter().collect();
+    let mut best = 1u32;
+    let mut cur = 1u32;
+    for i in 1..v.len() {
+        if let (Ok(d1), Ok(d2)) = (
+            chrono::NaiveDate::parse_from_str(v[i - 1], "%Y-%m-%d"),
+            chrono::NaiveDate::parse_from_str(v[i], "%Y-%m-%d"),
+        ) {
+            if (d2 - d1).num_days() == 1 {
+                cur += 1;
+                if cur > best {
+                    best = cur;
+                }
+            } else {
+                cur = 1;
+            }
+        }
+    }
+    best
+}
+
+fn compute_git_metrics_since(repo_path: &Path, since_date: &str) -> GitPeriodMetrics {
+    let out = match std::process::Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().unwrap_or(""),
+            "log",
+            &format!("--since={since_date}"),
+            "--numstat",
+            "--format=COMMIT",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return GitPeriodMetrics::default(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut m = GitPeriodMetrics::default();
+    for line in text.lines() {
+        if line.starts_with("COMMIT") {
+            m.commits += 1;
+        } else if !line.is_empty() {
+            let mut tabs = line.splitn(3, '\t');
+            if let (Some(a), Some(r), Some(_)) = (tabs.next(), tabs.next(), tabs.next()) {
+                m.lines_added += a.parse::<i64>().unwrap_or(0);
+                m.lines_removed += r.parse::<i64>().unwrap_or(0);
+                m.files_changed += 1;
+            }
+        }
+    }
+    m
+}
+
+#[tauri::command]
+fn wrapped_stats(period: String) -> WrappedStats {
+    let registry = load_registry();
+    let settings = get_settings();
+    let today = Local::now();
+    let today_str = today.format("%Y-%m-%d").to_string();
+
+    let today_dow = weekday_to_dow(today.weekday());
+    let reset_dow = settings.reset_weekday.min(6);
+    let days_since_reset = ((today_dow + 7 - reset_dow) % 7) as i64;
+
+    let (period_start, period_end, prev_start, prev_end): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = match period.as_str() {
+        "week" => {
+            let ws = (today - chrono::Duration::days(days_since_reset))
+                .format("%Y-%m-%d")
+                .to_string();
+            let ps = (today - chrono::Duration::days(days_since_reset + 7))
+                .format("%Y-%m-%d")
+                .to_string();
+            let pe = (today - chrono::Duration::days(days_since_reset + 1))
+                .format("%Y-%m-%d")
+                .to_string();
+            (ws, today_str.clone(), Some(ps), Some(pe))
+        }
+        "month" => {
+            let start = (today - chrono::Duration::days(29))
+                .format("%Y-%m-%d")
+                .to_string();
+            let ps = (today - chrono::Duration::days(59))
+                .format("%Y-%m-%d")
+                .to_string();
+            let pe = (today - chrono::Duration::days(30))
+                .format("%Y-%m-%d")
+                .to_string();
+            (start, today_str.clone(), Some(ps), Some(pe))
+        }
+        _ => ("2020-01-01".to_string(), today_str.clone(), None, None),
+    };
+
+    // Load & refresh usage cache (same incremental logic as usage_rollup)
+    let data_dir = app_data_dir();
+    let _ = fs::create_dir_all(&data_dir);
+    let cache_path = data_dir.join("usage_cache.json");
+    let mut cache: UsageCache = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+
+    // slug → date → DayBucket (all time)
+    let mut by_project_all: HashMap<String, HashMap<String, DayBucket>> = HashMap::new();
+
+    let claude_projects = home_dir().join(".claude/projects");
+    if let Ok(rd) = fs::read_dir(&claude_projects) {
+        for entry in rd.flatten() {
+            let proj_dir = entry.path();
+            if !proj_dir.is_dir() {
+                continue;
+            }
+            let dir_name = proj_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let slug = match_dir_to_slug(&dir_name, &registry);
+            if let Ok(files) = fs::read_dir(&proj_dir) {
+                for fentry in files.flatten() {
+                    let fpath = fentry.path();
+                    if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let fpath_str = fpath.to_string_lossy().into_owned();
+                    let Ok(meta) = fs::metadata(&fpath) else {
+                        continue;
+                    };
+                    let fmtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let fsize = meta.len();
+                    let cached = cache.files.get(&fpath_str);
+                    let days_data = if cached
+                        .map(|e| e.mtime == fmtime && e.size == fsize)
+                        .unwrap_or(false)
+                    {
+                        cached.unwrap().days.clone()
+                    } else {
+                        let days = parse_jsonl_file(&fpath);
+                        cache.files.insert(
+                            fpath_str.clone(),
+                            FileCacheEntry {
+                                mtime: fmtime,
+                                size: fsize,
+                                days: days.clone(),
+                            },
+                        );
+                        days
+                    };
+                    let proj_map = by_project_all.entry(slug.clone()).or_default();
+                    for (date, bucket) in &days_data {
+                        proj_map.entry(date.clone()).or_default().add(bucket);
+                    }
+                }
+            }
+        }
+    }
+
+    let cowork_base = home_dir()
+        .join("Library/Application Support/Claude/local-agent-mode-sessions");
+    if let Ok(space_dirs) = fs::read_dir(&cowork_base) {
+        for space_entry in space_dirs.flatten() {
+            let space_dir = space_entry.path();
+            if !space_dir.is_dir() {
+                continue;
+            }
+            if let Ok(ws_dirs) = fs::read_dir(&space_dir) {
+                for ws_entry in ws_dirs.flatten() {
+                    let ws_dir = ws_entry.path();
+                    if !ws_dir.is_dir() {
+                        continue;
+                    }
+                    if let Ok(session_dirs) = fs::read_dir(&ws_dir) {
+                        for sd_entry in session_dirs.flatten() {
+                            let sd = sd_entry.path();
+                            let sd_name =
+                                sd.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            if !sd.is_dir() || !sd_name.starts_with("local_") {
+                                continue;
+                            }
+                            let audit = sd.join("audit.jsonl");
+                            if !audit.is_file() {
+                                continue;
+                            }
+                            let meta_path = ws_dir.join(format!("{}.json", sd_name));
+                            let slug = fs::read_to_string(&meta_path)
+                                .ok()
+                                .and_then(|c| {
+                                    serde_json::from_str::<serde_json::Value>(&c).ok()
+                                })
+                                .and_then(|v| {
+                                    v.get("userSelectedFolders")
+                                        .and_then(|f| f.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|s| s.as_str())
+                                        .and_then(|rp| Path::new(rp).file_name())
+                                        .and_then(|n| n.to_str())
+                                        .and_then(|bn| match_basename_to_slug(bn, &registry))
+                                })
+                                .unwrap_or_else(|| "unfiled".to_string());
+                            let fpath_str = audit.to_string_lossy().into_owned();
+                            let Ok(meta) = fs::metadata(&audit) else {
+                                continue;
+                            };
+                            let fmtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let fsize = meta.len();
+                            let cached = cache.files.get(&fpath_str);
+                            let days_data = if cached
+                                .map(|e| e.mtime == fmtime && e.size == fsize)
+                                .unwrap_or(false)
+                            {
+                                cached.unwrap().days.clone()
+                            } else {
+                                let days = parse_jsonl_file(&audit);
+                                cache.files.insert(
+                                    fpath_str.clone(),
+                                    FileCacheEntry {
+                                        mtime: fmtime,
+                                        size: fsize,
+                                        days: days.clone(),
+                                    },
+                                );
+                                days
+                            };
+                            let proj_map = by_project_all.entry(slug).or_default();
+                            for (date, bucket) in &days_data {
+                                proj_map.entry(date.clone()).or_default().add(bucket);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = fs::write(&cache_path, json);
+    }
+
+    // Aggregate by period
+    let mut all_days_global: HashMap<String, DayBucket> = HashMap::new();
+    let mut by_project_period: HashMap<String, DayBucket> = HashMap::new();
+    let mut period_days: HashMap<String, DayBucket> = HashMap::new();
+    let mut prev_days: HashMap<String, DayBucket> = HashMap::new();
+
+    for (slug, proj_days) in &by_project_all {
+        let mut proj_period = DayBucket::default();
+        for (date, bucket) in proj_days {
+            all_days_global.entry(date.clone()).or_default().add(bucket);
+            let in_period = date.as_str() >= period_start.as_str()
+                && date.as_str() <= period_end.as_str();
+            let in_prev = prev_start
+                .as_deref()
+                .map(|ps| {
+                    date.as_str() >= ps
+                        && prev_end
+                            .as_deref()
+                            .map(|pe| date.as_str() <= pe)
+                            .unwrap_or(true)
+                })
+                .unwrap_or(false);
+            if in_period {
+                period_days.entry(date.clone()).or_default().add(bucket);
+                proj_period.add(bucket);
+            }
+            if in_prev {
+                prev_days.entry(date.clone()).or_default().add(bucket);
+            }
+        }
+        by_project_period.insert(slug.clone(), proj_period);
+    }
+
+    let mut period_total = DayBucket::default();
+    for b in period_days.values() {
+        period_total.add(b);
+    }
+    let mut prev_total = DayBucket::default();
+    for b in prev_days.values() {
+        prev_total.add(b);
+    }
+
+    let (busiest_day, busiest_day_tokens) = period_days
+        .iter()
+        .max_by_key(|(_, b)| b.total_tokens())
+        .map(|(d, b)| (Some(d.clone()), b.total_tokens()))
+        .unwrap_or((None, 0));
+
+    let current_streak = streak_from_days(&all_days_global);
+    let active_in_period: std::collections::BTreeSet<String> = period_days
+        .iter()
+        .filter(|(_, b)| b.total_tokens() > 0)
+        .map(|(d, _)| d.clone())
+        .collect();
+    let longest_streak = longest_run(&active_in_period);
+
+    let (top_project_slug, top_project_name, top_project_tokens) =
+        match by_project_period
+            .iter()
+            .max_by_key(|(_, b)| b.total_tokens())
+        {
+            Some((slug, bucket)) if bucket.total_tokens() > 0 => {
+                let name = if slug == "unfiled" {
+                    "Unfiled".to_string()
+                } else {
+                    slug_to_name(slug, &registry)
+                };
+                (Some(slug.clone()), Some(name), bucket.total_tokens())
+            }
+            _ => (None, None, 0),
+        };
+
+    let daily_tokens: Vec<DailyTokenPoint> = (0..7i64)
+        .rev()
+        .map(|i| {
+            let d = (today - chrono::Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string();
+            let tokens = if d.as_str() >= period_start.as_str() {
+                period_days.get(&d).map(|b| b.total_tokens()).unwrap_or(0)
+            } else {
+                0
+            };
+            DailyTokenPoint { date: d, tokens }
+        })
+        .collect();
+
+    // Git metrics
+    let git_cache_path = data_dir.join("git_metrics_cache.json");
+    let git_cache: GitMetricsCache = fs::read_to_string(&git_cache_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+
+    let (lines_added, lines_removed, commits) = match period.as_str() {
+        "week" => git_cache.repos.values().fold((0i64, 0i64, 0u32), |(a, r, c), e| {
+            (a + e.week.lines_added, r + e.week.lines_removed, c + e.week.commits)
+        }),
+        "month" => {
+            let session_paths = discover_session_repo_paths();
+            let mut m = GitPeriodMetrics::default();
+            for (_, proj) in &registry.projects {
+                for repo in &proj.repos {
+                    if let Some(path) = resolve_repo_path(repo, &session_paths) {
+                        let rm = compute_git_metrics_since(&path, &period_start);
+                        add_git_metrics(&mut m, &rm);
+                    }
+                }
+            }
+            (m.lines_added, m.lines_removed, m.commits)
+        }
+        _ => git_cache.repos.values().fold((0i64, 0i64, 0u32), |(a, r, c), e| {
+            (
+                a + e.all_time.lines_added,
+                r + e.all_time.lines_removed,
+                c + e.all_time.commits,
+            )
+        }),
+    };
+
+    // Dispatch runs
+    let all_runs = dispatch::load_all_runs();
+    let period_runs: Vec<_> = all_runs
+        .iter()
+        .filter(|r| {
+            let d = r.started_at.get(..10).unwrap_or("");
+            d >= period_start.as_str() && d <= period_end.as_str()
+        })
+        .collect();
+    let run_count = period_runs.len() as u32;
+    let run_done = period_runs.iter().filter(|r| r.status == "done").count() as u32;
+    let run_failed = period_runs.iter().filter(|r| r.status == "failed").count() as u32;
+    let run_killed = period_runs.iter().filter(|r| r.status == "killed").count() as u32;
+
+    WrappedStats {
+        period,
+        period_start,
+        period_end,
+        total_tokens: period_total.total_tokens(),
+        total_cost: period_total.est_dollars,
+        input_tokens: period_total.input,
+        output_tokens: period_total.output,
+        lines_added,
+        lines_removed,
+        commits,
+        run_count,
+        run_done,
+        run_failed,
+        run_killed,
+        busiest_day,
+        busiest_day_tokens,
+        current_streak,
+        longest_streak,
+        prev_period_tokens: prev_total.total_tokens(),
+        prev_period_cost: prev_total.est_dollars,
+        daily_tokens,
+        top_project_slug,
+        top_project_name,
+        top_project_tokens,
+    }
+}
+
+#[tauri::command]
+fn save_png_to_desktop(filename: String, data_base64: String) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let dest = home_dir().join("Desktop").join(&filename);
+    fs::write(&dest, bytes).map_err(|e| format!("write: {e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -1975,6 +2459,8 @@ fn main() {
             planning::plan_chat_send,
             planning::lock_tomorrow_plan,
             planning::get_tomorrow_plan,
+            wrapped_stats,
+            save_png_to_desktop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -325,6 +325,25 @@ pub fn open_terminal_resume(cwd: &str, sid: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Load all run records without requiring Tauri State (used by wrapped_stats).
+pub fn load_all_runs() -> Vec<RunRecord> {
+    let mut runs = vec![];
+    if let Ok(entries) = std::fs::read_dir(runs_dir()) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if let Ok(rec) = serde_json::from_str::<RunRecord>(&text) {
+                    runs.push(rec);
+                }
+            }
+        }
+    }
+    runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    runs
+}
+
 #[tauri::command]
 pub fn take_over_run(run_id: String) -> Result<(), String> {
     let rec: RunRecord = std::fs::read_to_string(runs_dir().join(format!("{run_id}.json")))
