@@ -389,6 +389,129 @@ pub(crate) fn morning_chat_turn(
     Ok(reply)
 }
 
+// ── Assistant (dispatch-aware) chat ──────────────────────────────────────────
+//
+// Like morning-chat but with a dispatch-detection layer. When the user asks to
+// BUILD/FIX/CREATE something in a repo, the model returns a __DISPATCH__ prefix
+// so the mobile server can author + arm a plan. Otherwise behaves like morning-chat.
+
+const ASSISTANT_SYSTEM_PROMPT: &str = "You are Jarvis, Connor's sharp chief of staff and morning agent. \
+Warm, decisive, no fluff, no em dashes. \
+You help Connor through his day and can dispatch agent runs to do technical work.\n\n\
+AVAILABLE PROJECTS: {project_slugs}\n\n\
+RULES:\n\
+• If the user is chatting, asking advice, giving updates, or exploring ideas: reply conversationally in 1-3 sentences.\n\
+• If the user is explicitly asking to BUILD, FIX, ADD, CREATE, IMPLEMENT, or DO something \
+technical in a project repo: output EXACTLY this on one line and NOTHING else:\n\
+__DISPATCH__ {{\"task\":\"<specific concrete task>\",\"project_slug\":\"<slug>\"}}\n\
+  Pick the most likely project slug from the list. If unclear, ask in CHAT mode.\n\
+• Do NOT dispatch for planning talk, analysis, or anything that is not code/infra work.\n\n\
+Connor's briefing for today:\n{briefing_json}";
+
+fn assistant_sessions_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let d = PathBuf::from(home).join(".antfarm/assistant-sessions");
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+fn load_assistant_session_id(date_key: &str) -> Option<String> {
+    std::fs::read_to_string(assistant_sessions_dir().join(format!("{date_key}.txt")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_assistant_session_id(date_key: &str, sid: &str) {
+    let _ = std::fs::write(assistant_sessions_dir().join(format!("{date_key}.txt")), sid);
+}
+
+pub(crate) struct DispatchIntent {
+    pub task: String,
+    pub project_slug: String,
+}
+
+pub(crate) enum AssistantReply {
+    Chat(String),
+    Dispatch(DispatchIntent),
+}
+
+fn assistant_turn_core(
+    claude: &str,
+    brain: &str,
+    date_key: &str,
+    briefing_json: &str,
+    message: &str,
+    now: &str,
+    project_slugs: &str,
+) -> Result<(AssistantReply, Option<String>), String> {
+    let session_id = load_assistant_session_id(date_key);
+
+    let args: Vec<String> = if let Some(sid) = &session_id {
+        let msg_with_time = format!("Current local date and time: {now}.\n\n{message}");
+        vec![
+            "--resume".into(), sid.clone(),
+            "-p".into(), msg_with_time,
+            "--model".into(), "claude-haiku-4-5-20251001".into(),
+            "--output-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--permission-mode".into(), "dontAsk".into(),
+        ]
+    } else {
+        let system = ASSISTANT_SYSTEM_PROMPT
+            .replace("{project_slugs}", project_slugs)
+            .replace("{briefing_json}", briefing_json);
+        let prompt = format!("Current local date and time: {now}.\n\n{system}\n\nUser: {message}");
+        vec![
+            "-p".into(), prompt,
+            "--model".into(), "claude-haiku-4-5-20251001".into(),
+            "--output-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--permission-mode".into(), "dontAsk".into(),
+            "--add-dir".into(), brain.into(),
+        ]
+    };
+
+    let (raw_reply, new_sid) = crate::chat::run_headless(claude, args, brain)?;
+
+    let reply = if let Some(json_part) = raw_reply.trim().strip_prefix("__DISPATCH__") {
+        match serde_json::from_str::<serde_json::Value>(json_part.trim()) {
+            Ok(v) => {
+                let task = v.get("task").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let slug = v.get("project_slug").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                if !task.is_empty() && !slug.is_empty() {
+                    AssistantReply::Dispatch(DispatchIntent { task, project_slug: slug })
+                } else {
+                    AssistantReply::Chat(raw_reply)
+                }
+            }
+            Err(_) => AssistantReply::Chat(raw_reply),
+        }
+    } else {
+        AssistantReply::Chat(raw_reply)
+    };
+
+    Ok((reply, new_sid))
+}
+
+pub(crate) fn assistant_chat_turn(
+    claude: &str,
+    brain: &str,
+    date_key: &str,
+    briefing_json: &str,
+    message: &str,
+    now: &str,
+    project_slugs: &str,
+) -> Result<(AssistantReply, Option<String>), String> {
+    let (reply, new_sid) = assistant_turn_core(
+        claude, brain, date_key, briefing_json, message, now, project_slugs,
+    )?;
+    if let Some(sid) = &new_sid {
+        save_assistant_session_id(date_key, sid);
+    }
+    Ok((reply, new_sid))
+}
+
 #[tauri::command]
 pub async fn morning_chat_send(
     dispatch: State<'_, DispatchState>,

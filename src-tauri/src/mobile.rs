@@ -246,6 +246,35 @@ fn call_openai_tts(text: &str, api_key: &str) -> Result<Vec<u8>, String> {
     resp.bytes().map(|b| b.to_vec()).map_err(|e| format!("TTS read bytes: {e}"))
 }
 
+// ── Dispatch state helpers ────────────────────────────────────────────────────
+
+struct PendingIntent {
+    task: String,
+    project_slug: String,
+}
+
+fn is_affirmative(msg: &str) -> bool {
+    let m = msg.trim().to_lowercase();
+    let words = ["go", "launch", "do it", "send it", "run it", "yep", "yes", "yeah",
+                 "ok", "okay", "sure", "ship it", "let's go", "lets go", "do that"];
+    words.iter().any(|w| m == *w || m.starts_with(&format!("{w} ")))
+}
+
+fn is_negative(msg: &str) -> bool {
+    let m = msg.trim().to_lowercase();
+    let words = ["no", "nope", "cancel", "stop", "never mind", "nevermind",
+                 "scratch that", "forget it", "discard"];
+    words.iter().any(|w| m == *w || m.starts_with(&format!("{w} ")))
+}
+
+fn project_slugs_for_prompt() -> String {
+    crate::list_projects_pub()
+        .into_iter()
+        .map(|p| format!("{} ({})", p.slug, p.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn claude_path(app: &tauri::AppHandle) -> String {
     let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
     let p = dispatch.claude_path.lock().unwrap().clone();
@@ -1153,6 +1182,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       container.scrollTop = container.scrollHeight;
     }
 
+    let PENDING_PLAN = false;
+
     async function sendChat() {
       const input = document.getElementById('chat-input');
       const text  = (input.value || '').trim();
@@ -1167,7 +1198,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       renderChat();
 
       try {
-        const r = await fetch('/api/morning-chat', {
+        const r = await fetch('/api/assistant', {
           method: 'POST',
           headers: { ...authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1177,9 +1208,17 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
             briefingJson: BRIEFING_JSON,
           }),
         });
-        const reply = await r.text();
-        if (!r.ok) throw new Error(reply || 'HTTP ' + r.status);
-        CHAT_MSGS.push({ role: 'agent', text: reply });
+        const body = await r.text();
+        if (!r.ok) throw new Error(body || 'HTTP ' + r.status);
+        const data = JSON.parse(body);
+        CHAT_MSGS.push({ role: 'agent', text: data.reply });
+        if (data.mode === 'plan_intent') {
+          PENDING_PLAN = true;
+          document.getElementById('voice-state-label').textContent = "Plan ready — say 'go' to launch";
+        } else {
+          PENDING_PLAN = false;
+          if (data.mode !== 'chat') document.getElementById('voice-state-label').textContent = '';
+        }
       } catch (e) {
         CHAT_MSGS.push({ role: 'error', text: e.message });
       }
@@ -1547,14 +1586,24 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
       let replyText = '';
       try {
-        const r = await fetch('/api/morning-chat', {
+        const r = await fetch('/api/assistant', {
           method: 'POST',
           headers: { ...authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: text, now: new Date().toLocaleString(), dateKey: DATE_KEY, briefingJson: BRIEFING_JSON }),
         });
-        replyText = await r.text();
-        if (!r.ok) throw new Error(replyText || 'HTTP ' + r.status);
+        const body = await r.text();
+        if (!r.ok) throw new Error(body || 'HTTP ' + r.status);
+        const data = JSON.parse(body);
+        replyText = data.reply;
         CHAT_MSGS.push({ role: 'agent', text: replyText });
+        const lbl = document.getElementById('voice-state-label');
+        if (data.mode === 'plan_intent') {
+          PENDING_PLAN = true;
+          lbl.textContent = "Plan ready — say 'go' to launch";
+        } else {
+          PENDING_PLAN = false;
+          if (data.mode === 'launched') lbl.textContent = '';
+        }
       } catch (e) {
         CHAT_MSGS.push({ role: 'error', text: e.message });
         CHAT_THINKING = false;
@@ -1614,6 +1663,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 pub fn start(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let token = load_or_create_token();
+        let pending_intent: std::sync::Arc<std::sync::Mutex<Option<PendingIntent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let server = match tiny_http::Server::http("127.0.0.1:8787") {
             Ok(s) => s,
             Err(e) => {
@@ -1850,6 +1901,118 @@ pub fn start(app: tauri::AppHandle) {
                     match crate::morning::refresh_whoop_blocking() {
                         Ok(msg) => respond(request, 200, "text/plain", msg),
                         Err(e)  => respond(request, 500, "text/plain", e),
+                    }
+                }
+
+                // ── Assistant (dispatch-aware) endpoint ──────────────────────
+
+                "/api/assistant" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let v = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                    let message      = v.get("message").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let now          = v.get("now").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let date_key     = v.get("dateKey").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let briefing_json = v.get("briefingJson").and_then(|s| s.as_str()).unwrap_or("").to_string();
+
+                    if message.is_empty() {
+                        respond(request, 400, "text/plain", "missing message".into()); continue;
+                    }
+
+                    let claude = claude_path(&app);
+                    let brain  = brain_path();
+
+                    // Check affirmative/negative against pending intent
+                    let has_pending = pending_intent.lock().unwrap().is_some();
+                    if has_pending && is_affirmative(&message) {
+                        // Extract intent and clear
+                        let (task, slug) = {
+                            let mut guard = pending_intent.lock().unwrap();
+                            let intent = guard.take().unwrap();
+                            (intent.task, intent.project_slug)
+                        };
+                        // Resolve project path
+                        let paths = crate::get_project_paths_pub(slug.clone());
+                        let project_path = paths.into_iter().map(|r| r.path).next().unwrap_or_default();
+                        if project_path.is_empty() {
+                            let reply = format!("I couldn't find a path for project {slug}. Check the registry.");
+                            respond(request, 200, "application/json",
+                                serde_json::json!({ "reply": reply, "mode": "chat" }).to_string());
+                            continue;
+                        }
+                        // Author + arm (blocking, ~30s)
+                        match crate::harness::author_plan_core(claude.clone(), task, project_path) {
+                            Err(e) => {
+                                let reply = format!("Plan authoring failed: {e}");
+                                respond(request, 200, "application/json",
+                                    serde_json::json!({ "reply": reply, "mode": "chat" }).to_string());
+                            }
+                            Ok(authored) => {
+                                let harness: tauri::State<crate::harness::HarnessState> = app.state();
+                                let aborts = harness.aborts.clone();
+                                drop(harness);
+                                match crate::harness::arm_plan_from_path(app.clone(), claude, aborts, authored.plan_path) {
+                                    Ok(plan_id) => {
+                                        let reply = format!(
+                                            "It's running, plan {}. Results will land in the Agents view.",
+                                            &plan_id[..plan_id.len().min(12)]
+                                        );
+                                        respond(request, 200, "application/json",
+                                            serde_json::json!({ "reply": reply, "mode": "launched", "plan_id": plan_id }).to_string());
+                                    }
+                                    Err(e) => {
+                                        let reply = format!("Failed to arm the plan: {e}");
+                                        respond(request, 200, "application/json",
+                                            serde_json::json!({ "reply": reply, "mode": "chat" }).to_string());
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if has_pending && is_negative(&message) {
+                        pending_intent.lock().unwrap().take();
+                        respond(request, 200, "application/json",
+                            serde_json::json!({ "reply": "Cancelled. What else?", "mode": "chat" }).to_string());
+                        continue;
+                    }
+
+                    // Run assistant turn with dispatch detection
+                    let slugs = project_slugs_for_prompt();
+                    match crate::morning::assistant_chat_turn(
+                        &claude, &brain, &date_key, &briefing_json, &message, &now, &slugs,
+                    ) {
+                        Err(e) => respond(request, 500, "text/plain", e),
+                        Ok((reply, _sid)) => {
+                            match reply {
+                                crate::morning::AssistantReply::Chat(text) => {
+                                    respond(request, 200, "application/json",
+                                        serde_json::json!({ "reply": text, "mode": "chat" }).to_string());
+                                }
+                                crate::morning::AssistantReply::Dispatch(intent) => {
+                                    let task = intent.task.clone();
+                                    let slug = intent.project_slug.clone();
+                                    let project_name = crate::list_projects_pub().into_iter()
+                                        .find(|p| p.slug == slug)
+                                        .map(|p| p.name)
+                                        .unwrap_or_else(|| slug.clone());
+                                    *pending_intent.lock().unwrap() = Some(PendingIntent {
+                                        task,
+                                        project_slug: slug,
+                                    });
+                                    let reply = format!(
+                                        "Understood. I'll build a plan for that in {}. Say 'go' to launch or 'cancel' to drop it.",
+                                        project_name
+                                    );
+                                    respond(request, 200, "application/json",
+                                        serde_json::json!({ "reply": reply, "mode": "plan_intent" }).to_string());
+                                }
+                            }
+                        }
                     }
                 }
 
