@@ -468,10 +468,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
   <!-- ── Morning view ────────────────────────────────────────────────── -->
   <div id="view-morning" class="view active">
     <div id="morning-scroll">
-      <div id="morning-state" class="morning-state">
-        <div class="spinner"></div>
-        <span>Pulling your day...</span>
-      </div>
+      <div id="morning-loader-wrap"></div>
       <div id="morning-content" style="display:none"></div>
     </div>
 
@@ -551,6 +548,62 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         AGENTS_LOADED = true;
       }
     }
+
+    // ── Morning particle loader ───────────────────────────────────────────────
+    function MorningLoaderFactory(){
+      function mount(container, onDone){
+        var wrap=document.createElement('div');
+        wrap.style.cssText="display:flex;flex-direction:column;align-items:center;padding:28px 0;transition:opacity .4s;";
+        var cv=document.createElement('canvas');
+        cv.style.cssText="width:250px;height:250px;display:block;";
+        var cap=document.createElement('div');
+        cap.style.cssText="font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.16em;color:#5f6776;text-transform:uppercase;margin-top:12px;";
+        cap.textContent='preparing your morning';
+        wrap.appendChild(cv);wrap.appendChild(cap);container.appendChild(wrap);
+
+        var ctx=cv.getContext('2d'),DPR=Math.min(window.devicePixelRatio||1,2),SIZE=250;
+        cv.width=SIZE*DPR;cv.height=SIZE*DPR;ctx.scale(DPR,DPR);
+        var W=SIZE,H=SIZE,cx=W/2,cyS=W/2-18,R=92,N=1500,FOCAL=340;
+        var barX0=26,barX1=W-26,barY=H-14,cap_=0.6,maxTaken=Math.floor(N*cap_);
+
+        var sphere=[],galaxy=[],ribbon=[],torus=[],i,PHI=(1+Math.sqrt(5))/2;
+        for(i=0;i<N;i++){var ph=Math.acos(1-2*(i+0.5)/N),th=Math.PI*(1+Math.sqrt(5))*i;sphere.push([Math.cos(th)*Math.sin(ph)*82,Math.sin(th)*Math.sin(ph)*82,Math.cos(ph)*82]);}
+        for(i=0;i<N;i++){var t=(i+1)/N,r=t*96,arm=(i%3)*(Math.PI*2/3),a=t*Math.PI*4+arm;galaxy.push([Math.cos(a)*r,(Math.random()-0.5)*16,Math.sin(a)*r]);}
+        for(i=0;i<N;i++){var gx=i%42,gz=Math.floor(i/42),x=(gx/41-0.5)*186,z=(gz/((N/42)-1)-0.5)*124,y=Math.sin(gx*0.32)*19+Math.cos(gz*0.4)*12;ribbon.push([x,y,z]);}
+        for(i=0;i<N;i++){var u=(i*7/N)*Math.PI*2,v=(i*PHI)*Math.PI*2,Rr=64,rr=23;torus.push([(Rr+rr*Math.cos(v))*Math.cos(u),(Rr+rr*Math.cos(v))*Math.sin(u),rr*Math.sin(v)]);}
+        function rot(p,ax,ay){var cyy=Math.cos(ay),sy=Math.sin(ay),X=p[0]*cyy-p[2]*sy,Z=p[0]*sy+p[2]*cyy,cxx=Math.cos(ax),sx=Math.sin(ax);return [X,p[1]*cxx-Z*sx,p[1]*sx+Z*cxx];}
+        var forms=[{n:'spinner',c:'preparing your morning'},{n:'sphere',c:'reading your sleep'},{n:'galaxy',c:'lining up your agents'},{n:'ribbon',c:'warming up'},{n:'torus',c:'almost ready'}];
+        var SHAPES={sphere:sphere,galaxy:galaxy,ribbon:ribbon,torus:torus};
+        var rankArr=[];for(i=0;i<N;i++)rankArr.push(i);
+        for(i=N-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),tm=rankArr[i];rankArr[i]=rankArr[j];rankArr[j]=tm;}
+        var P=[];for(i=0;i<N;i++){P.push({x:cx+(Math.random()-0.5)*70,y:cyS+(Math.random()-0.5)*70,rank:rankArr[i],roff:Math.random(),s:0.6+Math.random()*0.52,bjx:(Math.random()-0.5)*5,bjy:(Math.random()-0.5)*13});}
+        function shapeAt(name,i){if(name==='spinner'){var a=(i/N)*Math.PI*1.5+spin,rr=R*(0.80+P[i].roff*0.30);return [cx+Math.cos(a)*rr,cyS+Math.sin(a)*rr,1];}var rp=rot(SHAPES[name][i],ang*0.5,ang),s=FOCAL/(FOCAL-rp[2]);return [cx+rp[0]*s,cyS+rp[1]*s,s];}
+
+        var spin=0,ang=0,idx=0,last=0,HOLD=3000,raf=0,start=0,done=false,doneProg=0,finished=false;
+        function frame(t){
+          if(!start)start=t; if(!last)last=t;
+          var cur=forms[idx];
+          if(cur.n==='spinner')spin+=0.040; else ang+=0.009;
+          if(t-last>HOLD){idx=(idx+1)%forms.length;last=t;cur=forms[idx];cap.textContent=cur.c;}
+          var el=(t-start)/1000, base=Math.min((1-Math.exp(-el/14))*0.9,0.9), prog;
+          if(done){doneProg+=(1-doneProg)*0.06; prog=Math.max(base,doneProg);} else prog=base;
+          var taken=prog*maxTaken;
+          ctx.clearRect(0,0,W,H);
+          for(i=0;i<N;i++){var p=P[i],depth,tx,ty;
+            if(p.rank<taken){var fx=p.rank/(maxTaken-1);tx=barX0+fx*(barX1-barX0)+p.bjx;ty=barY+p.bjy;depth=1;p.x+=(tx-p.x)*0.10;p.y+=(ty-p.y)*0.10;}
+            else{var tg=shapeAt(cur.n,i),dxc=tg[0]-cx,dyc=tg[1]-cyS,dist=Math.sqrt(dxc*dxc+dyc*dyc),rip=Math.sin(dist*0.045-t*0.0015)*3.0,nrx=dist>0.001?dxc/dist:0,nry=dist>0.001?dyc/dist:0;tx=tg[0]+nrx*rip;ty=tg[1]+nry*rip;depth=Math.max(0.45,Math.min(tg[2],1.5));p.x+=(tx-p.x)*0.06;p.y+=(ty-p.y)*0.06;}
+            ctx.beginPath();ctx.arc(p.x,p.y,p.s*(0.6+depth*0.5),0,7);ctx.fillStyle='rgba(124,151,232,'+(0.5+(depth-0.45)*0.45)+')';ctx.fill();
+          }
+          ctx.strokeStyle='rgba(124,151,232,0.14)';ctx.lineWidth=1;ctx.strokeRect(barX0-3,barY-9,(barX1-barX0)+6,18);
+          if(done&&doneProg>0.99&&!finished){finished=true;wrap.style.opacity=0;setTimeout(function(){cancelAnimationFrame(raf);if(wrap.parentNode)wrap.parentNode.removeChild(wrap);if(onDone)onDone();},420);}
+          raf=requestAnimationFrame(frame);
+        }
+        raf=requestAnimationFrame(frame);
+        return {finish:function(){done=true;},destroy:function(){cancelAnimationFrame(raf);if(wrap.parentNode)wrap.parentNode.removeChild(wrap);}};
+      }
+      return {mount:mount};
+    }
+    var MorningLoader=MorningLoaderFactory();
 
     // ── Morning state ─────────────────────────────────────────────────────────
     let BRIEFING = null;
@@ -697,43 +750,69 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       html += `<div class="scroll-pad"></div>`;
 
       document.getElementById('morning-content').innerHTML = html;
-      document.getElementById('morning-state').style.display = 'none';
       document.getElementById('morning-content').style.display = 'block';
     }
 
     function showMorningError(msg) {
-      const el = document.getElementById('morning-state');
-      el.innerHTML = `
+      const content = document.getElementById('morning-content');
+      content.innerHTML = `<div class="morning-state" style="min-height:260px;">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
         <p style="color:#ef4444;font-size:13px">Briefing failed</p>
         <p style="font-size:11px;color:#71717a;max-width:260px;text-align:center;word-break:break-all">${esc(msg)}</p>
-        <button onclick="loadMorning()" style="margin-top:4px;font-size:12px;color:#6366f1;background:none;border:none;cursor:pointer;text-decoration:underline">Try again</button>`;
-      el.style.display = 'flex';
+        <button onclick="loadMorning()" style="margin-top:4px;font-size:12px;color:#6366f1;background:none;border:none;cursor:pointer;text-decoration:underline">Try again</button>
+      </div>`;
+      content.style.display = 'block';
     }
 
     // ── Morning data fetching ─────────────────────────────────────────────────
 
-    async function loadMorning() {
-      document.getElementById('morning-state').innerHTML = `<div class="spinner"></div><span>Pulling your day...</span>`;
-      document.getElementById('morning-state').style.display = 'flex';
-      document.getElementById('morning-content').style.display = 'none';
-      // fire-and-forget whoop refresh
+    var _morningCallId = 0;
+    var _morningErr = null;
+    var _activeLoader = null;
+
+    function loadMorning() {
+      const content = document.getElementById('morning-content');
+      content.style.display = 'none';
+      content.innerHTML = '';
+
+      if (_activeLoader) { _activeLoader.destroy(); _activeLoader = null; }
+
+      _morningErr = null;
+      const callId = ++_morningCallId;
+
       fetch('/api/refresh-whoop', { method: 'POST', headers: authHeaders() }).catch(() => {});
-      try {
-        const now = encodeURIComponent(new Date().toLocaleString());
-        const r = await fetch('/api/morning?now=' + now, { headers: authHeaders() });
-        const text = await r.text();
-        if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
-        const b = parseBriefing(text);
-        if (!b) throw new Error('Could not parse briefing JSON.\n\n' + text.slice(0, 200));
-        BRIEFING = b;
-        BRIEFING_JSON = JSON.stringify(b);
-        renderBriefing(b);
-        document.getElementById('chat-send-btn').disabled = false;
-        loadInsight();
-      } catch (e) {
-        showMorningError(e.message);
-      }
+
+      const wrap = document.getElementById('morning-loader-wrap');
+      wrap.innerHTML = '';
+      const loader = MorningLoader.mount(wrap, function() {
+        _activeLoader = null;
+        if (callId !== _morningCallId) return;
+        if (_morningErr) {
+          showMorningError(_morningErr);
+        } else {
+          renderBriefing(BRIEFING);
+          document.getElementById('chat-send-btn').disabled = false;
+          loadInsight();
+        }
+      });
+      _activeLoader = loader;
+
+      const now = encodeURIComponent(new Date().toLocaleString());
+      fetch('/api/morning?now=' + now, { headers: authHeaders() })
+        .then(r => r.text().then(text => {
+          if (callId !== _morningCallId) return;
+          if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
+          const b = parseBriefing(text);
+          if (!b) throw new Error('Could not parse briefing JSON');
+          BRIEFING = b;
+          BRIEFING_JSON = JSON.stringify(b);
+          loader.finish();
+        }))
+        .catch(e => {
+          if (callId !== _morningCallId) return;
+          _morningErr = e.message;
+          loader.finish();
+        });
     }
 
     async function loadInsight() {
