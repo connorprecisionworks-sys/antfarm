@@ -1,5 +1,6 @@
 use serde_json;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -143,4 +144,104 @@ fn run_morning(home: String, brain: String, claude: String) -> Result<String, St
     } else {
         Ok(result_text)
     }
+}
+
+// ── Morning chat ──────────────────────────────────────────────────────────────
+//
+// Per-day warm-session chat. Turn 1 (cold start): embeds MORNING_CHAT_PROMPT +
+// briefing JSON in the -p value and uses --add-dir to give the model the full
+// brain. Turn N: --resume <session_id> with only the new user message. Session
+// id is persisted to ~/.antfarm/morning-sessions/{date_key}.txt so warm
+// follow-ups survive across quick app re-launches within the same day.
+
+const MORNING_CHAT_PROMPT: &str = "You are Connor's morning agent (Jarvis). You know his day. Help him through it: answer follow-ups, react to 'I finished X' by suggesting the next move, recommend, and when something is a real task offer to dispatch it to his agents (1 agent / swarm / orchestrator). Warm, sharp, short. No em dashes.";
+
+fn morning_sessions_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let d = PathBuf::from(home).join(".antfarm/morning-sessions");
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+fn load_morning_session_id(date_key: &str) -> Option<String> {
+    std::fs::read_to_string(morning_sessions_dir().join(format!("{date_key}.txt")))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_morning_session_id(date_key: &str, sid: &str) {
+    let _ = std::fs::write(morning_sessions_dir().join(format!("{date_key}.txt")), sid);
+}
+
+fn morning_turn_core(
+    claude: &str,
+    brain: &str,
+    date_key: &str,
+    briefing_json: &str,
+    message: &str,
+) -> Result<(String, Option<String>), String> {
+    let session_id = load_morning_session_id(date_key);
+
+    let args: Vec<String> = if let Some(sid) = session_id {
+        // Warm resume: only the new user message; session carries all prior context.
+        vec![
+            "--resume".into(), sid,
+            "-p".into(), message.into(),
+            "--model".into(), "claude-sonnet-4-6".into(),
+            "--output-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--permission-mode".into(), "dontAsk".into(),
+        ]
+    } else {
+        // Cold start: embed system prompt + briefing + user message.
+        let prompt = format!(
+            "{MORNING_CHAT_PROMPT}\n\n\
+             Here is Connor's briefing for today:\n{briefing_json}\n\n\
+             You have the full brain directory via --add-dir \
+             (active/whoop-today.json, CLAUDE.md, active/now.md, \
+             active/tomorrow-plan.md, etc.) and can read any file you need.\n\n\
+             User: {message}"
+        );
+        vec![
+            "-p".into(), prompt,
+            "--model".into(), "claude-sonnet-4-6".into(),
+            "--output-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--permission-mode".into(), "dontAsk".into(),
+            "--add-dir".into(), brain.into(),
+        ]
+    };
+
+    crate::chat::run_headless(claude, args, brain)
+}
+
+#[tauri::command]
+pub async fn morning_chat_send(
+    dispatch: State<'_, DispatchState>,
+    date_key: String,
+    briefing_json: String,
+    message: String,
+) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let brain = format!("{}/Desktop/CD_claude", home);
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+
+    let dk = date_key.clone();
+    let bj = briefing_json.clone();
+
+    let (reply, new_sid) = tauri::async_runtime::spawn_blocking(move || {
+        morning_turn_core(&claude, &brain, &dk, &bj, &message)
+    })
+    .await
+    .map_err(|e| format!("task panicked: {e}"))??;
+
+    if let Some(sid) = new_sid {
+        save_morning_session_id(&date_key, &sid);
+    }
+
+    if reply.is_empty() {
+        return Err("morning chat: empty reply from model".into());
+    }
+    Ok(reply)
 }

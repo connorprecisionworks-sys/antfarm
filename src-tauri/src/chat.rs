@@ -96,7 +96,7 @@ const CHAT_AGENT_PROMPT: &str = "You are a lead engineer chatting with the user 
 
 // Returns (result_text, captured_session_id). Uses stream-json so we can
 // pull the session_id from the init line and cost from the result line.
-fn run_headless(
+pub(crate) fn run_headless(
     claude: &str,
     args: Vec<String>,
     cwd: &str,

@@ -1960,6 +1960,7 @@ fn main() {
             pty::kill_pty,
             list_slash_commands,
             morning::generate_morning_briefing,
+            morning::morning_chat_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
