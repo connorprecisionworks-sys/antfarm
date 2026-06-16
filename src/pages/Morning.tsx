@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronRight, RefreshCw, Send } from "lucide-react";
+import { ChevronRight, RefreshCw, Send, X } from "lucide-react";
 import { Project, RepoPath } from "../types";
 
-// ── Animation styles (injected once) ─────────────────────────────────────────
+// ── Animation styles ──────────────────────────────────────────────────────────
 
 const CHAT_STYLES = `
   @keyframes msgIn {
@@ -33,6 +33,50 @@ const CHAT_STYLES = `
     .typing-shimmer { background: #27272a; }
   }
 `;
+
+// ── localStorage helpers ──────────────────────────────────────────────────────
+
+function lsGet(key: string): string | null {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function lsSet(key: string, val: string) {
+  try { localStorage.setItem(key, val); } catch {}
+}
+
+// ── Routine checklist storage ─────────────────────────────────────────────────
+
+const ROUTINE_ITEMS_KEY = "antfarm-routine-items";
+const ROUTINE_DEFAULT   = [
+  "Coffee",
+  "Breakfast / fuel",
+  "Plan / review the day",
+  "Reading (20 min)",
+  "Workout",
+  "Work block",
+];
+
+function routineChecksKey(dateKey: string) {
+  return `antfarm-routine-checks-${dateKey}`;
+}
+
+function loadRoutineItems(): string[] {
+  const raw = lsGet(ROUTINE_ITEMS_KEY);
+  if (raw === null) {
+    lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(ROUTINE_DEFAULT));
+    return [...ROUTINE_DEFAULT];
+  }
+  try { return JSON.parse(raw) as string[]; } catch { return [...ROUTINE_DEFAULT]; }
+}
+
+function loadRoutineChecks(dateKey: string): Set<string> {
+  const raw = lsGet(routineChecksKey(dateKey));
+  if (!raw) return new Set();
+  try { return new Set(JSON.parse(raw) as string[]); } catch { return new Set(); }
+}
+
+// ── Chat storage ──────────────────────────────────────────────────────────────
+
+const CHAT_EXPANDED_KEY = "antfarm-chat-expanded";
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
@@ -93,7 +137,7 @@ type HandoffState =
   | { kind: "proposal"; result: ProposalResult }
   | { kind: "error"; message: string };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Misc helpers ──────────────────────────────────────────────────────────────
 
 function recoveryColor(pct: number): string {
   if (pct >= 67) return "#3a9e62";
@@ -118,9 +162,7 @@ function parseBriefing(raw: string): MorningBriefing | null {
 }
 
 let _chatSeq = 0;
-function newChatId() {
-  return `cm-${++_chatSeq}`;
-}
+function newChatId() { return `cm-${++_chatSeq}`; }
 
 // ── Recovery ring ─────────────────────────────────────────────────────────────
 
@@ -129,7 +171,6 @@ function RecoveryRing({ pct }: { pct: number }) {
   const circ = 2 * Math.PI * r;
   const color = recoveryColor(pct);
   const offset = circ * (1 - Math.min(100, Math.max(0, pct)) / 100);
-
   return (
     <svg width="88" height="88" viewBox="0 0 88 88" className="shrink-0">
       <circle cx="44" cy="44" r={r} fill="none" stroke="#27272a" strokeWidth="7" />
@@ -143,6 +184,132 @@ function RecoveryRing({ pct }: { pct: number }) {
         {pct}
       </text>
     </svg>
+  );
+}
+
+// ── Routine checklist ─────────────────────────────────────────────────────────
+
+function RoutineChecklist() {
+  const dateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const [items, setItems]   = useState<string[]>(() => loadRoutineItems());
+  const [checks, setChecks] = useState<Set<string>>(() => loadRoutineChecks(dateKey));
+  const [addText, setAddText] = useState("");
+  const addRef = useRef<HTMLInputElement>(null);
+
+  function toggleCheck(text: string) {
+    setChecks((prev) => {
+      const next = new Set(prev);
+      if (next.has(text)) next.delete(text);
+      else next.add(text);
+      lsSet(routineChecksKey(dateKey), JSON.stringify([...next]));
+      return next;
+    });
+  }
+
+  function removeItem(text: string) {
+    setItems((prev) => {
+      const next = prev.filter((i) => i !== text);
+      lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(next));
+      return next;
+    });
+    setChecks((prev) => {
+      const next = new Set(prev);
+      next.delete(text);
+      lsSet(routineChecksKey(dateKey), JSON.stringify([...next]));
+      return next;
+    });
+  }
+
+  function addItem() {
+    const text = addText.trim();
+    if (!text || items.includes(text)) return;
+    setItems((prev) => {
+      const next = [...prev, text];
+      lsSet(ROUTINE_ITEMS_KEY, JSON.stringify(next));
+      return next;
+    });
+    setAddText("");
+    setTimeout(() => addRef.current?.focus(), 0);
+  }
+
+  const checkedCount = items.filter((i) => checks.has(i)).length;
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
+      <div className="flex items-center justify-between px-4 pt-3 pb-2">
+        <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">
+          Morning routine
+        </p>
+        <p className="text-[10px] text-zinc-600 tabular-nums">
+          {checkedCount}/{items.length}
+        </p>
+      </div>
+
+      <div className="divide-y divide-zinc-800/40">
+        {items.map((item) => {
+          const isDone = checks.has(item);
+          return (
+            <div key={item} className="flex items-center gap-3 px-4 py-2.5 group/routine">
+              {/* Check dot */}
+              <button
+                onClick={() => toggleCheck(item)}
+                className="shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-all"
+                style={{
+                  borderColor: isDone ? "#52525b" : "#71717a",
+                  backgroundColor: isDone ? "#3f3f46" : "transparent",
+                }}
+                aria-label={isDone ? "Uncheck" : "Check"}
+              >
+                {isDone && (
+                  <svg width="7" height="7" viewBox="0 0 7 7" fill="none">
+                    <path d="M1 3.5L2.8 5.5L6 1.5" stroke="#a1a1aa" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </button>
+
+              <span
+                className={`flex-1 text-sm select-none transition-colors cursor-default ${
+                  isDone ? "text-zinc-600 line-through" : "text-zinc-300"
+                }`}
+                onClick={() => toggleCheck(item)}
+              >
+                {item}
+              </span>
+
+              {/* Remove x — visible on hover */}
+              <button
+                onClick={() => removeItem(item)}
+                className="shrink-0 opacity-0 group-hover/routine:opacity-100 transition-opacity text-zinc-600 hover:text-zinc-400"
+                aria-label={`Remove ${item}`}
+              >
+                <X size={12} strokeWidth={2} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Add input */}
+      <div className="flex items-center gap-2 px-4 py-2.5 border-t border-zinc-800/40">
+        <input
+          ref={addRef}
+          type="text"
+          placeholder="+ add item"
+          value={addText}
+          onChange={(e) => setAddText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") addItem(); }}
+          className="flex-1 text-xs bg-transparent text-zinc-400 placeholder-zinc-600 focus:outline-none focus:text-zinc-200 transition-colors"
+        />
+        {addText.trim() && (
+          <button
+            onClick={addItem}
+            className="text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors"
+          >
+            Add
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -179,20 +346,21 @@ interface TaskRowProps {
   task: MorningTask;
   isDone: boolean;
   onToggleDone: () => void;
+  onRemove: () => void;
   isExpanded: boolean;
   onExpand: (id: string | null) => void;
   projects: Project[];
   recovColor: string;
 }
 
-function TaskRow({ task, isDone, onToggleDone, isExpanded, onExpand, projects, recovColor }: TaskRowProps) {
-  const [scope, setScope] = useState("");
+function TaskRow({ task, isDone, onToggleDone, onRemove, isExpanded, onExpand, projects, recovColor }: TaskRowProps) {
+  const [scope, setScope]           = useState("");
   const [selectedSlug, setSelectedSlug] = useState("");
-  const [handoff, setHandoff] = useState<HandoffState>({ kind: "idle" });
+  const [handoff, setHandoff]       = useState<HandoffState>({ kind: "idle" });
 
   const dispatched = handoff.kind === "sent" || handoff.kind === "proposal";
-  const dotBorder = dispatched ? "#6366f1" : isDone ? "#52525b" : recovColor;
-  const dotFill   = dispatched ? "#4f46e5" : isDone ? "#3f3f46" : "transparent";
+  const dotBorder  = dispatched ? "#6366f1" : isDone ? "#52525b" : recovColor;
+  const dotFill    = dispatched ? "#4f46e5" : isDone ? "#3f3f46" : "transparent";
 
   async function dispatch(mode: "single" | "swarm" | "orchestrate") {
     if (!selectedSlug) return;
@@ -228,19 +396,32 @@ function TaskRow({ task, isDone, onToggleDone, isExpanded, onExpand, projects, r
 
   return (
     <>
-      <div className={`flex items-center gap-3 px-4 py-3 transition-colors ${isExpanded ? "bg-zinc-900/80" : ""}`}>
+      <div className={`flex items-center gap-3 px-4 py-3 group/task transition-colors ${isExpanded ? "bg-zinc-900/80" : ""}`}>
+        {/* Done dot */}
         <button
           onClick={onToggleDone}
           className="shrink-0 w-4 h-4 rounded-full border-2 transition-all"
           style={{ borderColor: dotBorder, backgroundColor: dotFill }}
           aria-label={isDone ? "Mark undone" : "Mark done"}
         />
+
+        {/* Text — click to expand handoff panel */}
         <button className="flex-1 min-w-0 text-left" onClick={() => onExpand(isExpanded ? null : task.id)}>
           <p className={`text-sm transition-colors ${isDone ? "text-zinc-600 line-through" : "text-zinc-200"}`}>
             {task.text}
           </p>
           {task.detail && <p className="text-xs text-zinc-500 mt-0.5">{task.detail}</p>}
         </button>
+
+        {/* Remove x — visible on row hover */}
+        <button
+          onClick={onRemove}
+          className="shrink-0 opacity-0 group-hover/task:opacity-100 transition-opacity text-zinc-600 hover:text-zinc-400"
+          aria-label="Remove task"
+        >
+          <X size={12} strokeWidth={2} />
+        </button>
+
         <ChevronRight
           size={14} strokeWidth={1.75}
           className={`text-zinc-600 shrink-0 transition-transform duration-150 ${isExpanded ? "rotate-90" : ""}`}
@@ -282,11 +463,16 @@ function TaskRow({ task, isDone, onToggleDone, isExpanded, onExpand, projects, r
           {handoff.kind === "error" && (
             <div className="flex items-start justify-between gap-2">
               <p className="text-xs text-red-400 leading-relaxed">{handoff.message}</p>
-              <button onClick={() => setHandoff({ kind: "idle" })} className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2 shrink-0">Reset</button>
+              <button
+                onClick={() => setHandoff({ kind: "idle" })}
+                className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2 shrink-0"
+              >
+                Reset
+              </button>
             </div>
           )}
-          {handoff.kind === "working" && <p className="text-xs text-zinc-500 animate-pulse">{handoff.label}</p>}
-          {handoff.kind === "sent"    && <p className="text-xs text-emerald-400">{handoff.label}, it'll report back.</p>}
+          {handoff.kind === "working"  && <p className="text-xs text-zinc-500 animate-pulse">{handoff.label}</p>}
+          {handoff.kind === "sent"     && <p className="text-xs text-emerald-400">{handoff.label}, it'll report back.</p>}
           {handoff.kind === "proposal" && <ProposalView result={handoff.result} />}
         </div>
       )}
@@ -306,15 +492,35 @@ interface BriefingViewProps {
 function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps) {
   const { health } = briefing;
   const rColor = recoveryColor(health.recovery);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedId, setExpandedId]     = useState<string | null>(null);
+  const [removedTasks, setRemovedTasks] = useState<Set<string>>(new Set());
+
+  function removeTask(id: string) {
+    setRemovedTasks((prev) => new Set([...prev, id]));
+  }
+
+  function clearDone() {
+    setRemovedTasks((prev) => {
+      const next = new Set(prev);
+      briefing.tasks.forEach((t) => { if (done.has(t.id)) next.add(t.id); });
+      return next;
+    });
+  }
+
+  const visibleTasks = briefing.tasks.filter((t) => !removedTasks.has(t.id));
+  const doneVisible  = visibleTasks.filter((t) => done.has(t.id)).length;
 
   return (
     <div className="max-w-2xl mx-auto space-y-4">
+      {/* Date + greeting */}
       <div>
-        <p className="text-[11px] font-medium text-zinc-500 uppercase tracking-widest">{briefing.date_label}</p>
+        <p className="text-[11px] font-medium text-zinc-500 uppercase tracking-widest">
+          {briefing.date_label}
+        </p>
         <h2 className="text-xl font-semibold text-zinc-100 mt-1">{briefing.greeting}</h2>
       </div>
 
+      {/* Health card */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
         <div className="flex items-start gap-5">
           <RecoveryRing pct={health.recovery} />
@@ -337,6 +543,7 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
         </div>
       </div>
 
+      {/* Day shape + commitments */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 space-y-2">
         <p className="text-sm text-zinc-200">{briefing.day_line}</p>
         {briefing.commitments.length > 0 && (
@@ -351,24 +558,47 @@ function BriefingView({ briefing, done, onToggle, projects }: BriefingViewProps)
         )}
       </div>
 
+      {/* Morning routine checklist */}
+      <RoutineChecklist />
+
+      {/* Work task list */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
-        <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider px-4 pt-3 pb-2">The Plan</p>
-        <div className="divide-y divide-zinc-800/50">
-          {briefing.tasks.map((task) => (
-            <TaskRow
-              key={task.id}
-              task={task}
-              isDone={done.has(task.id)}
-              onToggleDone={() => onToggle(task.id)}
-              isExpanded={expandedId === task.id}
-              onExpand={setExpandedId}
-              projects={projects}
-              recovColor={rColor}
-            />
-          ))}
+        <div className="flex items-center justify-between px-4 pt-3 pb-2">
+          <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">
+            The Plan
+          </p>
+          {doneVisible > 0 && (
+            <button
+              onClick={clearDone}
+              className="text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors"
+            >
+              Clear done
+            </button>
+          )}
         </div>
+
+        {visibleTasks.length === 0 ? (
+          <p className="px-4 pb-3 text-xs text-zinc-600">All tasks cleared.</p>
+        ) : (
+          <div className="divide-y divide-zinc-800/50">
+            {visibleTasks.map((task) => (
+              <TaskRow
+                key={task.id}
+                task={task}
+                isDone={done.has(task.id)}
+                onToggleDone={() => onToggle(task.id)}
+                onRemove={() => removeTask(task.id)}
+                isExpanded={expandedId === task.id}
+                onExpand={setExpandedId}
+                projects={projects}
+                recovColor={rColor}
+              />
+            ))}
+          </div>
+        )}
       </div>
 
+      {/* Agent note */}
       {briefing.agent_note && (
         <div className="rounded-xl border border-zinc-800/60 bg-zinc-900/30 px-4 py-3">
           <p className="text-xs text-zinc-400">{briefing.agent_note}</p>
@@ -418,22 +648,39 @@ interface MorningChatProps {
 }
 
 function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
+  const reducedMotion = useMemo(
+    () => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches,
+    []
+  );
+  const [expanded, setExpanded] = useState<boolean>(() => {
+    const raw = lsGet(CHAT_EXPANDED_KEY);
+    return raw === null ? true : raw === "true";
+  });
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput]       = useState("");
   const [thinking, setThinking] = useState(false);
-  const scrollRef  = useRef<HTMLDivElement>(null);
-  const inputRef   = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef  = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, thinking]);
 
+  function toggleExpanded() {
+    setExpanded((prev) => {
+      const next = !prev;
+      lsSet(CHAT_EXPANDED_KEY, String(next));
+      return next;
+    });
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || thinking) return;
     setInput("");
     setThinking(true);
+    if (!expanded) { setExpanded(true); lsSet(CHAT_EXPANDED_KEY, "true"); }
     setMessages((prev) => [...prev, { id: newChatId(), role: "user", text }]);
     try {
       const reply = await invoke<string>("morning_chat_send", {
@@ -450,44 +697,83 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
     }
   }
 
+  const bodyTransition = reducedMotion
+    ? "none"
+    : "max-height 0.25s ease, opacity 0.2s ease";
+
   return (
-    <div className="shrink-0 flex flex-col border-t border-zinc-800 bg-zinc-950/80" style={{ maxHeight: "280px" }}>
+    <div className="shrink-0 flex flex-col border-t border-zinc-800 bg-zinc-950/80">
       <style>{CHAT_STYLES}</style>
 
-      {/* Message thread */}
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-2">
-        {messages.length === 0 && !thinking && (
-          <p className="text-xs text-zinc-600 text-center py-3 select-none">Ask Jarvis a follow-up...</p>
-        )}
-        {messages.map((msg) => <MessageBubble key={msg.id} msg={msg} />)}
-        {thinking && <TypingIndicator />}
-      </div>
-
-      {/* Input row */}
-      <div className="shrink-0 flex gap-2 items-center px-4 py-2.5 border-t border-zinc-800/50">
-        <input
-          ref={inputRef}
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-          disabled={thinking}
-          placeholder={thinking ? "Thinking..." : "Ask Jarvis..."}
-          className="flex-1 text-xs bg-transparent border border-zinc-700/50 rounded-lg px-3 py-2 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500/60 disabled:opacity-50 transition-colors"
-        />
-        <button
-          onClick={send}
-          disabled={thinking || !input.trim()}
-          className="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-        >
-          {thinking ? (
-            <svg className="animate-spin w-3.5 h-3.5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-            </svg>
-          ) : (
-            <Send size={13} strokeWidth={2} className="text-white" />
+      {/* Collapse header */}
+      <button
+        onClick={toggleExpanded}
+        className="flex items-center justify-between px-4 py-2.5 w-full hover:bg-zinc-900/40 transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-zinc-400">Morning agent</span>
+          {messages.length > 0 && !expanded && (
+            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />
           )}
-        </button>
+        </div>
+        <ChevronRight
+          size={13} strokeWidth={1.75}
+          className={`text-zinc-600 transition-transform ${reducedMotion ? "" : "duration-200"} ${
+            expanded ? "rotate-90" : ""
+          }`}
+        />
+      </button>
+
+      {/* Collapsible body */}
+      <div
+        style={{
+          maxHeight: expanded ? "240px" : "0",
+          opacity: expanded ? 1 : 0,
+          overflow: "hidden",
+          transition: bodyTransition,
+        }}
+      >
+        {/* Thread — inner scroll */}
+        <div
+          ref={scrollRef}
+          className="overflow-y-auto px-4 py-3 space-y-2"
+          style={{ maxHeight: "192px" }}
+        >
+          {messages.length === 0 && !thinking && (
+            <p className="text-xs text-zinc-600 text-center py-3 select-none">
+              Ask Jarvis a follow-up...
+            </p>
+          )}
+          {messages.map((msg) => <MessageBubble key={msg.id} msg={msg} />)}
+          {thinking && <TypingIndicator />}
+        </div>
+
+        {/* Input row */}
+        <div className="flex gap-2 items-center px-4 py-2.5 border-t border-zinc-800/50">
+          <input
+            ref={inputRef}
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            disabled={thinking}
+            placeholder={thinking ? "Thinking..." : "Ask Jarvis..."}
+            className="flex-1 text-xs bg-transparent border border-zinc-700/50 rounded-lg px-3 py-2 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500/60 disabled:opacity-50 transition-colors"
+          />
+          <button
+            onClick={send}
+            disabled={thinking || !input.trim()}
+            className="shrink-0 w-8 h-8 flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          >
+            {thinking ? (
+              <svg className="animate-spin w-3.5 h-3.5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+            ) : (
+              <Send size={13} strokeWidth={2} className="text-white" />
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -503,9 +789,9 @@ type Phase =
   | { kind: "error"; message: string };
 
 export function Morning() {
-  const [phase, setPhase]           = useState<Phase>({ kind: "idle" });
-  const [done, setDone]             = useState<Set<string>>(new Set());
-  const [projects, setProjects]     = useState<Project[]>([]);
+  const [phase, setPhase]               = useState<Phase>({ kind: "idle" });
+  const [done, setDone]                 = useState<Set<string>>(new Set());
+  const [projects, setProjects]         = useState<Project[]>([]);
   const [briefingJson, setBriefingJson] = useState<string>("");
 
   const dateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
@@ -557,7 +843,7 @@ export function Morning() {
         )}
       </div>
 
-      {/* Cards area — scrollable */}
+      {/* Cards area */}
       <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
         {phase.kind === "loading" && (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-zinc-400">
@@ -594,7 +880,7 @@ export function Morning() {
         )}
       </div>
 
-      {/* Docked chat — always mounted once briefing has succeeded at least once */}
+      {/* Docked chat — stays mounted once briefing has loaded at least once */}
       {briefingJson && (
         <MorningChat briefingJson={briefingJson} dateKey={dateKey} />
       )}
