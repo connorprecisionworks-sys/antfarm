@@ -9,9 +9,11 @@ import {
   Settings,
   Hexagon,
   PanelLeft,
+  Sunrise,
 } from "lucide-react";
 
 const NAV = [
+  { to: "/morning", label: "Morning", icon: Sunrise, end: false },
   { to: "/", label: "Home", icon: Home, end: true },
   { to: "/projects", label: "Projects", icon: Layers, end: false },
   { to: "/sessions", label: "Sessions", icon: Activity, end: false },

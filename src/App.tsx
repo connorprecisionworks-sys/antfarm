@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
+import { Morning } from "./pages/Morning";
 import { Projects } from "./pages/Projects";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Sessions } from "./pages/Sessions";
@@ -13,6 +14,7 @@ export default function App() {
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Home />} />
+          <Route path="morning" element={<Morning />} />
           <Route path="projects" element={<Projects />} />
           <Route path="projects/:slug" element={<ProjectDetail />} />
           <Route path="sessions" element={<Sessions />} />
