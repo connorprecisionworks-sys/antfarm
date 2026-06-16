@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Lock, Moon, Send } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { Lock, Mic, Moon, Send } from "lucide-react";
 
 // ── Animation styles ──────────────────────────────────────────────────────────
 
@@ -85,6 +86,7 @@ function TypingIndicator() {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export function Tonight() {
+  const navigate = useNavigate();
   const [existingPlan, setExistingPlan] = useState<TomorrowPlan | null>(null);
   const [showExisting, setShowExisting] = useState(true);
   const [messages, setMessages]         = useState<ChatMsg[]>([]);
@@ -159,6 +161,14 @@ export function Tonight() {
           <h1 className="text-base font-semibold text-zinc-100">Tonight</h1>
           <p className="text-xs text-zinc-500">Plan for {tomorrowLabel()}</p>
         </div>
+        <button
+          onClick={() => navigate("/voice?mode=night")}
+          className="ml-auto flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+          title="Plan out loud with Jarvis"
+        >
+          <Mic size={12} strokeWidth={1.75} />
+          Plan out loud
+        </button>
       </div>
 
       {/* Locked plan card */}

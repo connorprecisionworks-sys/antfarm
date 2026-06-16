@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronRight, Moon, RefreshCw, Send, X } from "lucide-react";
+import { ChevronRight, Mic, Moon, RefreshCw, Send, X } from "lucide-react";
 import { useVoice } from "../lib/useVoice";
 import { Project, RepoPath } from "../types";
 
@@ -1117,6 +1117,15 @@ export function Morning() {
       <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 shrink-0">
         <h1 className="text-base font-semibold text-zinc-100">Morning</h1>
         <div className="flex items-center gap-3">
+          {/* Talk to Jarvis */}
+          <button
+            onClick={() => navigate("/voice?mode=morning")}
+            className="flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+            title="Talk to Jarvis"
+          >
+            <Mic size={12} strokeWidth={1.75} />
+            Talk to Jarvis
+          </button>
           {/* Whoop refresh button */}
           <button
             onClick={refreshWhoop}

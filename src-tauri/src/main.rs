@@ -2455,6 +2455,7 @@ fn main() {
             mobile::tool_get_brief,
             mobile::tool_draft_dispatch,
             mobile::tool_launch_dispatch,
+            mobile::tool_lock_tomorrow_plan,
             mobile::jarvis_chat,
             planning::plan_chat_send,
             planning::lock_tomorrow_plan,

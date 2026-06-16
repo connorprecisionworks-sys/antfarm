@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useVoice } from "../lib/useVoice";
 
 // gpt-4o-mini-realtime audio pricing ($/min): in $0.06 + out $0.024 ≈ $0.084
@@ -16,7 +16,10 @@ interface RealtimeTokenResponse {
 }
 
 export function VoiceMode() {
-  const navigate    = useNavigate();
+  const navigate       = useNavigate();
+  const [searchParams] = useSearchParams();
+  const mode           = (searchParams.get("mode") ?? "general") as "general" | "morning" | "night";
+
   const canvasRef   = useRef<HTMLCanvasElement>(null);
   const pcRef       = useRef<RTCPeerConnection | null>(null);
   const dcRef       = useRef<RTCDataChannel | null>(null);
@@ -28,10 +31,12 @@ export function VoiceMode() {
   const outBufRef   = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const orbRafRef   = useRef<number | null>(null);
   const timerRef    = useRef<number | null>(null);
+  const idleTimerRef   = useRef<number | null>(null);
+  const lastAudioRef   = useRef<number>(0);
   const sessionStartRef = useRef<number | null>(null);
   const orbStateRef = useRef<OrbState>("idle");
 
-  const [mode, setMode]               = useState<Mode>("realtime");
+  const [voiceMode, setVoiceMode]     = useState<Mode>("realtime");
   const [orbState, setOrbStateReact]  = useState<OrbState>("idle");
   const [status, setStatus]           = useState("ready");
   const [elapsed, setElapsed]         = useState("");
@@ -42,6 +47,7 @@ export function VoiceMode() {
   const [errorKind, setErrorKind]     = useState<"mic" | "network" | "">("");
   const [planPending, setPlanPending] = useState(false);
   const [fbHolding, setFbHolding]     = useState(false);
+  const [idleEnded, setIdleEnded]     = useState(false);
 
   // Fallback voice hook (batch STT + TTS via Tauri)
   const voice = useVoice({
@@ -164,6 +170,8 @@ export function VoiceMode() {
       } else if (name === "launch_dispatch") {
         result = await invoke<string>("tool_launch_dispatch");
         setPlanPending(false);
+      } else if (name === "lock_tomorrow_plan") {
+        result = await invoke<string>("tool_lock_tomorrow_plan");
       }
     } catch (e) { result = "Error: " + String(e); }
     sendRT({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output: result } });
@@ -173,8 +181,8 @@ export function VoiceMode() {
 
   function handleRealtimeEvent(evt: Record<string, unknown>) {
     switch (evt.type) {
-      case "input_audio_buffer.speech_started": setOrbState("listening"); break;
-      case "response.audio.delta":              setOrbState("speaking");  break;
+      case "input_audio_buffer.speech_started": lastAudioRef.current = Date.now(); setOrbState("listening"); break;
+      case "response.audio.delta":              lastAudioRef.current = Date.now(); setOrbState("speaking");  break;
       case "response.audio.done":               setOrbState("listening"); break;
       case "response.function_call_arguments.done": {
         setOrbState("thinking");
@@ -203,7 +211,7 @@ export function VoiceMode() {
 
     let session: RealtimeTokenResponse;
     try {
-      session = await invoke<RealtimeTokenResponse>("get_realtime_token");
+      session = await invoke<RealtimeTokenResponse>("get_realtime_token", { mode });
     } catch (e) {
       setOrbState("idle");
       setError("Token failed: " + String(e));
@@ -253,6 +261,7 @@ export function VoiceMode() {
     dcRef.current = dc;
     dc.onopen = () => {
       setOrbState("listening");
+      lastAudioRef.current = Date.now();
       sessionStartRef.current = Date.now();
       timerRef.current = window.setInterval(() => {
         if (!sessionStartRef.current) return;
@@ -262,6 +271,13 @@ export function VoiceMode() {
         setElapsed(m + ":" + s);
         setCost("~$" + ((sec / 60) * COST_PER_MIN).toFixed(3));
       }, 1000);
+      idleTimerRef.current = window.setInterval(() => {
+        if (Date.now() - lastAudioRef.current > 40000) {
+          setIdleEnded(true);
+          disconnect();
+          setTimeout(() => setIdleEnded(false), 3000);
+        }
+      }, 10000);
     };
     dc.onmessage = (e) => {
       try { handleRealtimeEvent(JSON.parse(e.data)); } catch {}
@@ -287,6 +303,7 @@ export function VoiceMode() {
   }, [startOrb, stopOrb]);
 
   const disconnect = useCallback(() => {
+    if (idleTimerRef.current) { clearInterval(idleTimerRef.current); idleTimerRef.current = null; }
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     if (dcRef.current) { try { dcRef.current.close(); } catch {} dcRef.current = null; }
     if (pcRef.current) { try { pcRef.current.close(); } catch {} pcRef.current = null; }
@@ -301,7 +318,7 @@ export function VoiceMode() {
 
   function switchToFallback() {
     disconnect();
-    setMode("fallback");
+    setVoiceMode("fallback");
     setError(""); setErrorKind("");
     setStatus("ready");
     startOrb();
@@ -309,21 +326,21 @@ export function VoiceMode() {
 
   // Auto-connect realtime on mount
   useEffect(() => {
-    if (mode === "realtime") {
+    if (voiceMode === "realtime") {
       connect();
       return () => disconnect();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [voiceMode]);
 
   // Keep orb breathing during fallback voice state
   useEffect(() => {
-    if (mode !== "fallback") return;
+    if (voiceMode !== "fallback") return;
     if (voice.state === "recording") setOrbState("listening");
     else if (voice.state === "transcribing") setOrbState("thinking");
     else if (voice.state === "speaking") setOrbState("speaking");
     else setOrbState("idle");
-  }, [mode, voice.state]);
+  }, [voiceMode, voice.state]);
 
   const dotColor =
     orbState === "listening" || orbState === "speaking" ? "bg-emerald-400"
@@ -347,7 +364,7 @@ export function VoiceMode() {
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
-  const isLive = mode === "realtime" && (orbState === "listening" || orbState === "speaking" || orbState === "thinking");
+  const isLive = voiceMode === "realtime" && (orbState === "listening" || orbState === "speaking" || orbState === "thinking");
 
   return (
     <div
@@ -359,7 +376,7 @@ export function VoiceMode() {
         <div className="flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor} ${isLive ? "animate-pulse" : ""}`} />
           <span className="text-xs font-mono text-zinc-500 tracking-wider">
-            {mode === "fallback" ? "CLASSIC" : status.toUpperCase()}
+            {idleEnded ? "ENDED (IDLE)" : voiceMode === "fallback" ? "CLASSIC" : status.toUpperCase()}
           </span>
         </div>
         <div className="flex items-center gap-3 text-xs font-mono text-zinc-600">
@@ -425,7 +442,7 @@ export function VoiceMode() {
         )}
 
         {/* Fallback press-to-talk */}
-        {mode === "fallback" && (
+        {voiceMode === "fallback" && (
           <button
             onPointerDown={fbPointerDown}
             onPointerUp={fbPointerUp}
@@ -452,7 +469,7 @@ export function VoiceMode() {
           >
             CC
           </button>
-          {mode === "realtime" && !error && (
+          {voiceMode === "realtime" && !error && (
             <button
               onClick={switchToFallback}
               className="text-xs font-mono px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-700 hover:text-zinc-500 transition-colors"

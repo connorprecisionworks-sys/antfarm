@@ -735,7 +735,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     <button class="tab active" id="tab-morning" onclick="switchView('morning')">Morning</button>
     <button class="tab"        id="tab-agents"  onclick="switchView('agents')">Agents</button>
     <span id="nav-status"></span>
-    <button class="tab-voice" onclick="openVoiceOverlay()" title="Talk to Jarvis">
+    <button class="tab-voice" onclick="openVoiceOverlay('morning')" title="Talk to Jarvis">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
       Talk
     </button>
@@ -1808,6 +1808,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       micAn: null, outAn: null, orbState: 'idle',
       sessionStart: null, timerInterval: null, orbRaf: null,
       captionsOn: false, pendingDispatch: null, micFreqBuf: null, outFreqBuf: null,
+      lastAudioTs: 0, idleTimer: null,
     };
 
     function setOrbState(s) {
@@ -1827,12 +1828,12 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         s === 'thinking'   ? 'THINKING...'   : s === 'speaking'  ? 'SPEAKING' : '';
     }
 
-    async function openVoiceOverlay() {
+    async function openVoiceOverlay(mode) {
       const ov = document.getElementById('voice-overlay');
       ov.classList.add('active');
       requestAnimationFrame(() => ov.classList.add('visible'));
       startOrbCanvas();
-      await connectRealtime();
+      await connectRealtime(mode || 'morning');
     }
 
     function closeVoiceOverlay() {
@@ -1858,7 +1859,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       if (el) el.textContent = text;
     }
 
-    async function connectRealtime() {
+    async function connectRealtime(mode) {
+      _RT.lastAudioTs = Date.now();
       setOrbState('connecting');
       // 1. Mint ephemeral token
       let token, model;
@@ -1866,7 +1868,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         const r = await fetch('/api/realtime-token', {
           method: 'POST',
           headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-          body: '{}',
+          body: JSON.stringify({ mode: mode || 'morning' }),
         });
         if (!r.ok) throw new Error(await r.text());
         const d = await r.json();
@@ -1905,8 +1907,18 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       _RT.dc = _RT.pc.createDataChannel('oai-events');
       _RT.dc.onopen = () => {
         setOrbState('listening');
+        _RT.lastAudioTs = Date.now();
         _RT.sessionStart = Date.now();
         startSessionTimer();
+        _RT.idleTimer = setInterval(() => {
+          if (Date.now() - _RT.lastAudioTs > 40000) {
+            const s = document.getElementById('voice-status-text');
+            if (s) s.textContent = 'ended (idle)';
+            const t = document.getElementById('voice-state-text');
+            if (t) t.textContent = '';
+            setTimeout(() => stopRealtime(), 1800);
+          }
+        }, 10000);
       };
       _RT.dc.onmessage = (e) => { try { handleRealtimeEvent(JSON.parse(e.data)); } catch {} };
       _RT.dc.onclose = () => setOrbState('idle');
@@ -1929,8 +1941,8 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
     function handleRealtimeEvent(evt) {
       switch (evt.type) {
-        case 'input_audio_buffer.speech_started':   setOrbState('listening'); break;
-        case 'response.audio.delta':                setOrbState('speaking');  break;
+        case 'input_audio_buffer.speech_started':   _RT.lastAudioTs = Date.now(); setOrbState('listening'); break;
+        case 'response.audio.delta':                _RT.lastAudioTs = Date.now(); setOrbState('speaking');  break;
         case 'response.audio.done':                 setOrbState('listening'); break;
         case 'response.function_call_arguments.done':
           setOrbState('thinking');
@@ -1973,6 +1985,12 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
             _RT.pendingDispatch = null;
             result = d.reply || "Running.";
           }
+        } else if (name === 'lock_tomorrow_plan') {
+          const r = await fetch('/api/lock-plan', {
+            method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: '{}',
+          });
+          result = r.ok ? 'Plan locked. Tomorrow is set.' : 'Failed to lock: ' + (await r.text());
         }
       } catch (e) { result = 'Error: ' + e.message; }
       sendRT({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: callId, output: result } });
@@ -1981,6 +1999,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     }
 
     function stopRealtime() {
+      if (_RT.idleTimer)     { clearInterval(_RT.idleTimer);     _RT.idleTimer = null; }
       if (_RT.timerInterval) { clearInterval(_RT.timerInterval); _RT.timerInterval = null; }
       if (_RT.dc)     { try { _RT.dc.close();  } catch {} _RT.dc = null; }
       if (_RT.pc)     { try { _RT.pc.close();  } catch {} _RT.pc = null; }
@@ -2123,54 +2142,79 @@ fn read_brief_context() -> String {
     ctx
 }
 
-fn realtime_session_body(brief_ctx: &str) -> serde_json::Value {
-    let instructions = format!(
-        "You are Jarvis, Connor's sharp chief of staff and AI operating partner. \
+fn realtime_session_body(brief_ctx: &str, mode: &str) -> serde_json::Value {
+    let instructions = match mode {
+        "morning" => format!(
+            "It's morning. Tell Connor what to work on today and WHY, fold in insights from \
+his recovery and locked plan, react to what he's done, and name the highest-leverage move. \
+Warm, sharp, no em dashes.\n\n{brief_ctx}"
+        ),
+        "night" => format!(
+            "It's night. Be Connor's planning partner: ask sharp questions, push him to decide \
+tomorrow's one big rock and commitments, then when it's set, lock it in with lock_tomorrow_plan. \
+No em dashes.\n\n{brief_ctx}"
+        ),
+        _ => format!(
+            "You are Jarvis, Connor's sharp chief of staff and AI operating partner. \
 Warm, decisive, concise. No em dashes. No bullet walls. Short punchy sentences. \
 You know Connor's day cold and can dispatch coding agents to his projects.\n\n\
 ALWAYS confirm before calling launch_dispatch. Say exactly what you will do and \
 wait for a clear go before launching. Drafting is cheap; launching spends real money \
 and writes real code.\n\n{brief_ctx}"
-    );
+        ),
+    };
+
+    let base_tools = serde_json::json!([
+        {
+            "type": "function",
+            "name": "get_brief",
+            "description": "Return today's morning brief and tomorrow's plan as text.",
+            "parameters": { "type": "object", "properties": {} }
+        },
+        {
+            "type": "function",
+            "name": "draft_dispatch",
+            "description": "Draft an autonomous agent coding task for one of Connor's repos. Returns a plan summary. Always call this before launch_dispatch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "Concrete coding task for the agent to implement" }
+                },
+                "required": ["task"]
+            }
+        },
+        {
+            "type": "function",
+            "name": "launch_dispatch",
+            "description": "Arm and run the previously drafted plan. Only call after Connor explicitly says go.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    ]);
+
+    let mut tools = base_tools.as_array().cloned().unwrap_or_default();
+    if mode == "night" {
+        tools.push(serde_json::json!({
+            "type": "function",
+            "name": "lock_tomorrow_plan",
+            "description": "Lock and save tomorrow's plan once Connor confirms it's ready. Call this when Connor says to lock it in.",
+            "parameters": { "type": "object", "properties": {} }
+        }));
+    }
+
     serde_json::json!({
         "session": {
             "type": "realtime",
             "model": "gpt-4o-mini-realtime-preview",
             "audio": { "output": { "voice": "ash" } },
             "instructions": instructions,
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "get_brief",
-                    "description": "Return today's morning brief and tomorrow's plan as text.",
-                    "parameters": { "type": "object", "properties": {} }
-                },
-                {
-                    "type": "function",
-                    "name": "draft_dispatch",
-                    "description": "Draft an autonomous agent coding task for one of Connor's repos. Returns a plan summary. Always call this before launch_dispatch.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "task": { "type": "string", "description": "Concrete coding task for the agent to implement" }
-                        },
-                        "required": ["task"]
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "launch_dispatch",
-                    "description": "Arm and run the previously drafted plan. Only call after Connor explicitly says go.",
-                    "parameters": { "type": "object", "properties": {} }
-                }
-            ],
+            "tools": tools,
             "tool_choice": "auto"
         }
     })
 }
 
-fn call_openai_realtime_session(api_key: &str, brief_ctx: &str) -> Result<serde_json::Value, String> {
-    let body = realtime_session_body(brief_ctx);
+fn call_openai_realtime_session(api_key: &str, brief_ctx: &str, mode: &str) -> Result<serde_json::Value, String> {
+    let body = realtime_session_body(brief_ctx, mode);
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post("https://api.openai.com/v1/realtime/client_secrets")
@@ -2207,10 +2251,11 @@ fn extract_realtime_token_response(raw: serde_json::Value) -> String {
 }
 
 #[tauri::command]
-pub async fn get_realtime_token() -> Result<serde_json::Value, String> {
+pub async fn get_realtime_token(mode: Option<String>) -> Result<serde_json::Value, String> {
+    let mode = mode.as_deref().unwrap_or("general");
     let api_key = openai_api_key().ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
     let brief_ctx = read_brief_context();
-    let body = realtime_session_body(&brief_ctx);
+    let body = realtime_session_body(&brief_ctx, mode);
     let client = reqwest::Client::new();
     let resp = client
         .post("https://api.openai.com/v1/realtime/client_secrets")
@@ -2328,6 +2373,15 @@ pub async fn tool_launch_dispatch(
         "It's running, plan {}. Results will land in the Agents view.",
         &plan_id[..plan_id.len().min(12)]
     ))
+}
+
+#[tauri::command]
+pub async fn tool_lock_tomorrow_plan(app: tauri::AppHandle) -> Result<String, String> {
+    let claude = claude_path(&app);
+    let now = chrono::Local::now().to_string();
+    tauri::async_runtime::spawn_blocking(move || crate::planning::run_lock_now(&claude, &now))
+        .await
+        .map_err(|e| format!("task panicked: {e}"))?
 }
 
 // Fallback: simple Jarvis chat completion for classic voice mode
@@ -2752,9 +2806,29 @@ pub fn start(app: tauri::AppHandle) {
                         Some(k) => k,
                         None => { respond(request, 500, "text/plain", "OPENAI_API_KEY not set".into()); continue; }
                     };
+                    let mut body_bytes = Vec::new();
+                    let _ = request.as_reader().read_to_end(&mut body_bytes);
+                    let mode = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                        .ok()
+                        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_else(|| "general".to_string());
                     let brief_ctx = read_brief_context();
-                    match call_openai_realtime_session(&api_key, &brief_ctx) {
+                    match call_openai_realtime_session(&api_key, &brief_ctx, &mode) {
                         Ok(session) => respond(request, 200, "application/json", extract_realtime_token_response(session)),
+                        Err(e) => respond(request, 500, "text/plain", e),
+                    }
+                }
+
+                "/api/lock-plan" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let claude = claude_path(&app);
+                    let now = chrono::Local::now().to_string();
+                    match crate::planning::run_lock_now(&claude, &now) {
+                        Ok(md) => respond(request, 200, "application/json",
+                            serde_json::json!({ "ok": true, "markdown": md }).to_string()),
                         Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }

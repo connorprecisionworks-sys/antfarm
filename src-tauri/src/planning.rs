@@ -141,6 +141,39 @@ fn lock_turn_core(
     crate::chat::run_headless(claude, args, brain)
 }
 
+// Public helper — wraps lock_turn_core + file write so the voice handler can call it.
+pub fn run_lock_now(claude: &str, now: &str) -> Result<String, String> {
+    let brain    = brain_path();
+    let date_key = today_key();
+    let tomorrow = tomorrow_key();
+    let (raw_md, new_sid) = lock_turn_core(claude, &brain, &date_key, now, &tomorrow)?;
+    if let Some(sid) = new_sid {
+        save_plan_session_id(&date_key, &sid);
+    }
+    if raw_md.is_empty() {
+        return Err("lock_tomorrow_plan: empty response from model".into());
+    }
+    let clean = raw_md
+        .trim()
+        .trim_start_matches("```markdown")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+    let locked_md = if let Some(nl) = clean.find('\n') {
+        format!("{} (LOCKED {}){}", &clean[..nl], now, &clean[nl..])
+    } else {
+        format!("{} (LOCKED {})", clean, now)
+    };
+    let active_dir = format!("{}/active", brain);
+    std::fs::create_dir_all(&active_dir)
+        .map_err(|e| format!("could not create active dir: {e}"))?;
+    let plan_path = format!("{}/tomorrow-plan.md", active_dir);
+    std::fs::write(&plan_path, &locked_md)
+        .map_err(|e| format!("failed to write tomorrow-plan.md: {e}"))?;
+    Ok(locked_md)
+}
+
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
