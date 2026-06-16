@@ -110,6 +110,142 @@ fn respond(request: tiny_http::Request, status: u16, content_type: &str, body: S
     request.respond(response).ok();
 }
 
+// ── OpenAI voice helpers ──────────────────────────────────────────────────────
+
+fn openai_api_key() -> Option<String> {
+    if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+        let k = k.trim().to_string();
+        if !k.is_empty() { return Some(k); }
+    }
+    // Fallback: ~/.antfarm/openai-key
+    if let Ok(k) = std::fs::read_to_string(home().join(".antfarm/openai-key")) {
+        let k = k.trim().to_string();
+        if !k.is_empty() { return Some(k); }
+    }
+    None
+}
+
+fn respond_binary(request: tiny_http::Request, status: u16, content_type: &str, body: Vec<u8>) {
+    let header = tiny_http::Header::from_bytes(b"Content-Type", content_type.as_bytes())
+        .unwrap_or_else(|_| {
+            tiny_http::Header::from_bytes(b"Content-Type", b"application/octet-stream").unwrap()
+        });
+    let response = tiny_http::Response::from_data(body)
+        .with_status_code(status)
+        .with_header(header);
+    request.respond(response).ok();
+}
+
+fn memmem_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() { return Some(0); }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+// Returns (audio_bytes, content_type) from a multipart/form-data body.
+fn parse_multipart_file(body: &[u8], content_type_header: &str) -> Option<(Vec<u8>, String)> {
+    let boundary = content_type_header.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string())
+    })?;
+
+    let bound_bytes = format!("--{}", boundary).into_bytes();
+    let start = memmem_find(body, &bound_bytes)?;
+    let after_bound = start + bound_bytes.len();
+
+    let header_start = if body.get(after_bound..after_bound + 2) == Some(b"\r\n") {
+        after_bound + 2
+    } else {
+        after_bound
+    };
+
+    let sep = b"\r\n\r\n";
+    let header_end_rel = memmem_find(&body[header_start..], sep)?;
+    let header_block = &body[header_start..header_start + header_end_rel];
+    let data_start = header_start + header_end_rel + 4;
+
+    let headers_str = String::from_utf8_lossy(header_block);
+    let file_content_type = headers_str.lines()
+        .find_map(|line| {
+            let lower = line.to_lowercase();
+            if lower.starts_with("content-type:") {
+                line.splitn(2, ':').nth(1).map(|v| v.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "audio/webm".to_string());
+
+    let end_marker = format!("\r\n--{}", boundary).into_bytes();
+    let data_end = memmem_find(&body[data_start..], &end_marker)
+        .map(|p| data_start + p)
+        .unwrap_or(body.len());
+
+    Some((body[data_start..data_end].to_vec(), file_content_type))
+}
+
+fn call_openai_stt(audio_bytes: Vec<u8>, audio_content_type: String, api_key: &str) -> Result<String, String> {
+    let ext = if audio_content_type.contains("webm") { "webm" }
+        else if audio_content_type.contains("mp4") || audio_content_type.contains("m4a") { "mp4" }
+        else if audio_content_type.contains("ogg") { "ogg" }
+        else if audio_content_type.contains("wav") { "wav" }
+        else if audio_content_type.contains("mpeg") || audio_content_type.contains("mp3") { "mp3" }
+        else { "webm" };
+
+    let part = reqwest::blocking::multipart::Part::bytes(audio_bytes)
+        .file_name(format!("audio.{ext}"))
+        .mime_str(&audio_content_type)
+        .map_err(|e| format!("mime error: {e}"))?;
+
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("model", "gpt-4o-mini-transcribe")
+        .part("file", part);
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("OpenAI STT request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("OpenAI STT HTTP {status}: {body}"));
+    }
+
+    let json: serde_json::Value = resp.json().map_err(|e| format!("STT JSON parse: {e}"))?;
+    Ok(json.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
+}
+
+const TTS_MAX_CHARS: usize = 4096;
+
+fn call_openai_tts(text: &str, api_key: &str) -> Result<Vec<u8>, String> {
+    let text = if text.len() > TTS_MAX_CHARS { &text[..TTS_MAX_CHARS] } else { text };
+    let body = serde_json::json!({
+        "model": "tts-1",
+        "voice": "alloy",
+        "input": text,
+        "response_format": "mp3",
+    });
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post("https://api.openai.com/v1/audio/speech")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("OpenAI TTS request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body_text = resp.text().unwrap_or_default();
+        return Err(format!("OpenAI TTS HTTP {status}: {body_text}"));
+    }
+
+    resp.bytes().map(|b| b.to_vec()).map_err(|e| format!("TTS read bytes: {e}"))
+}
+
 fn claude_path(app: &tauri::AppHandle) -> String {
     let dispatch: tauri::State<crate::dispatch::DispatchState> = app.state();
     let p = dispatch.claude_path.lock().unwrap().clone();
@@ -350,6 +486,19 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       cursor: pointer; flex-shrink: 0; -webkit-tap-highlight-color: transparent;
     }
     #chat-send-btn:disabled { background: #1c1c1f; color: #3f3f46; cursor: default; }
+    #mic-btn {
+      width: 36px; height: 36px; border: none; border-radius: 10px;
+      background: #27272a; color: #71717a;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; flex-shrink: 0; -webkit-tap-highlight-color: transparent;
+      transition: background 0.15s, color 0.15s;
+    }
+    #mic-btn.recording { background: #7f1d1d; color: #fca5a5; animation: micPulse 1s ease-in-out infinite; }
+    #mic-btn.transcribing { background: #1e3a5f; color: #7dd3fc; }
+    #mic-btn.speaking { background: #14532d; color: #86efac; }
+    #voice-state-row { padding: 0 14px 4px; }
+    #voice-state-label { font-size: 10px; color: #52525b; letter-spacing: 0.04em; }
+    @keyframes micPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 
     /* ── Agents view ── */
     #view-agents { overflow-y: auto; padding-bottom: env(safe-area-inset-bottom); }
@@ -501,10 +650,14 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         <div id="chat-input-row">
           <input id="chat-input" type="text" placeholder="Ask Jarvis..."
             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}">
+          <button id="mic-btn" onclick="toggleMic()" title="Voice input" style="display:none">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="21" x2="12" y2="17"/></svg>
+          </button>
           <button id="chat-send-btn" onclick="sendChat()" disabled>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
         </div>
+        <div id="voice-state-row"><span id="voice-state-label"></span></div>
       </div>
     </div>
   </div>
@@ -1294,8 +1447,158 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       } catch (e) { alert('Error: ' + e.message); }
     }
 
+    // ── Voice (Press-to-Talk) ─────────────────────────────────────────────────
+
+    let _voiceState = 'idle'; // 'idle' | 'recording' | 'transcribing' | 'speaking'
+    let _mediaRecorder = null;
+    let _audioChunks = [];
+    let _currentAudio = null;
+
+    function setVoiceState(state) {
+      _voiceState = state;
+      const btn = document.getElementById('mic-btn');
+      const lbl = document.getElementById('voice-state-label');
+      if (!btn) return;
+      btn.classList.remove('recording', 'transcribing', 'speaking');
+      if (state === 'recording') {
+        btn.classList.add('recording');
+        if (lbl) lbl.textContent = 'recording…';
+      } else if (state === 'transcribing') {
+        btn.classList.add('transcribing');
+        if (lbl) lbl.textContent = 'transcribing…';
+      } else if (state === 'speaking') {
+        btn.classList.add('speaking');
+        if (lbl) lbl.textContent = 'speaking…';
+      } else {
+        if (lbl) lbl.textContent = '';
+      }
+    }
+
+    function initVoice() {
+      if (!window.MediaRecorder || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+      const btn = document.getElementById('mic-btn');
+      if (btn) btn.style.display = 'flex';
+    }
+
+    async function toggleMic() {
+      if (_voiceState === 'speaking') { stopVoicePlayback(); return; }
+      if (_voiceState === 'transcribing') return;
+      if (_voiceState === 'recording') { if (_mediaRecorder) _mediaRecorder.stop(); return; }
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (_) {
+        const lbl = document.getElementById('voice-state-label');
+        if (lbl) { lbl.textContent = 'mic denied — type instead'; setTimeout(() => { lbl.textContent = ''; }, 3000); }
+        return;
+      }
+
+      _audioChunks = [];
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
+      _mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      _mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) _audioChunks.push(e.data); };
+      _mediaRecorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        handleRecordingDone();
+      };
+      _mediaRecorder.start();
+      setVoiceState('recording');
+    }
+
+    async function handleRecordingDone() {
+      setVoiceState('transcribing');
+      const mimeType = (_audioChunks[0] && _audioChunks[0].type) || 'audio/webm';
+      const blob = new Blob(_audioChunks, { type: mimeType });
+      _audioChunks = [];
+
+      let transcript = '';
+      try {
+        const fd = new FormData();
+        fd.append('file', blob, 'audio.webm');
+        const r = await fetch('/api/stt', { method: 'POST', headers: authHeaders(), body: fd });
+        if (!r.ok) throw new Error(await r.text());
+        transcript = ((await r.json()).text || '').trim();
+      } catch (e) {
+        setVoiceState('idle');
+        const lbl = document.getElementById('voice-state-label');
+        if (lbl) { lbl.textContent = 'transcription failed'; setTimeout(() => { lbl.textContent = ''; }, 3000); }
+        return;
+      }
+
+      if (!transcript) { setVoiceState('idle'); return; }
+
+      // Put in input box for visibility then send
+      const inp = document.getElementById('chat-input');
+      if (inp) inp.value = transcript;
+      setVoiceState('idle');
+      await sendChatVoice(transcript);
+    }
+
+    async function sendChatVoice(text) {
+      if (!text.trim() || CHAT_THINKING || !BRIEFING_JSON) return;
+      if (!CHAT_OPEN) toggleChat();
+      const inp = document.getElementById('chat-input');
+      if (inp) inp.value = '';
+
+      CHAT_MSGS.push({ role: 'user', text });
+      CHAT_THINKING = true;
+      renderChat();
+
+      let replyText = '';
+      try {
+        const r = await fetch('/api/morning-chat', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, now: new Date().toLocaleString(), dateKey: DATE_KEY, briefingJson: BRIEFING_JSON }),
+        });
+        replyText = await r.text();
+        if (!r.ok) throw new Error(replyText || 'HTTP ' + r.status);
+        CHAT_MSGS.push({ role: 'agent', text: replyText });
+      } catch (e) {
+        CHAT_MSGS.push({ role: 'error', text: e.message });
+        CHAT_THINKING = false;
+        renderChat();
+        return;
+      }
+      CHAT_THINKING = false;
+      renderChat();
+
+      if (replyText) await playVoiceTTS(replyText);
+    }
+
+    async function playVoiceTTS(text) {
+      setVoiceState('speaking');
+      try {
+        const r = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const url = URL.createObjectURL(await r.blob());
+        _currentAudio = new Audio(url);
+        _currentAudio.onended = () => { URL.revokeObjectURL(url); _currentAudio = null; setVoiceState('idle'); };
+        _currentAudio.onerror = () => { URL.revokeObjectURL(url); _currentAudio = null; setVoiceState('idle'); };
+        _currentAudio.play();
+      } catch (_) { setVoiceState('idle'); }
+    }
+
+    function stopVoicePlayback() {
+      if (_currentAudio) { _currentAudio.pause(); _currentAudio = null; }
+      setVoiceState('idle');
+    }
+
+    // Tap anywhere outside mic button to stop playback
+    document.addEventListener('click', function(e) {
+      if (_voiceState !== 'speaking') return;
+      const btn = document.getElementById('mic-btn');
+      if (!btn || !btn.contains(e.target)) stopVoicePlayback();
+    }, true);
+
     // ── Init ──────────────────────────────────────────────────────────────────
     loadMorning();
+    initVoice();
     // agents view polls lazily (only starts when switched to)
     // but keep background poll running for badge-style awareness
     setInterval(() => {
@@ -1547,6 +1850,61 @@ pub fn start(app: tauri::AppHandle) {
                     match crate::morning::refresh_whoop_blocking() {
                         Ok(msg) => respond(request, 200, "text/plain", msg),
                         Err(e)  => respond(request, 500, "text/plain", e),
+                    }
+                }
+
+                // ── Voice endpoints ──────────────────────────────────────────
+
+                "/api/stt" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let api_key = match openai_api_key() {
+                        Some(k) => k,
+                        None => { respond(request, 500, "text/plain", "OPENAI_API_KEY not set".into()); continue; }
+                    };
+                    let content_type_hdr = request.headers().iter()
+                        .find(|h| h.field.equiv("content-type"))
+                        .map(|h| h.value.as_str().to_string())
+                        .unwrap_or_default();
+                    let mut body_bytes = Vec::new();
+                    let _ = request.as_reader().read_to_end(&mut body_bytes);
+                    match parse_multipart_file(&body_bytes, &content_type_hdr) {
+                        None => { respond(request, 400, "text/plain", "could not parse multipart audio".into()); }
+                        Some((audio_bytes, audio_ct)) => {
+                            match call_openai_stt(audio_bytes, audio_ct, &api_key) {
+                                Ok(text) => {
+                                    let json = serde_json::json!({ "text": text }).to_string();
+                                    respond(request, 200, "application/json", json);
+                                }
+                                Err(e) => respond(request, 500, "text/plain", e),
+                            }
+                        }
+                    }
+                }
+
+                "/api/tts" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    if *request.method() != tiny_http::Method::Post {
+                        respond(request, 405, "text/plain", "405 Method Not Allowed".into()); continue;
+                    }
+                    let api_key = match openai_api_key() {
+                        Some(k) => k,
+                        None => { respond(request, 500, "text/plain", "OPENAI_API_KEY not set".into()); continue; }
+                    };
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let text = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    if text.trim().is_empty() {
+                        respond(request, 400, "text/plain", "missing text".into()); continue;
+                    }
+                    match call_openai_tts(&text, &api_key) {
+                        Ok(mp3_bytes) => respond_binary(request, 200, "audio/mpeg", mp3_bytes),
+                        Err(e) => respond(request, 500, "text/plain", e),
                     }
                 }
 
