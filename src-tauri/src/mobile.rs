@@ -253,7 +253,7 @@ fn call_openai_tts(text: &str, voice: &str, api_key: &str) -> Result<Vec<u8>, St
 
 // ── Dispatch state helpers ────────────────────────────────────────────────────
 
-struct PendingIntent {
+pub(crate) struct PendingIntent {
     task: String,
     project_slug: String,
 }
@@ -2220,6 +2220,91 @@ pub async fn get_realtime_token() -> Result<serde_json::Value, String> {
     }
     resp.json::<serde_json::Value>().await
         .map_err(|e| format!("parse realtime session: {e}"))
+}
+
+// ── Voice tool call handlers (Tauri commands for desktop VoiceMode) ──────────
+
+#[derive(Default)]
+pub struct VoicePendingState {
+    pub intent: std::sync::Mutex<Option<PendingIntent>>,
+}
+
+fn brief_json_for_assistant() -> String {
+    let brain = brain_path();
+    let cache_path = format!("{}/active/today-brief.json", brain);
+    std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("briefing").map(|b| b.to_string()))
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+#[tauri::command]
+pub fn tool_get_brief() -> String {
+    read_brief_context()
+}
+
+#[tauri::command]
+pub async fn tool_draft_dispatch(
+    app: tauri::AppHandle,
+    voice_pending: tauri::State<'_, VoicePendingState>,
+    task: String,
+) -> Result<String, String> {
+    let claude = claude_path(&app);
+    let brain  = brain_path();
+    let date_key = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now = chrono::Local::now().to_string();
+    let briefing_json = brief_json_for_assistant();
+    let slugs = project_slugs_for_prompt();
+    match crate::morning::assistant_chat_turn(&claude, &brain, &date_key, &briefing_json, &task, &now, &slugs) {
+        Err(e) => Err(e),
+        Ok((reply, _sid)) => match reply {
+            crate::morning::AssistantReply::Chat(text) => Ok(text),
+            crate::morning::AssistantReply::Dispatch(intent) => {
+                let project_name = crate::list_projects_pub().into_iter()
+                    .find(|p| p.slug == intent.project_slug)
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| intent.project_slug.clone());
+                *voice_pending.intent.lock().unwrap() = Some(PendingIntent {
+                    task: intent.task,
+                    project_slug: intent.project_slug,
+                });
+                Ok(format!(
+                    "Plan drafted for {}. Say go to launch, or cancel to drop it.",
+                    project_name
+                ))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn tool_launch_dispatch(
+    app: tauri::AppHandle,
+    voice_pending: tauri::State<'_, VoicePendingState>,
+) -> Result<String, String> {
+    let (task, slug) = {
+        let mut guard = voice_pending.intent.lock().unwrap();
+        match guard.take() {
+            None => return Ok("No plan pending. Draft one first with draft_dispatch.".to_string()),
+            Some(pi) => (pi.task, pi.project_slug),
+        }
+    };
+    let paths = crate::get_project_paths_pub(slug.clone());
+    let project_path = paths.into_iter().map(|r| r.path).next().unwrap_or_default();
+    if project_path.is_empty() {
+        return Err(format!("No repo path for project {slug}. Check registry."));
+    }
+    let claude = claude_path(&app);
+    let authored = crate::harness::author_plan_core(claude.clone(), task, project_path)?;
+    let harness: tauri::State<crate::harness::HarnessState> = app.state();
+    let aborts = harness.aborts.clone();
+    drop(harness);
+    let plan_id = crate::harness::arm_plan_from_path(app.clone(), claude, aborts, authored.plan_path)?;
+    Ok(format!(
+        "It's running, plan {}. Results will land in the Agents view.",
+        &plan_id[..plan_id.len().min(12)]
+    ))
 }
 
 // ── Desktop Tauri voice commands ─────────────────────────────────────────────

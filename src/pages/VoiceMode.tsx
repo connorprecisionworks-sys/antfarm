@@ -7,7 +7,7 @@ const COST_PER_MIN = 0.084;
 
 type OrbState = "idle" | "connecting" | "listening" | "thinking" | "speaking";
 
-interface RealtimeSession {
+interface RealtimeTokenResponse {
   token: string;
   model: string;
   session_id: string;
@@ -27,7 +27,6 @@ export function VoiceMode() {
   const orbRafRef   = useRef<number | null>(null);
   const timerRef    = useRef<number | null>(null);
   const sessionStartRef = useRef<number | null>(null);
-  const pendingDispatchRef = useRef<unknown>(null);
   const orbStateRef = useRef<OrbState>("idle");
 
   const [orbState, setOrbStateReact] = useState<OrbState>("idle");
@@ -135,44 +134,11 @@ export function VoiceMode() {
     let result = "ok";
     try {
       if (name === "get_brief") {
-        // Return context already injected in session instructions
-        result = "Brief context already loaded in session instructions.";
+        result = await invoke<string>("tool_get_brief");
       } else if (name === "draft_dispatch") {
-        const session = await invoke<RealtimeSession>("get_realtime_token");
-        // Use the local HTTP server for the assistant endpoint
-        const r = await fetch("http://127.0.0.1:8787/api/assistant", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            // Pass no auth token — Tauri desktop app is trusted
-          },
-          body: JSON.stringify({ message: args.task || "", now: new Date().toLocaleString(), dateKey: new Date().toISOString().slice(0, 10), briefingJson: "{}" }),
-        }).catch(() => null);
-        if (r && r.ok) {
-          const d = await r.json();
-          pendingDispatchRef.current = d;
-          result = d.reply || "Plan drafted.";
-        } else {
-          result = "Could not reach assistant endpoint.";
-        }
-        void session; // ephemeral token not needed here, just for type checking
+        result = await invoke<string>("tool_draft_dispatch", { task: args.task || "" });
       } else if (name === "launch_dispatch") {
-        if (!pendingDispatchRef.current) {
-          result = "No plan drafted yet. Use draft_dispatch first.";
-        } else {
-          const r = await fetch("http://127.0.0.1:8787/api/assistant", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: "go", now: new Date().toLocaleString(), dateKey: new Date().toISOString().slice(0, 10), briefingJson: "{}" }),
-          }).catch(() => null);
-          if (r && r.ok) {
-            const d = await r.json();
-            pendingDispatchRef.current = null;
-            result = d.reply || "Running.";
-          } else {
-            result = "Could not reach assistant endpoint.";
-          }
-        }
+        result = await invoke<string>("tool_launch_dispatch");
       }
     } catch (e) { result = "Error: " + String(e); }
     sendRT({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output: result } });
@@ -210,9 +176,9 @@ export function VoiceMode() {
     setOrbState("connecting");
     startOrb();
 
-    let session: RealtimeSession;
+    let session: RealtimeTokenResponse;
     try {
-      session = await invoke<RealtimeSession>("get_realtime_token");
+      session = await invoke<RealtimeTokenResponse>("get_realtime_token");
     } catch (e) {
       setOrbState("idle");
       setError("Token failed: " + String(e));
@@ -294,7 +260,7 @@ export function VoiceMode() {
     if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch {} audioCtxRef.current = null; }
     micAnRef.current = null; outAnRef.current = null;
     micBufRef.current = null; outBufRef.current = null;
-    sessionStartRef.current = null; pendingDispatchRef.current = null;
+    sessionStartRef.current = null;
     setOrbState("idle"); setElapsed(""); setCost("");
     stopOrb();
   }, [stopOrb]);

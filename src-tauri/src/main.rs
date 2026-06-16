@@ -1895,6 +1895,7 @@ fn main() {
         .manage(dispatch_state)
         .manage(harness_state)
         .manage(pty_state)
+        .manage(mobile::VoicePendingState::default())
         .setup(move |app| {
             // Mark any step/run left "running" from a prior crash as interrupted.
             harness::reconcile_orphans();
@@ -1967,6 +1968,9 @@ fn main() {
             mobile::voice_stt,
             mobile::voice_tts,
             mobile::get_realtime_token,
+            mobile::tool_get_brief,
+            mobile::tool_draft_dispatch,
+            mobile::tool_launch_dispatch,
             planning::plan_chat_send,
             planning::lock_tomorrow_plan,
             planning::get_tomorrow_plan,
