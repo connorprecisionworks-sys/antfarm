@@ -1014,6 +1014,94 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
   );
 }
 
+// ── Instant-shell helpers ─────────────────────────────────────────────────────
+
+interface WhoopRaw {
+  recovery_pct?: number;
+  hrv_ms?: number;
+  resting_hr?: number;
+  sleep_total_hours?: number;
+  sleep_performance_pct?: number;
+  day_strain?: number;
+}
+
+function InstantDateGreeting() {
+  const now = new Date();
+  const h = now.getHours();
+  const greeting = h < 12 ? "Good morning." : h < 17 ? "Good afternoon." : "Good evening.";
+  const label = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+  return (
+    <div>
+      <p className="text-[11px] font-medium text-zinc-500 uppercase tracking-widest">{label}</p>
+      <h2 className="text-xl font-semibold text-zinc-100 mt-1">{greeting}</h2>
+    </div>
+  );
+}
+
+function WhoopRawCard({ whoop }: { whoop: WhoopRaw }) {
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+      <div className="flex items-start gap-5">
+        <RecoveryRing pct={whoop.recovery_pct ?? 0} />
+        <div className="flex-1 space-y-3">
+          <div className="grid grid-cols-4 gap-2">
+            {[
+              { label: "Sleep",  value: `${whoop.sleep_total_hours ?? 0}h · ${whoop.sleep_performance_pct ?? 0}%` },
+              { label: "HRV",    value: `${whoop.hrv_ms ?? 0}ms` },
+              { label: "RHR",    value: `${whoop.resting_hr ?? 0}bpm` },
+              { label: "Strain", value: String(whoop.day_strain ?? 0) },
+            ].map(({ label, value }) => (
+              <div key={label} className="rounded-lg bg-zinc-800/60 px-2.5 py-2">
+                <p className="text-[10px] text-zinc-500 uppercase tracking-wider">{label}</p>
+                <p className="text-xs font-semibold text-zinc-200 mt-0.5 tabular-nums">{value}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlanSummaryCard({ markdown }: { markdown: string }) {
+  const lines = markdown.split("\n").filter(l => l.trim() && !l.startsWith("#")).slice(0, 6);
+  if (!lines.length) return null;
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3">
+      <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">Today's plan</p>
+      <div className="space-y-1">
+        {lines.map((l, i) => (
+          <p key={i} className="text-xs text-zinc-400 leading-relaxed">{l.replace(/^[-*]\s*/, "")}</p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BriefingSkeleton() {
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 space-y-2.5">
+        <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Briefing</p>
+        {[75, 50, 62].map((w, i) => (
+          <div key={i} className="h-2.5 bg-zinc-800 rounded animate-pulse" style={{ width: `${w}%` }} />
+        ))}
+      </div>
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
+        <div className="px-4 pt-3 pb-2">
+          <p className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">The Plan</p>
+        </div>
+        {[1, 2, 3].map((i) => (
+          <div key={i} className="px-4 py-3 border-t border-zinc-800/50 flex items-center gap-3">
+            <div className="w-4 h-4 rounded bg-zinc-800 animate-pulse shrink-0" />
+            <div className="h-2.5 bg-zinc-800 rounded animate-pulse flex-1" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Page root ─────────────────────────────────────────────────────────────────
 
 type Phase =
@@ -1033,6 +1121,12 @@ export function Morning() {
   const [briefingJson, setBriefingJson] = useState<string>("");
   const [whoopState, setWhoopState]     = useState<WhoopState>("idle");
   const [showPlanNudge, setShowPlanNudge] = useState(false);
+  // Instant-shell state (no LLM)
+  const [whoopRaw, setWhoopRaw]         = useState<WhoopRaw | null>(null);
+  const [planMd, setPlanMd]             = useState<string | null>(null);
+  // Routine state hoisted for instant-shell rendering during cold cache
+  const [instRoutineItems, setInstRoutineItems]   = useState<string[]>(() => loadRoutineItems());
+  const [instRoutineChecks, setInstRoutineChecks] = useState<Set<string>>(() => loadRoutineChecks(new Date().toISOString().slice(0, 10)));
   const navigate = useNavigate();
 
   const dateKey = useMemo(() => new Date().toISOString().slice(0, 10), []);
@@ -1076,12 +1170,33 @@ export function Morning() {
       .catch((e) => setPhase({ kind: "error", message: String(e) }));
   }
 
-  // Mount: fire-and-forget whoop refresh, read from cache (no force)
+  // Mount: instant-shell data + stale-while-revalidate briefing
   useEffect(() => {
     invoke("refresh_whoop").catch(() => {});
-    setPhase({ kind: "loading" });
     setDone(new Set());
-    generate(false);
+    // Kick zero-LLM reads in parallel
+    invoke<WhoopRaw | null>("get_whoop_today").then((w) => { if (w) setWhoopRaw(w); }).catch(() => {});
+    invoke<{ locked: boolean; markdown: string }>("get_tomorrow_plan").then((p) => { if (p.markdown) setPlanMd(p.markdown); }).catch(() => {});
+    // Cache-first: render stale if today's briefing exists, then background-refresh
+    invoke<string>("get_morning_cache")
+      .then((cached) => {
+        if (cached) {
+          const b = parseBriefing(cached);
+          if (b) {
+            setBriefingJson(JSON.stringify(b));
+            setPhase({ kind: "done", briefing: b });
+            generate(false); // background refresh — swaps in fresh data when done
+            return;
+          }
+        }
+        // Cold cache: show instant shell + skeleton, wait for LLM
+        setPhase({ kind: "loading" });
+        generate(false);
+      })
+      .catch(() => {
+        setPhase({ kind: "loading" });
+        generate(false);
+      });
   }, []);
 
   // Explicit refresh: wait for fresh Whoop data, then force-regenerate
@@ -1107,9 +1222,6 @@ export function Morning() {
   }
 
   const isLoading = phase.kind === "loading";
-  const loadingLabel = phase.kind === "loading"
-    ? (phase.label ?? "Pulling your Whoop and your day...")
-    : "";
 
   return (
     <div className="h-full flex flex-col">
@@ -1129,7 +1241,7 @@ export function Morning() {
           {/* Whoop refresh button */}
           <button
             onClick={refreshWhoop}
-            disabled={whoopState === "loading" || isLoading}
+            disabled={whoopState === "loading"}
             className="flex items-center gap-1.5 text-xs text-zinc-600 hover:text-zinc-400 disabled:opacity-30 transition-colors"
             title="Refresh Whoop data"
           >
@@ -1167,11 +1279,21 @@ export function Morning() {
       {/* Cards area */}
       <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
         {isLoading && (
-          <div className="flex flex-col items-center justify-center h-full gap-4 text-zinc-400">
-            <svg className="animate-spin" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-            </svg>
-            <p className="text-sm">{loadingLabel}</p>
+          <div className="max-w-2xl mx-auto space-y-4">
+            <InstantDateGreeting />
+            {whoopRaw
+              ? <WhoopRawCard whoop={whoopRaw} />
+              : <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 h-24 animate-pulse" />
+            }
+            <RoutineChecklist
+              items={instRoutineItems}
+              onItemsChange={setInstRoutineItems}
+              checks={instRoutineChecks}
+              onChecksChange={setInstRoutineChecks}
+              dateKey={dateKey}
+            />
+            {planMd && <PlanSummaryCard markdown={planMd} />}
+            <BriefingSkeleton />
           </div>
         )}
 

@@ -2463,6 +2463,8 @@ fn main() {
             mobile::voice_tts,
             mobile::get_realtime_token,
             mobile::append_voice_log,
+            morning::get_morning_cache,
+            morning::get_whoop_today,
             mobile::tool_get_brief,
             mobile::tool_draft_dispatch,
             mobile::tool_launch_dispatch,

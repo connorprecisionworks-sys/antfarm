@@ -195,6 +195,43 @@ pub(crate) fn run_morning(brain: String, claude: String, now: String, force: boo
     Ok(result_text)
 }
 
+// ── Fast cache readers (no LLM, no blocking) ─────────────────────────────────
+
+#[tauri::command]
+pub fn get_morning_cache() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let brain = format!("{}/Desktop/CD_claude", home);
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let cache_path = format!("{}/active/today-brief.json", brain);
+    if let Ok(raw) = std::fs::read_to_string(&cache_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if v.get("date").and_then(|x| x.as_str()) == Some(today.as_str()) {
+                if let Some(briefing) = v.get("briefing") {
+                    return briefing.to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+#[tauri::command]
+pub fn get_whoop_today() -> serde_json::Value {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let brain = format!("{}/Desktop/CD_claude", home);
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let path = format!("{}/active/whoop-today.json", brain);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let fetched = v.get("fetched_at").and_then(|x| x.as_str()).unwrap_or("");
+            if fetched.starts_with(&today) {
+                return v;
+            }
+        }
+    }
+    serde_json::Value::Null
+}
+
 // ── Whoop refresh (decoupled from briefing generation) ────────────────────────
 
 #[tauri::command]

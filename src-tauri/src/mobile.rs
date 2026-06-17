@@ -1141,53 +1141,112 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
 
     function loadMorning() {
       const content = document.getElementById('morning-content');
-      content.style.display = 'none';
-      content.innerHTML = '';
-
       if (_activeLoader) { _activeLoader.destroy(); _activeLoader = null; }
-
       _morningErr = null;
       _morningNeedsPlan = false;
       const callId = ++_morningCallId;
 
       fetch('/api/refresh-whoop', { method: 'POST', headers: authHeaders() }).catch(() => {});
 
-      const wrap = document.getElementById('morning-loader-wrap');
-      wrap.innerHTML = '';
-      const loader = MorningLoader.mount(wrap, function() {
-        _activeLoader = null;
-        if (callId !== _morningCallId) return;
-        if (_morningErr) {
-          showMorningError(_morningErr);
-        } else if (_morningNeedsPlan) {
-          showMorningNeedsPlan();
-        } else {
-          renderBriefing(BRIEFING);
-          document.getElementById('chat-send-btn').disabled = false;
-          loadInsight();
-        }
-      });
-      _activeLoader = loader;
+      // Step 1: try stale cache — render immediately if today's briefing exists
+      fetch('/api/morning-cache', { headers: authHeaders() })
+        .then(r => r.text())
+        .then(cached => {
+          if (callId !== _morningCallId) return;
+          const stale = cached ? parseBriefing(cached) : null;
+          if (stale) {
+            BRIEFING = stale;
+            BRIEFING_JSON = JSON.stringify(stale);
+            renderBriefing(stale);
+            content.style.display = 'block';
+            document.getElementById('morning-loader-wrap').innerHTML = '';
+            document.getElementById('chat-send-btn').disabled = false;
+            loadInsight();
+          } else {
+            // Cold cache: show particle loader while LLM runs
+            content.style.display = 'none';
+            content.innerHTML = '';
+            const wrap = document.getElementById('morning-loader-wrap');
+            wrap.innerHTML = '';
+            const loader = MorningLoader.mount(wrap, function() {
+              _activeLoader = null;
+              if (callId !== _morningCallId) return;
+              if (_morningErr) { showMorningError(_morningErr); }
+              else if (_morningNeedsPlan) { showMorningNeedsPlan(); }
+              else {
+                renderBriefing(BRIEFING);
+                content.style.display = 'block';
+                document.getElementById('chat-send-btn').disabled = false;
+                loadInsight();
+              }
+            });
+            _activeLoader = loader;
+          }
 
-      const now = encodeURIComponent(new Date().toLocaleString());
-      fetch('/api/morning?now=' + now, { headers: authHeaders() })
-        .then(r => r.text().then(text => {
+          // Step 2: always background-refresh (updates stale or fulfills cold)
+          const now = encodeURIComponent(new Date().toLocaleString());
+          fetch('/api/morning?now=' + now, { headers: authHeaders() })
+            .then(r => r.text().then(text => {
+              if (callId !== _morningCallId) return;
+              if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
+              try {
+                const quick = JSON.parse(text);
+                if (quick && quick.needs_plan) {
+                  _morningNeedsPlan = true;
+                  if (_activeLoader) { _activeLoader.finish(); } else { showMorningNeedsPlan(); }
+                  return;
+                }
+              } catch {}
+              const b = parseBriefing(text);
+              if (!b) throw new Error('Could not parse briefing JSON');
+              BRIEFING = b; BRIEFING_JSON = JSON.stringify(b);
+              if (_activeLoader) {
+                _activeLoader.finish(); // cold cache path: loader finishes → renderBriefing
+              } else {
+                // stale path: swap in fresh content silently
+                renderBriefing(b);
+                loadInsight();
+              }
+            }))
+            .catch(e => {
+              if (callId !== _morningCallId) return;
+              _morningErr = e.message;
+              if (_activeLoader) { _activeLoader.finish(); }
+              else if (!BRIEFING) { showMorningError(e.message); }
+            });
+        })
+        .catch(() => {
+          // Cache endpoint failed: fall back to old path
           if (callId !== _morningCallId) return;
-          if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
-          try {
-            const quick = JSON.parse(text);
-            if (quick && quick.needs_plan) { _morningNeedsPlan = true; loader.finish(); return; }
-          } catch {}
-          const b = parseBriefing(text);
-          if (!b) throw new Error('Could not parse briefing JSON');
-          BRIEFING = b;
-          BRIEFING_JSON = JSON.stringify(b);
-          loader.finish();
-        }))
-        .catch(e => {
-          if (callId !== _morningCallId) return;
-          _morningErr = e.message;
-          loader.finish();
+          content.style.display = 'none';
+          content.innerHTML = '';
+          const wrap = document.getElementById('morning-loader-wrap');
+          wrap.innerHTML = '';
+          const loader = MorningLoader.mount(wrap, function() {
+            _activeLoader = null;
+            if (callId !== _morningCallId) return;
+            if (_morningErr) { showMorningError(_morningErr); }
+            else if (_morningNeedsPlan) { showMorningNeedsPlan(); }
+            else {
+              renderBriefing(BRIEFING);
+              content.style.display = 'block';
+              document.getElementById('chat-send-btn').disabled = false;
+              loadInsight();
+            }
+          });
+          _activeLoader = loader;
+          const now = encodeURIComponent(new Date().toLocaleString());
+          fetch('/api/morning?now=' + now, { headers: authHeaders() })
+            .then(r => r.text().then(text => {
+              if (callId !== _morningCallId) return;
+              if (!r.ok) throw new Error(text || 'HTTP ' + r.status);
+              try { const q = JSON.parse(text); if (q?.needs_plan) { _morningNeedsPlan = true; loader.finish(); return; } } catch {}
+              const b = parseBriefing(text);
+              if (!b) throw new Error('Could not parse briefing JSON');
+              BRIEFING = b; BRIEFING_JSON = JSON.stringify(b);
+              loader.finish();
+            }))
+            .catch(e => { if (callId !== _morningCallId) return; _morningErr = e.message; loader.finish(); });
         });
     }
 
@@ -2759,6 +2818,18 @@ pub fn start(app: tauri::AppHandle) {
                         Ok(msg) => respond(request, 200, "text/plain", msg),
                         Err(e)  => respond(request, 500, "text/plain", e),
                     }
+                }
+
+                "/api/morning-cache" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    let result = crate::morning::get_morning_cache();
+                    respond(request, 200, "text/plain; charset=utf-8", result)
+                }
+                "/api/whoop-today" => {
+                    if !auth { respond(request, 401, "text/plain", "401 Unauthorized".into()); continue; }
+                    let v = crate::morning::get_whoop_today();
+                    respond(request, 200, "application/json",
+                        if v.is_null() { "null".into() } else { v.to_string() })
                 }
 
                 // ── Assistant (dispatch-aware) endpoint ──────────────────────
