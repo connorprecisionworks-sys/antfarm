@@ -2354,6 +2354,20 @@ pub async fn get_realtime_token(mode: Option<String>) -> Result<serde_json::Valu
     Ok(serde_json::json!({ "token": token, "model": model, "session_id": session_id }))
 }
 
+// ── Voice debug log ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn append_voice_log(line: String) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = format!("{}/.antfarm", home);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{}/voice-debug.log", dir);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 // ── Voice tool call handlers (Tauri commands for desktop VoiceMode) ──────────
 
 #[derive(Default)]

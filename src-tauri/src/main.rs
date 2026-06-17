@@ -2462,6 +2462,7 @@ fn main() {
             mobile::voice_stt,
             mobile::voice_tts,
             mobile::get_realtime_token,
+            mobile::append_voice_log,
             mobile::tool_get_brief,
             mobile::tool_draft_dispatch,
             mobile::tool_launch_dispatch,

@@ -49,6 +49,7 @@ export function VoiceMode() {
     const next = [...debugLogRef.current.slice(-299), line];
     debugLogRef.current = next;
     setDebugLog(next);
+    invoke("append_voice_log", { line }).catch(() => {});
   }
 
   // Auto-scroll log panel to bottom
@@ -193,7 +194,7 @@ export function VoiceMode() {
   }
 
   async function handleToolCall(name: string, args: Record<string, string>, callId: string) {
-    log(`tool: ${name} call_id=${callId}`);
+    log(`tool: ${name} call_id=${callId} args=${JSON.stringify(args)}`);
     let result = "ok";
     try {
       if (name === "get_brief") {
@@ -209,8 +210,9 @@ export function VoiceMode() {
       }
       log(`tool: ${name} result="${result.slice(0, 80)}"`);
     } catch (e) {
-      result = "Error: " + String(e);
-      log(`tool: ${name} ERROR: ${result}`);
+      const errStr = e instanceof Error ? `${e.message}${e.stack ? "\n" + e.stack : ""}` : String(e);
+      result = "Error: " + errStr;
+      log(`tool: ${name} ERROR: ${errStr}`);
     }
     sendRT({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output: result } });
     sendRT({ type: "response.create" });
@@ -286,6 +288,8 @@ export function VoiceMode() {
   }
 
   const connect = useCallback(async () => {
+    debugLogRef.current = [];
+    setDebugLog([]);
     log(`=== connect() mode=${mode}`);
     setError(""); setErrorKind("");
     setOrbState("connecting");
@@ -659,17 +663,23 @@ export function VoiceMode() {
               Classic
             </button>
           )}
-          <button
-            onClick={() => {
-              disconnect();
-              voice.stopAll();
-              navigate(-1);
-            }}
-            className="px-8 py-2.5 rounded-full text-sm font-medium text-zinc-200 border border-zinc-800 hover:border-zinc-600 transition-colors"
-            style={{ background: "#18181b" }}
-          >
-            End
-          </button>
+          {orbState !== "idle" ? (
+            <button
+              onClick={() => { disconnect(); voice.stopAll(); }}
+              className="px-8 py-2.5 rounded-full text-sm font-medium text-zinc-200 border border-zinc-800 hover:border-zinc-600 transition-colors"
+              style={{ background: "#18181b" }}
+            >
+              Stop
+            </button>
+          ) : (
+            <button
+              onClick={() => navigate(-1)}
+              className="px-8 py-2.5 rounded-full text-sm font-medium text-zinc-200 border border-zinc-800 hover:border-zinc-600 transition-colors"
+              style={{ background: "#18181b" }}
+            >
+              Back
+            </button>
+          )}
         </div>
       </div>
     </div>
