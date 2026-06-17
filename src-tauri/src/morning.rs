@@ -442,7 +442,7 @@ RULES:\n\
 • If the user is chatting, asking advice, giving updates, or exploring ideas: reply conversationally in 1-3 sentences.\n\
 • If the user is explicitly asking to BUILD, FIX, ADD, CREATE, IMPLEMENT, or DO something \
 technical in a project repo: output EXACTLY this on one line and NOTHING else:\n\
-__DISPATCH__ {{\"task\":\"<specific concrete task>\",\"project_slug\":\"<slug>\"}}\n\
+__DISPATCH__ {\"task\":\"<specific concrete task>\",\"project_slug\":\"<slug>\"}\n\
   Pick the most likely project slug from the list. If unclear, ask in CHAT mode.\n\
 • Do NOT dispatch for planning talk, analysis, or anything that is not code/infra work.\n\n\
 Connor's briefing for today:\n{briefing_json}";
@@ -514,8 +514,14 @@ fn assistant_turn_core(
     let (raw_reply, new_sid) = crate::chat::run_headless(claude, args, brain)?;
 
     let reply = if let Some(json_part) = raw_reply.trim().strip_prefix("__DISPATCH__") {
-        match serde_json::from_str::<serde_json::Value>(json_part.trim()) {
-            Ok(v) => {
+        // Collapse doubled braces from any format-string drift, then extract first {…}
+        let normalised = json_part.replace("{{", "{").replace("}}", "}");
+        let s = normalised.trim();
+        let parsed = s.find('{').zip(s.rfind('}')).and_then(|(lo, hi)| {
+            if hi >= lo { serde_json::from_str::<serde_json::Value>(&s[lo..=hi]).ok() } else { None }
+        });
+        match parsed {
+            Some(v) => {
                 let task = v.get("task").and_then(|t| t.as_str()).unwrap_or("").to_string();
                 let slug = v.get("project_slug").and_then(|s| s.as_str()).unwrap_or("").to_string();
                 if !task.is_empty() && !slug.is_empty() {
@@ -524,7 +530,7 @@ fn assistant_turn_core(
                     AssistantReply::Chat(raw_reply)
                 }
             }
-            Err(_) => AssistantReply::Chat(raw_reply),
+            None => AssistantReply::Chat(raw_reply),
         }
     } else {
         AssistantReply::Chat(raw_reply)
