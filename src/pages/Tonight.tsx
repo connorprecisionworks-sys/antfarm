@@ -164,7 +164,7 @@ export function Tonight() {
         <button
           onClick={() => navigate("/voice?mode=night")}
           className="ml-auto flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-          title="Plan out loud with Jarvis"
+          title="Plan out loud with Captain Jack"
         >
           <Mic size={12} strokeWidth={1.75} />
           Plan out loud

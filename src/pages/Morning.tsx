@@ -934,7 +934,7 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         >
           {messages.length === 0 && !thinking && (
             <p className="text-xs text-zinc-600 text-center py-3 select-none">
-              Ask Jarvis a follow-up...
+              Ask Captain Jack a follow-up...
             </p>
           )}
           {messages.map((msg) => <MessageBubble key={msg.id} msg={msg} speaking={msg.id === speakingId} />)}
@@ -991,7 +991,7 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
               : voiceState === "transcribing" ? "Transcribing…"
               : voiceState === "speaking" ? "Speaking…"
               : thinking ? "Thinking…"
-              : "Ask Jarvis…"
+              : "Ask Captain Jack…"
             }
             className="flex-1 text-xs bg-transparent border border-zinc-700/50 rounded-lg px-3 py-2 text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500/60 disabled:opacity-50 transition-colors"
           />
@@ -1117,14 +1117,14 @@ export function Morning() {
       <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 shrink-0">
         <h1 className="text-base font-semibold text-zinc-100">Morning</h1>
         <div className="flex items-center gap-3">
-          {/* Talk to Jarvis */}
+          {/* Talk to Captain Jack */}
           <button
             onClick={() => navigate("/voice?mode=morning")}
             className="flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-            title="Talk to Jarvis"
+            title="Talk to Captain Jack"
           >
             <Mic size={12} strokeWidth={1.75} />
-            Talk to Jarvis
+            Talk to Captain Jack
           </button>
           {/* Whoop refresh button */}
           <button

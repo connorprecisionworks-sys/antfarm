@@ -93,7 +93,7 @@ export function VoiceMode() {
         setCaptions(reply);
         await voice.speak(reply);
       } catch (e) {
-        setError("Jarvis: " + String(e));
+        setError("Captain Jack: " + String(e));
       } finally {
         setStatus("ready");
       }

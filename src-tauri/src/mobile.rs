@@ -740,7 +740,7 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
     <button class="tab active" id="tab-morning" onclick="switchView('morning')">Morning</button>
     <button class="tab"        id="tab-agents"  onclick="switchView('agents')">Agents</button>
     <span id="nav-status"></span>
-    <button class="tab-voice" onclick="openVoiceOverlay('morning')" title="Talk to Jarvis">
+    <button class="tab-voice" onclick="openVoiceOverlay('morning')" title="Talk to Captain Jack">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
       Talk
     </button>
@@ -790,10 +790,10 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
       </button>
       <div id="chat-body">
         <div id="chat-messages">
-          <div class="chat-empty" id="chat-empty">Ask Jarvis a follow-up...</div>
+          <div class="chat-empty" id="chat-empty">Ask Captain Jack a follow-up...</div>
         </div>
         <div id="chat-input-row">
-          <input id="chat-input" type="text" placeholder="Ask Jarvis..."
+          <input id="chat-input" type="text" placeholder="Ask Captain Jack..."
             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}">
           <button id="mic-btn" onclick="toggleMic()" title="Voice input" style="display:none">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="21" x2="12" y2="17"/></svg>
@@ -2213,7 +2213,7 @@ tomorrow's one big rock and commitments, then when it's set, lock it in with loc
 No em dashes.\n\n{brief_ctx}"
         ),
         _ => format!(
-            "You are Jarvis, Connor's sharp chief of staff and AI operating partner. \
+            "You are Captain Jack, Connor's sharp chief of staff and AI operating partner. \
 Warm, decisive, concise. No em dashes. No bullet walls. Short punchy sentences. \
 You know Connor's day cold and can dispatch coding agents to his projects.\n\n\
 ALWAYS confirm before calling launch_dispatch. Say exactly what you will do and \
@@ -2471,7 +2471,7 @@ pub async fn jarvis_chat(message: String) -> Result<String, String> {
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": format!(
-                "You are Jarvis, a concise AI chief of staff. Speak conversationally. \
+                "You are Captain Jack, a concise AI chief of staff. Speak conversationally. \
                  Keep replies to 2-3 sentences unless detail is requested.\n\nContext:\n{brief}"
             )},
             {"role": "user", "content": &message}

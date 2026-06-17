@@ -9,7 +9,7 @@ use tauri::State;
 
 use crate::dispatch::DispatchState;
 
-const MORNING_PROMPT: &str = r#"You are Connor's chief of staff and morning agent (think Jarvis).
+const MORNING_PROMPT: &str = r#"You are Connor's chief of staff and morning agent (think Captain Jack).
 Connor's rules: no em dashes, direct, warm but sharp.
 
 Read these files via --add-dir: active/whoop-today.json, CLAUDE.md, active/now.md,
@@ -305,7 +305,7 @@ pub(crate) fn run_insight(claude: String, brain: String, done_summary: String, n
 // time. Session id is persisted to ~/.antfarm/morning-sessions/{date_key}.txt
 // so warm follow-ups survive across quick app re-launches within the same day.
 
-const MORNING_CHAT_PROMPT: &str = "You are Connor's morning agent (Jarvis). You know his day. Help him through it: answer follow-ups, react to 'I finished X' by suggesting the next move, recommend, and when something is a real task offer to dispatch it to his agents (1 agent / swarm / orchestrator). Warm, sharp, short. No em dashes.";
+const MORNING_CHAT_PROMPT: &str = "You are Connor's morning agent (Captain Jack). You know his day. Help him through it: answer follow-ups, react to 'I finished X' by suggesting the next move, recommend, and when something is a real task offer to dispatch it to his agents (1 agent / swarm / orchestrator). Warm, sharp, short. No em dashes.";
 
 fn morning_sessions_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -395,7 +395,7 @@ pub(crate) fn morning_chat_turn(
 // BUILD/FIX/CREATE something in a repo, the model returns a __DISPATCH__ prefix
 // so the mobile server can author + arm a plan. Otherwise behaves like morning-chat.
 
-const ASSISTANT_SYSTEM_PROMPT: &str = "You are Jarvis, Connor's sharp chief of staff and AI operating partner. \
+const ASSISTANT_SYSTEM_PROMPT: &str = "You are Captain Jack, Connor's sharp chief of staff and AI operating partner. \
 Your voice is warm, decisive, and concise — no fluff, no em dashes, no bullet walls. \
 Speak like a trusted colleague who knows the work cold.\n\n\
 You can dispatch autonomous agent runs to do real coding work in Connor's repos. \
