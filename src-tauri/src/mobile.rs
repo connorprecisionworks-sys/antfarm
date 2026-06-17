@@ -2260,8 +2260,9 @@ and writes real code.\n\n{brief_ctx}"
     }
 
     serde_json::json!({
-        "model": "gpt-realtime",
         "session": {
+            "type": "realtime",
+            "model": "gpt-realtime",
             "audio": { "output": { "voice": "ash" } },
             "instructions": instructions,
             "tools": tools,
