@@ -2260,9 +2260,8 @@ and writes real code.\n\n{brief_ctx}"
     }
 
     serde_json::json!({
+        "model": "gpt-realtime",
         "session": {
-            "type": "realtime",
-            "model": "gpt-4o-mini-realtime-preview",
             "audio": { "output": { "voice": "ash" } },
             "instructions": instructions,
             "tools": tools,
@@ -2301,7 +2300,7 @@ fn extract_realtime_token_response(raw: serde_json::Value) -> String {
     let model = raw.get("model")
         .or_else(|| nested.and_then(|s| s.get("model")))
         .and_then(|m| m.as_str())
-        .unwrap_or("gpt-4o-mini-realtime-preview")
+        .unwrap_or("gpt-realtime")
         .to_string();
     let session_id = raw.get("id")
         .or_else(|| nested.and_then(|s| s.get("id")))
@@ -2344,7 +2343,7 @@ pub async fn get_realtime_token(mode: Option<String>) -> Result<serde_json::Valu
     let model = raw.get("model")
         .or_else(|| nested.and_then(|s| s.get("model")))
         .and_then(|m| m.as_str())
-        .unwrap_or("gpt-4o-mini-realtime-preview")
+        .unwrap_or("gpt-realtime")
         .to_string();
     let session_id = raw.get("id")
         .or_else(|| nested.and_then(|s| s.get("id")))

@@ -414,7 +414,7 @@ export function VoiceMode() {
     await pc.setLocalDescription(offer);
     log("setLocalDescription done");
 
-    const sdpUrl = `https://api.openai.com/v1/realtime?model=${session.model}`;
+    const sdpUrl = "https://api.openai.com/v1/realtime/calls";
     log(`POST ${sdpUrl}`);
     try {
       const sdpR = await fetch(sdpUrl, {
