@@ -1453,16 +1453,17 @@ const MOBILE_HTML: &str = r###"<!DOCTYPE html>
         return;
       }
 
-      const DONE = new Set(['accepted', 'rejected', 'merged']);
+      const TOSS_TERMINAL = new Set(['rejected', 'merged']);
       list.innerHTML = ENTRIES.map(({ run }, i) => {
         const label = run.status.replace(/_/g, ' ');
         const reviewBlock = run.reviewNotes
           ? `<div class="reviewer"><b>Reviewer:</b> ${esc(run.reviewNotes)}</div>` : '';
-        const actionable = run.worktree && !DONE.has(run.status);
-        const actionsBlock = actionable ? `
+        const mergeable = run.worktree && ['done', 'approved', 'flagged'].includes(run.status);
+        const tossable  = run.worktree && !TOSS_TERMINAL.has(run.status);
+        const actionsBlock = (mergeable || tossable) ? `
           <div class="actions">
-            <button class="btn btn-merge" onclick="event.stopPropagation();mergeRun(${i})">Merge</button>
-            <button class="btn btn-toss"  onclick="event.stopPropagation();tossRun(${i})">Toss</button>
+            ${mergeable ? `<button class="btn btn-merge" onclick="event.stopPropagation();mergeRun(${i})">Merge</button>` : ''}
+            ${tossable  ? `<button class="btn btn-toss"  onclick="event.stopPropagation();tossRun(${i})">Toss</button>`  : ''}
           </div>` : '';
         return `<div class="run-card" onclick="showDiff(${i})">
           <div class="goal">${esc(run.goal || 'Untitled run')}</div>

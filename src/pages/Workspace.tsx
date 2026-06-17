@@ -2065,8 +2065,8 @@ function AgentsView() {
               const msg = msgs[run.runId];
               const hasWt = !!run.worktree;
               const hasSession = run.steps.some(s => s.sessionId);
-              const reviewable = ["done", "failed", "interrupted", "conflict", "approved", "flagged"].includes(run.status);
-              const showDiff = hasWt && (reviewable || run.status === "accepted");
+              const reviewable = ["done", "failed", "interrupted", "conflict", "approved", "flagged", "accepted"].includes(run.status);
+              const showDiff = hasWt && reviewable;
               const showMerge = hasWt && ["done", "approved", "flagged"].includes(run.status);
               const showToss = hasWt && reviewable;
               const showTakeOver = reviewable && hasSession;

@@ -1387,10 +1387,16 @@ pub fn accept_run(plan_id: String, run_id: String) -> Result<String, String> {
 #[tauri::command]
 pub fn reject_run(plan_id: String, run_id: String) -> Result<(), String> {
     let rs = find_run(&plan_id, &run_id)?;
-    let repo = repo_of(&rs.worktree)?;
-    git(&repo, &["worktree", "remove", "--force", &rs.worktree]).ok();
-    git(&repo, &["worktree", "prune"]).ok();
-    git(&repo, &["branch", "-D", &rs.branch]).ok();
+    // Best-effort: remove worktree + branch, but don't fail if the path is gone/malformed
+    if !rs.worktree.is_empty() {
+        if let Ok(repo) = repo_of(&rs.worktree) {
+            git(&repo, &["worktree", "remove", "--force", &rs.worktree]).ok();
+            git(&repo, &["worktree", "prune"]).ok();
+            if !rs.branch.is_empty() {
+                git(&repo, &["branch", "-D", &rs.branch]).ok();
+            }
+        }
+    }
     set_run_status(&plan_id, &run_id, "rejected")
 }
 
