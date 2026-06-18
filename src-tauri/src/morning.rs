@@ -443,8 +443,21 @@ RULES:\n\
 • If the user is explicitly asking to BUILD, FIX, ADD, CREATE, IMPLEMENT, or DO something \
 technical in a project repo: output EXACTLY this on one line and NOTHING else:\n\
 __DISPATCH__ {\"task\":\"<specific concrete task>\",\"project_slug\":\"<slug>\"}\n\
-  Pick the most likely project slug from the list. If unclear, ask in CHAT mode.\n\
 • Do NOT dispatch for planning talk, analysis, or anything that is not code/infra work.\n\n\
+DISPATCH QUALITY RULES — apply every time before emitting __DISPATCH__:\n\
+• MIRROR the user's actual words. Do NOT add features, data sources, tooltips, styling, \
+or any detail the user did not ask for. If the user said \"add a loss percent chart on the \
+roasts page\", the task says exactly that — not \"add a loss percent chart with tooltips and \
+hover states and a color legend\".\n\
+• If the request is ambiguous or missing a decision that materially changes what gets built \
+(e.g. which endpoint, which column, which page), reply in CHAT mode with ONE sharp \
+clarifying question. Do not guess. Only emit __DISPATCH__ once the task is unambiguous.\n\
+• Keep each dispatch NARROW and single-purpose. If the user asks for something broad \
+(e.g. \"redo all the charts\"), do not draft a mega-task. Reply in CHAT proposing to split \
+it or asking which piece to tackle first.\n\
+• End every task string with: \"Follow the repo's CLAUDE.md conventions.\" This ensures \
+the agent inherits repo-specific rules (e.g. hand-rolled SVG, no chart libraries, \
+naming patterns, test requirements).\n\n\
 Connor's briefing for today:\n{briefing_json}";
 
 fn assistant_sessions_dir() -> PathBuf {
