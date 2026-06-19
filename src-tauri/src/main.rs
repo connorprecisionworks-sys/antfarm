@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use notify::{RecommendedWatcher, Watcher, RecursiveMode, Config as NotifyConfig};
 use tauri::{Emitter, Manager};
@@ -466,6 +466,8 @@ impl DayBucket {
 struct FileCacheEntry {
     mtime: u64,
     size: u64,
+    #[serde(default)]
+    byte_offset: u64,
     days: HashMap<String, DayBucket>,
 }
 
@@ -562,68 +564,77 @@ fn match_dir_to_slug(dir_name: &str, registry: &Registry) -> String {
     best.map(|(_, s)| s).unwrap_or_else(|| "unfiled".to_string())
 }
 
-fn parse_jsonl_file(path: &Path) -> HashMap<String, DayBucket> {
-    let mut days: HashMap<String, DayBucket> = HashMap::new();
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return days,
+fn parse_usage_line(line: &str, days: &mut HashMap<String, DayBucket>) {
+    if line.is_empty() { return; }
+    let obj: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
     };
-    for line in content.lines() {
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if obj.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-            continue;
-        }
-        let msg = match obj.get("message").and_then(|m| m.as_object()) {
-            Some(m) => m,
-            None => continue,
-        };
-        let usage = match msg.get("usage").and_then(|u| u.as_object()) {
-            Some(u) => u,
-            None => continue,
-        };
-        let model = msg
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown");
-        let input = usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_read = usage
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_write = usage
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        // Cowork audit.jsonl uses "_audit_timestamp"; CC uses "timestamp"
-        let timestamp = match obj
-            .get("timestamp")
-            .or_else(|| obj.get("_audit_timestamp"))
-            .and_then(|t| t.as_str())
-            .filter(|t| t.len() >= 10)
-        {
-            Some(t) => t,
-            None => continue,
-        };
-        let date = timestamp[..10].to_string();
-        let est = est_dollars_for(model, input, output, cache_read, cache_write);
-        let bucket = days.entry(date).or_default();
-        bucket.input += input;
-        bucket.output += output;
-        bucket.cache_read += cache_read;
-        bucket.cache_write += cache_write;
-        bucket.est_dollars += est;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return;
     }
-    days
+    let msg = match obj.get("message").and_then(|m| m.as_object()) {
+        Some(m) => m,
+        None => return,
+    };
+    let usage = match msg.get("usage").and_then(|u| u.as_object()) {
+        Some(u) => u,
+        None => return,
+    };
+    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
+    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Cowork audit.jsonl uses "_audit_timestamp"; CC uses "timestamp"
+    let timestamp = match obj
+        .get("timestamp")
+        .or_else(|| obj.get("_audit_timestamp"))
+        .and_then(|t| t.as_str())
+        .filter(|t| t.len() >= 10)
+    {
+        Some(t) => t,
+        None => return,
+    };
+    let date = timestamp[..10].to_string();
+    let est = est_dollars_for(model, input, output, cache_read, cache_write);
+    let bucket = days.entry(date).or_default();
+    bucket.input += input;
+    bucket.output += output;
+    bucket.cache_read += cache_read;
+    bucket.cache_write += cache_write;
+    bucket.est_dollars += est;
+}
+
+/// Read only the bytes appended since `entry.byte_offset`, parse them line-by-line,
+/// and accumulate into `entry.days`. Returns true if new bytes were read.
+fn update_file_cache_entry(path: &Path, entry: &mut FileCacheEntry, current_size: u64) -> bool {
+    // File was truncated/replaced — reset and re-read from the start.
+    if current_size < entry.byte_offset {
+        entry.byte_offset = 0;
+        entry.days.clear();
+    }
+    if entry.byte_offset >= current_size {
+        return false;
+    }
+    let Ok(f) = fs::File::open(path) else { return false };
+    let mut reader = BufReader::new(f);
+    if entry.byte_offset > 0 && reader.seek(SeekFrom::Start(entry.byte_offset)).is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => parse_usage_line(line.trim(), &mut entry.days),
+            Err(_) => break,
+        }
+    }
+    if let Ok(pos) = reader.stream_position() {
+        entry.byte_offset = pos;
+    }
+    true
 }
 
 fn slug_to_name(slug: &str, _registry: &Registry) -> String {
@@ -664,8 +675,12 @@ fn weekday_to_dow(wd: Weekday) -> u8 {
     }
 }
 
+static USAGE_ROLLUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 #[tauri::command]
 fn usage_rollup() -> UsageRollup {
+    // Serialize concurrent calls so two polls can't both read new bytes and double-count.
+    let _guard = USAGE_ROLLUP_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let settings = get_settings();
     let registry = load_registry();
     let today = Local::now();
@@ -727,28 +742,14 @@ fn usage_rollup() -> UsageRollup {
                         .unwrap_or(0);
                     let fsize = meta.len();
 
-                    // Check cache
-                    let cached = cache.files.get(&fpath_str);
-                    let days_data = if cached
-                        .map(|e| e.mtime == fmtime && e.size == fsize)
-                        .unwrap_or(false)
-                    {
-                        cached_files += 1;
-                        eprintln!("cache hit: {}", fpath_str);
-                        cached.unwrap().days.clone()
-                    } else {
-                        parsed_files += 1;
-                        let days = parse_jsonl_file(&fpath);
-                        cache.files.insert(
-                            fpath_str.clone(),
-                            FileCacheEntry {
-                                mtime: fmtime,
-                                size: fsize,
-                                days: days.clone(),
-                            },
-                        );
-                        days
-                    };
+                    let entry = cache.files.entry(fpath_str.clone()).or_insert_with(|| FileCacheEntry {
+                        mtime: fmtime, size: fsize, byte_offset: 0, days: HashMap::new(),
+                    });
+                    let read_new = update_file_cache_entry(&fpath, entry, fsize);
+                    entry.mtime = fmtime;
+                    entry.size = fsize;
+                    if read_new { parsed_files += 1; } else { cached_files += 1; }
+                    let days_data = entry.days.clone();
 
                     let proj_map = by_project_day.entry(slug.clone()).or_default();
                     for (date, bucket) in &days_data {
@@ -822,26 +823,14 @@ fn usage_rollup() -> UsageRollup {
                                 .unwrap_or(0);
                             let fsize = meta.len();
 
-                            let cached = cache.files.get(&fpath_str);
-                            let days_data = if cached
-                                .map(|e| e.mtime == fmtime && e.size == fsize)
-                                .unwrap_or(false)
-                            {
-                                cached_files += 1;
-                                cached.unwrap().days.clone()
-                            } else {
-                                parsed_files += 1;
-                                let days = parse_jsonl_file(&audit);
-                                cache.files.insert(
-                                    fpath_str.clone(),
-                                    FileCacheEntry {
-                                        mtime: fmtime,
-                                        size: fsize,
-                                        days: days.clone(),
-                                    },
-                                );
-                                days
-                            };
+                            let entry = cache.files.entry(fpath_str.clone()).or_insert_with(|| FileCacheEntry {
+                                mtime: fmtime, size: fsize, byte_offset: 0, days: HashMap::new(),
+                            });
+                            let read_new = update_file_cache_entry(&audit, entry, fsize);
+                            entry.mtime = fmtime;
+                            entry.size = fsize;
+                            if read_new { parsed_files += 1; } else { cached_files += 1; }
+                            let days_data = entry.days.clone();
 
                             let proj_map = by_project_day.entry(slug).or_default();
                             for (date, bucket) in &days_data {
@@ -2071,24 +2060,13 @@ fn wrapped_stats(period: String) -> WrappedStats {
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     let fsize = meta.len();
-                    let cached = cache.files.get(&fpath_str);
-                    let days_data = if cached
-                        .map(|e| e.mtime == fmtime && e.size == fsize)
-                        .unwrap_or(false)
-                    {
-                        cached.unwrap().days.clone()
-                    } else {
-                        let days = parse_jsonl_file(&fpath);
-                        cache.files.insert(
-                            fpath_str.clone(),
-                            FileCacheEntry {
-                                mtime: fmtime,
-                                size: fsize,
-                                days: days.clone(),
-                            },
-                        );
-                        days
-                    };
+                    let entry = cache.files.entry(fpath_str.clone()).or_insert_with(|| FileCacheEntry {
+                        mtime: fmtime, size: fsize, byte_offset: 0, days: HashMap::new(),
+                    });
+                    update_file_cache_entry(&fpath, entry, fsize);
+                    entry.mtime = fmtime;
+                    entry.size = fsize;
+                    let days_data = entry.days.clone();
                     let proj_map = by_project_all.entry(slug.clone()).or_default();
                     for (date, bucket) in &days_data {
                         proj_map.entry(date.clone()).or_default().add(bucket);
@@ -2151,24 +2129,13 @@ fn wrapped_stats(period: String) -> WrappedStats {
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
                             let fsize = meta.len();
-                            let cached = cache.files.get(&fpath_str);
-                            let days_data = if cached
-                                .map(|e| e.mtime == fmtime && e.size == fsize)
-                                .unwrap_or(false)
-                            {
-                                cached.unwrap().days.clone()
-                            } else {
-                                let days = parse_jsonl_file(&audit);
-                                cache.files.insert(
-                                    fpath_str.clone(),
-                                    FileCacheEntry {
-                                        mtime: fmtime,
-                                        size: fsize,
-                                        days: days.clone(),
-                                    },
-                                );
-                                days
-                            };
+                            let entry = cache.files.entry(fpath_str.clone()).or_insert_with(|| FileCacheEntry {
+                                mtime: fmtime, size: fsize, byte_offset: 0, days: HashMap::new(),
+                            });
+                            update_file_cache_entry(&audit, entry, fsize);
+                            entry.mtime = fmtime;
+                            entry.size = fsize;
+                            let days_data = entry.days.clone();
                             let proj_map = by_project_all.entry(slug).or_default();
                             for (date, bucket) in &days_data {
                                 proj_map.entry(date.clone()).or_default().add(bucket);
