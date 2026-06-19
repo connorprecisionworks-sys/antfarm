@@ -500,51 +500,60 @@ function PanelTab(props: IDockviewPanelHeaderProps) {
   return <DockviewDefaultTab {...props} onDoubleClick={handleDoubleClick} />;
 }
 
-// ── Even-out layout helper ─────────────────────────────────────────────────
-// Accesses the internal gridview directly to call BranchNode.resizeChild(),
-// which routes to splitview.resizeView() — the real in-place resize path.
-// fromJSON(reuseExistingPanels) ignores serialized sizes so it cannot be used.
+// ── Layout helpers ──────────────────────────────────────────────────────────
 
+interface PanelSnapshot {
+  component: string;
+  title: string;
+  params: Record<string, unknown>;
+}
+
+// Extract panels from dockview JSON in display order (left→right, top→bottom).
+// The JSON uses "contentComponent" (serialized name) which maps to the "component"
+// key used in addPanel — this is what DOCK_COMPONENTS is keyed by.
+function collectPanels(json: any): PanelSnapshot[] {
+  const map = (json?.panels ?? {}) as Record<string, { contentComponent?: string; title?: string; params?: Record<string, unknown> }>;
+  const ids: string[] = [];
+  function walk(node: any) {
+    if (!node) return;
+    if (node.type === "leaf") {
+      for (const id of (node.data?.views ?? [])) ids.push(id);
+    } else {
+      for (const child of (node.data ?? [])) walk(child);
+    }
+  }
+  walk(json?.grid?.root);
+  return ids
+    .map(id => map[id])
+    .filter((p): p is NonNullable<typeof p> => !!p?.contentComponent)
+    .map(p => ({ component: p.contentComponent!, title: p.title ?? "", params: p.params ?? {} }));
+}
+
+// Re-add a captured panel with a fresh id (avoids PTY kill/spawn race on same id).
+function reAddPanel(
+  api: DockviewApi,
+  panel: PanelSnapshot,
+  position?: { referencePanel: string; direction: "right" | "left" | "above" | "below" },
+  initialWidth?: number,
+  initialHeight?: number,
+): string {
+  const id = crypto.randomUUID();
+  const opts: Parameters<typeof api.addPanel>[0] = { id, component: panel.component, title: panel.title, params: panel.params, position };
+  if (initialWidth !== undefined) (opts as any).initialWidth = initialWidth;
+  if (initialHeight !== undefined) (opts as any).initialHeight = initialHeight;
+  const p = api.addPanel(opts);
+  if (panel.component === "terminal") p.api.setConstraints(TERM_CONSTRAINTS);
+  return id;
+}
+
+// Even-out: detect best grid from panel count and restructure.
+// buildGridLayout is declared below (module-level function declarations are hoisted).
 function evenOutPanes(api: DockviewApi) {
   if (api.groups.length <= 1) return;
-
-  const gridview = (api as any).component?.gridview;
-  if (!gridview) return;
-
-  const root = (api.toJSON() as any)?.grid?.root;
-  if (!root) return;
-
-  // Walk the JSON tree top-down. For each branch node, get the matching
-  // BranchNode from gridview (by location = path of child indices from root)
-  // and redistribute its children to equal sizes via resizeChild().
-  // Top-down order is required: resizing an outer branch propagates new
-  // orthogonal sizes to inner branches proportionally, then we redistribute
-  // those inner branches' children on the next step.
-  function processNode(node: any, location: number[]) {
-    if (node.type !== 'branch') return;
-    const children: any[] = node.data ?? [];
-    const n = children.length;
-
-    if (n >= 2) {
-      try {
-        const [, branchNode] = gridview.getNode(location) as [any, any];
-        let total = 0;
-        for (let i = 0; i < n; i++) total += (branchNode.getChildSize(i) as number);
-        const each = Math.floor(total / n);
-        // Set children 0..N-2 to equal size; N-1 absorbs the rounding remainder.
-        for (let i = 0; i < n - 1; i++) {
-          branchNode.resizeChild(i, each);
-        }
-      } catch {
-        // getNode can throw for stale locations; skip silently
-      }
-    }
-
-    // Recurse into child branches AFTER resizing (top-down order)
-    children.forEach((child: any, i: number) => processNode(child, [...location, i]));
-  }
-
-  processNode(root, []);
+  const existing = collectPanels(api.toJSON() as any);
+  if (existing.length === 0) return;
+  const kind = (existing.length <= 2 ? "2across" : existing.length === 3 ? "3across" : "2x2") as GridKind;
+  buildGridLayout(api, kind, null);
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
@@ -581,6 +590,107 @@ interface DockAreaProps {
 
 const TERM_CONSTRAINTS = { minimumWidth: 320, minimumHeight: 160 } as const;
 
+// ── Grid layout builder ────────────────────────────────────────────────────
+// Restructures existing panels into the target geometry. If the dock is empty,
+// falls back to creating fresh terminal panes (initial-setup path).
+function buildGridLayout(api: DockviewApi, kind: GridKind, slug: string | null) {
+  const W = api.width || 800;
+  const H = api.height || 600;
+  const existing = collectPanels(api.toJSON() as any);
+
+  api.clear();
+
+  if (existing.length > 0) {
+    const n = existing.length;
+    const halfW = Math.round(W / 2);
+    const halfH = Math.round(H / 2);
+
+    if (kind === "conductor") {
+      // Sort orchestrators first, then executors, then shells.
+      const sorted = [...existing].sort((a, b) => {
+        const order: Record<string, number> = { orchestrator: 0, executor: 1, shell: 2 };
+        return (order[String(a.params.role)] ?? 2) - (order[String(b.params.role)] ?? 2);
+      });
+      const half = Math.round(W * 0.5);
+      const id0 = reAddPanel(api, sorted[0], undefined, half);
+      if (sorted.length > 1) {
+        const id1 = reAddPanel(api, sorted[1], { referencePanel: id0, direction: "right" }, half);
+        for (let i = 2; i < sorted.length; i++) {
+          reAddPanel(api, sorted[i], { referencePanel: id1, direction: "below" });
+        }
+      }
+      return;
+    }
+
+    if (kind === "2across") {
+      const id0 = reAddPanel(api, existing[0], undefined, halfW);
+      let lastId = id0;
+      for (let i = 1; i < n; i++) {
+        const dir = i === 1 ? "right" : "below";
+        const iw = i === 1 ? halfW : undefined;
+        lastId = reAddPanel(api, existing[i], { referencePanel: lastId, direction: dir as "right" | "below" }, iw);
+      }
+      return;
+    }
+
+    if (kind === "3across") {
+      const thirdW = Math.round(W / 3);
+      const id0 = reAddPanel(api, existing[0], undefined, thirdW);
+      let lastId = id0;
+      for (let i = 1; i < n && i < 3; i++) {
+        lastId = reAddPanel(api, existing[i], { referencePanel: lastId, direction: "right" }, thirdW);
+      }
+      for (let i = 3; i < n; i++) {
+        lastId = reAddPanel(api, existing[i], { referencePanel: lastId, direction: "below" });
+      }
+      return;
+    }
+
+    // 2x2
+    const id0 = reAddPanel(api, existing[0], undefined, halfW);
+    if (n >= 2) {
+      const id1 = reAddPanel(api, existing[1], { referencePanel: id0, direction: "right" }, halfW);
+      if (n >= 3) {
+        const id2 = reAddPanel(api, existing[2], { referencePanel: id0, direction: "below" }, halfW, halfH);
+        if (n >= 4) {
+          reAddPanel(api, existing[3], { referencePanel: id1, direction: "below" }, halfW, halfH);
+        }
+        let lastId = id2;
+        for (let i = 4; i < n; i++) {
+          lastId = reAddPanel(api, existing[i], { referencePanel: lastId, direction: "below" });
+        }
+      }
+    }
+    return;
+  }
+
+  // Empty dock: create fresh terminal panes in the target geometry.
+  function freshAdd(role: PaneRole, position?: { referencePanel: string; direction: "right" | "below" }, initialWidth?: number): string {
+    const id = crypto.randomUUID();
+    const p = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, initialWidth });
+    p.api.setConstraints(TERM_CONSTRAINTS);
+    return id;
+  }
+  if (kind === "conductor") {
+    const half = Math.round(W * 0.5);
+    const o = freshAdd("orchestrator", undefined, half);
+    const e1 = freshAdd("executor", { referencePanel: o, direction: "right" }, half);
+    freshAdd("executor", { referencePanel: e1, direction: "below" });
+    return;
+  }
+  const id1 = freshAdd("shell");
+  if (kind === "2across") {
+    freshAdd("shell", { referencePanel: id1, direction: "right" });
+  } else if (kind === "3across") {
+    const id2 = freshAdd("shell", { referencePanel: id1, direction: "right" });
+    freshAdd("shell", { referencePanel: id2, direction: "right" });
+  } else {
+    const id2 = freshAdd("shell", { referencePanel: id1, direction: "right" });
+    freshAdd("shell", { referencePanel: id1, direction: "below" });
+    freshAdd("shell", { referencePanel: id2, direction: "below" });
+  }
+}
+
 const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   { workspace, onLayoutChange },
   ref
@@ -616,37 +726,6 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       const role: PaneRole = type === "orchestrator" ? "orchestrator" : type === "executor" ? "executor" : "shell";
       const panel = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
       panel.api.setConstraints(TERM_CONSTRAINTS);
-    }
-  }
-
-  // Lay out tiled panes as a grid (no manual dragging needed).
-  function buildGridLayout(api: DockviewApi, kind: GridKind, slug: string | null) {
-    const totalWidth = api.width || 800;
-    api.clear();
-    const add = (role: PaneRole, position?: { referencePanel: string; direction: "right" | "below" }, initialWidth?: number) => {
-      const id = crypto.randomUUID();
-      const panel = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position, initialWidth });
-      panel.api.setConstraints(TERM_CONSTRAINTS);
-      return id;
-    };
-    if (kind === "conductor") {
-      // Orchestrator gets ~50% width; two executors split the other half.
-      const half = Math.round(totalWidth * 0.5);
-      const o = add("orchestrator", undefined, half);
-      const e1 = add("executor", { referencePanel: o, direction: "right" }, half);
-      add("executor", { referencePanel: e1, direction: "below" });
-      return;
-    }
-    const id1 = add("shell");
-    if (kind === "2across") {
-      add("shell", { referencePanel: id1, direction: "right" });
-    } else if (kind === "3across") {
-      const id2 = add("shell", { referencePanel: id1, direction: "right" });
-      add("shell", { referencePanel: id2, direction: "right" });
-    } else {
-      const id2 = add("shell", { referencePanel: id1, direction: "right" });
-      add("shell", { referencePanel: id1, direction: "below" });
-      add("shell", { referencePanel: id2, direction: "below" });
     }
   }
 
