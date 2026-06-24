@@ -778,20 +778,41 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       const api = apiRef.current;
       if (!api) return;
       try {
-        // Add one executor pane per subtask. buildGridLayout will snapshot params
-        // (including seed) via api.toJSON(), clear, and reAddPanel in conductor
-        // order — so seeds survive the relayout and fire on the fresh mounts.
+        // Position executors relative to existing panels so the orchestrator
+        // pane stays alive (its PTY + conversation are NOT killed).
+        //
+        // Anchor selection:
+        //   - If an executor already exists → stack new executors below it
+        //     (preserves the existing right-column layout)
+        //   - Else if an orchestrator exists → first executor goes right,
+        //     subsequent ones stack below
+        //   - Else → no position hint (dock places freely)
+        const panels = api.panels;
+        const existingExecutor = panels.find(
+          p => (p.params as TerminalParams | null)?.role === "executor"
+        );
+        const orchestrator = panels.find(
+          p => (p.params as TerminalParams | null)?.role === "orchestrator"
+        );
+
+        let refId = (existingExecutor ?? orchestrator)?.id ?? null;
+        let isFirst = true;
+
         for (const subtask of subtasks) {
           const id = crypto.randomUUID();
+          const dir: "right" | "below" = isFirst && !existingExecutor ? "right" : "below";
+          const position = refId ? { referencePanel: refId, direction: dir } : undefined;
           const panel = api.addPanel({
             id,
             component: "terminal",
             params: { project_slug: slug, role: "executor", seed: subtask } as TerminalParams,
             title: ROLE_META["executor"].label,
+            position,
           });
           panel.api.setConstraints(TERM_CONSTRAINTS);
+          refId = id;
+          isFirst = false;
         }
-        buildGridLayout(api, "conductor", slug);
       } catch (err) {
         console.error("[DockArea] delegate failed:", err);
       }
