@@ -467,6 +467,7 @@ const XTERM_THEME = {
 function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
   const paneId = api.id;
   const containerRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
   const relaySend = useContext(RelaySendContext);
   const [selectedText, setSelectedText] = useState("");
 
@@ -474,15 +475,19 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
     const el = containerRef.current;
     if (!el) return;
 
+    const isOrchestrator = params.role === "orchestrator";
     const term = new Terminal({
       fontFamily: '"Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, monospace',
       fontSize: 13,
       lineHeight: 1.2,
       theme: XTERM_THEME,
-      cursorBlink: true,
+      // Disable cursor blink on orchestrator to prevent onSelectionChange spam
+      // from cursor-blink repaints wiping the captured selection.
+      cursorBlink: !isOrchestrator,
       scrollback: 5000,
       allowTransparency: false,
     });
+    termRef.current = term;
 
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -497,10 +502,13 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
       invoke("write_pty", { paneId, data }).catch(() => {});
     });
 
-    // Selection → show send-to-executor overlay (orchestrator role only)
-    if (params.role === "orchestrator") {
+    // Selection → show send-to-executor overlay (orchestrator role only).
+    // Only capture non-empty selections; never overwrite with empty so that
+    // xterm repaints (streaming output, cursor moves) don't wipe the overlay.
+    if (isOrchestrator) {
       term.onSelectionChange(() => {
-        setSelectedText(term.getSelection() ?? "");
+        const sel = term.getSelection();
+        if (sel && sel.trim()) setSelectedText(sel);
       });
     }
 
@@ -572,6 +580,7 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
       unlisten?.();
       invoke("kill_pty", { paneId }).catch(() => {});
       term.dispose();
+      termRef.current = null;
     };
   }, [paneId, params.project_slug, params.role]);
 
@@ -599,8 +608,12 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
           onSend={() => {
             relaySend.send(selectedText.trim(), params.project_slug);
             setSelectedText("");
+            termRef.current?.clearSelection();
           }}
-          onDismiss={() => setSelectedText("")}
+          onDismiss={() => {
+            setSelectedText("");
+            termRef.current?.clearSelection();
+          }}
         />
       )}
       <div

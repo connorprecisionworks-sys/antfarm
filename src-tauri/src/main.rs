@@ -133,10 +133,7 @@ fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry
                         has_notification = true;
                         "needs_permission"
                     }
-                    Some("idle_prompt") => {
-                        has_notification = true;
-                        "idle"
-                    }
+                    Some("idle_prompt") => "idle",
                     _ => "idle",
                 },
                 _ => continue,
