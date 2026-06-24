@@ -350,7 +350,7 @@ function SkillsMenu({ paneId }: { paneId: string }) {
 
 type PaneRole = "shell" | "orchestrator" | "executor";
 
-interface TerminalParams { project_slug: string | null; role?: PaneRole }
+interface TerminalParams { project_slug: string | null; role?: PaneRole; seed?: string }
 
 // Visual identity per role so it's obvious which pane plans vs which execute.
 const ROLE_META: Record<PaneRole, { label: string; accent: string; tint: string }> = {
@@ -399,19 +399,32 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
 
     let unlisten: UnlistenFn | null = null;
     let mounted = true;
+    let seedWritten = false;
 
     // Keystroke → PTY stdin
     term.onData(data => {
       invoke("write_pty", { paneId, data }).catch(() => {});
     });
 
-    // PTY stdout → xterm (base64-encoded bytes)
+    // PTY stdout → xterm (base64-encoded bytes).
+    // Seed: on the first output event (proves the agent is alive) wait 1.5s
+    // then inject the seed once. Guard: mounted prevents the setTimeout from
+    // firing after a StrictMode cleanup; seedWritten prevents re-entry on
+    // subsequent output events.
     listen<string>(`pty-output-${paneId}`, event => {
       const b64 = event.payload;
       const binary = atob(b64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       term.write(bytes);
+      if (params.seed && !seedWritten) {
+        seedWritten = true;
+        const seed = params.seed;
+        setTimeout(() => {
+          if (!mounted) return;
+          invoke("write_pty", { paneId, data: seed + "\r" }).catch(() => {});
+        }, 1500);
+      }
     }).then(fn => {
       if (mounted) unlisten = fn;
       else fn();
