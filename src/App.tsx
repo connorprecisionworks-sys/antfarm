@@ -10,6 +10,7 @@ import { Usage } from "./pages/Usage";
 import { Settings } from "./pages/Settings";
 import { VoiceMode } from "./pages/VoiceMode";
 import { Wrapped } from "./pages/Wrapped";
+import { Memory } from "./pages/Memory";
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="projects" element={<Projects />} />
           <Route path="projects/:slug" element={<ProjectDetail />} />
           <Route path="sessions" element={<Sessions />} />
+          <Route path="memory" element={<Memory />} />
           <Route path="usage" element={<Usage />} />
           <Route path="wrapped" element={<Wrapped />} />
           <Route path="workspace" element={null} />

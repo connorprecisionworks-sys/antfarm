@@ -288,7 +288,7 @@ fn claude_path(app: &tauri::AppHandle) -> String {
 }
 
 fn brain_path() -> String {
-    format!("{}/Desktop/CD_claude", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+    format!("{}/Desktop/antfarm-memory", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
 }
 
 // ── Mobile HTML page ──────────────────────────────────────────────────────────

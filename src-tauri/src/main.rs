@@ -27,7 +27,7 @@ fn home_dir() -> PathBuf {
 }
 
 fn brain_root() -> PathBuf {
-    home_dir().join("Desktop").join("CD_claude")
+    home_dir().join("Desktop").join("antfarm-memory")
 }
 
 fn app_data_dir() -> PathBuf {

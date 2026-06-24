@@ -81,7 +81,7 @@ pub async fn generate_morning_briefing(
     force: bool,
 ) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let brain = format!("{}/Desktop/CD_claude", home);
+    let brain = format!("{}/Desktop/antfarm-memory", home);
     let claude = dispatch.claude_path.lock().unwrap().clone();
 
     tauri::async_runtime::spawn_blocking(move || run_morning(brain, claude, now, force))
@@ -200,7 +200,7 @@ pub(crate) fn run_morning(brain: String, claude: String, now: String, force: boo
 #[tauri::command]
 pub fn get_morning_cache() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
-    let brain = format!("{}/Desktop/CD_claude", home);
+    let brain = format!("{}/Desktop/antfarm-memory", home);
     let today = Local::now().format("%Y-%m-%d").to_string();
     let cache_path = format!("{}/active/today-brief.json", brain);
     if let Ok(raw) = std::fs::read_to_string(&cache_path) {
@@ -218,7 +218,7 @@ pub fn get_morning_cache() -> String {
 #[tauri::command]
 pub fn get_whoop_today() -> serde_json::Value {
     let home = std::env::var("HOME").unwrap_or_default();
-    let brain = format!("{}/Desktop/CD_claude", home);
+    let brain = format!("{}/Desktop/antfarm-memory", home);
     let today = Local::now().format("%Y-%m-%d").to_string();
     let path = format!("{}/active/whoop-today.json", brain);
     if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -239,7 +239,7 @@ pub async fn refresh_whoop() -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         let cmd = format!(
-            "node {}/Desktop/CD_claude/tools-built/whoop-report/whoop-fetch.cjs",
+            "node {}/Desktop/antfarm-memory/tools-built/whoop-report/whoop-fetch.cjs",
             home
         );
         let mut child = Command::new("/bin/zsh")
@@ -267,7 +267,7 @@ pub async fn refresh_whoop() -> Result<String, String> {
 pub(crate) fn refresh_whoop_blocking() -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cmd = format!(
-        "node {}/Desktop/CD_claude/tools-built/whoop-report/whoop-fetch.cjs",
+        "node {}/Desktop/antfarm-memory/tools-built/whoop-report/whoop-fetch.cjs",
         home
     );
     let mut child = Command::new("/bin/zsh")
@@ -307,7 +307,7 @@ pub async fn morning_insight(
     now: String,
 ) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let brain = format!("{}/Desktop/CD_claude", home);
+    let brain = format!("{}/Desktop/antfarm-memory", home);
     let claude = dispatch.claude_path.lock().unwrap().clone();
 
     tauri::async_runtime::spawn_blocking(move || run_insight(claude, brain, done_summary, now))
@@ -579,7 +579,7 @@ pub async fn morning_chat_send(
     now: String,
 ) -> Result<String, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let brain = format!("{}/Desktop/CD_claude", home);
+    let brain = format!("{}/Desktop/antfarm-memory", home);
     let claude = dispatch.claude_path.lock().unwrap().clone();
 
     let dk = date_key.clone();

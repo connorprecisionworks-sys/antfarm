@@ -2,7 +2,9 @@ use base64::{engine::general_purpose, Engine as _};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::Emitter;
 
 pub(crate) struct PtyEntry {
@@ -19,11 +21,11 @@ impl Default for PtyState {
     }
 }
 
-/// CD_claude brain directory — the orchestrator boots with read access to this
-/// so it carries cross-project memory, not just the current repo.
+/// Memory vault directory — the orchestrator boots with read access to this
+/// so it carries cross-project memory + run history, not just the current repo.
 fn brain_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{}/Desktop/CD_claude", home)
+    format!("{}/Desktop/antfarm-memory", home)
 }
 
 #[tauri::command]
@@ -103,19 +105,63 @@ pub fn spawn_pty(
         guard.insert(pane_id.clone(), PtyEntry { writer, master, child });
     }
 
-    // Background thread: read PTY output → base64-encode → emit as Tauri event
+    // Background: read the PTY on one thread, COALESCE on a second, then emit.
+    //
+    // Claude Code's TUI repaints constantly (spinner, streaming tokens, full-screen
+    // ANSI redraws). Emitting one Tauri event per ~4KB read floods the webview IPC
+    // with thousands of tiny base64 messages per second; the renderer main-thread
+    // and serialization saturate the CPU, queued events balloon memory, and the
+    // machine swaps and locks up. The fix is flow control: batch raw reads through a
+    // channel and emit at most once per ~8ms (or when 64KB accumulates), collapsing
+    // a flood into a steady, bounded stream while staying visually real-time.
     let event_name = format!("pty-output-{}", pane_id);
     let app_clone = app.clone();
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+
+    // Reader thread: blocking reads → send raw chunks to the batcher.
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,  // EOF — child exited
                 Ok(n) => {
-                    let encoded = general_purpose::STANDARD.encode(&buf[..n]);
-                    let _ = app_clone.emit(&event_name, encoded);
+                    if chunk_tx.send(buf[..n].to_vec()).is_err() {
+                        break; // batcher gone
+                    }
                 }
                 Err(_) => break, // EIO or closed master
+            }
+        }
+    });
+
+    // Batcher thread: coalesce chunks, flush on size threshold or short idle gap.
+    std::thread::spawn(move || {
+        const FLUSH_BYTES: usize = 64 * 1024;
+        let flush_interval = Duration::from_millis(8);
+        let mut pending: Vec<u8> = Vec::with_capacity(FLUSH_BYTES);
+
+        let flush = |bytes: &mut Vec<u8>| {
+            if bytes.is_empty() {
+                return;
+            }
+            let encoded = general_purpose::STANDARD.encode(&bytes[..]);
+            let _ = app_clone.emit(&event_name, encoded);
+            bytes.clear();
+        };
+
+        loop {
+            match chunk_rx.recv_timeout(flush_interval) {
+                Ok(chunk) => {
+                    pending.extend_from_slice(&chunk);
+                    if pending.len() >= FLUSH_BYTES {
+                        flush(&mut pending);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => flush(&mut pending),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    flush(&mut pending);
+                    break; // reader done, child exited
+                }
             }
         }
     });

@@ -168,7 +168,7 @@ fn chat_turn_core(
     session_id: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
     let brain = format!(
-        "{}/Desktop/CD_claude",
+        "{}/Desktop/antfarm-memory",
         std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
     );
 

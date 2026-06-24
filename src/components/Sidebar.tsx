@@ -13,6 +13,7 @@ import {
   Sunrise,
   Radio,
   Gift,
+  Brain,
 } from "lucide-react";
 
 const NAV = [
@@ -22,6 +23,7 @@ const NAV = [
   { to: "/", label: "Home", icon: Home, end: true },
   { to: "/projects", label: "Projects", icon: Layers, end: false },
   { to: "/sessions", label: "Sessions", icon: Activity, end: false },
+  { to: "/memory", label: "Memory", icon: Brain, end: false },
   { to: "/usage", label: "Usage", icon: BarChart2, end: false },
   { to: "/wrapped", label: "Wrapped", icon: Gift, end: false },
   { to: "/workspace", label: "Workspace", icon: PanelLeft, end: false },

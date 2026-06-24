@@ -19,7 +19,7 @@ Warm, direct, short. No em dashes.";
 
 fn brain_path() -> String {
     format!(
-        "{}/Desktop/CD_claude",
+        "{}/Desktop/antfarm-memory",
         std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
     )
 }
