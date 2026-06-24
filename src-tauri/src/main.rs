@@ -3,6 +3,7 @@
 mod chat;
 mod dispatch;
 mod harness;
+mod memory;
 mod mobile;
 mod morning;
 mod planning;
@@ -2397,6 +2398,7 @@ fn main() {
             harness::arm_night_plan,
             harness::abort_night_plan,
             harness::list_plan_states,
+            harness::read_plan_step_prompts,
             harness::harness_run_diff,
             harness::accept_run,
             harness::reject_run,
@@ -2443,6 +2445,10 @@ fn main() {
             wrapped_stats,
             save_png_to_desktop,
             open_devtools,
+            memory::memory_list,
+            memory::memory_read,
+            memory::memory_write,
+            memory::memory_search,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

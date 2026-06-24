@@ -258,6 +258,38 @@ fn create_worktree(repo: &str, run_id: &str) -> Result<(String, String, String),
     Ok((wt, branch, base))
 }
 
+/// Reclaim disk from antfarm worktrees left over by PRIOR plans.
+///
+/// Each run materializes a full working tree (often carrying a ~200MB node_modules).
+/// Historically `create_worktree` only pruned the worktree with the SAME run_id, so
+/// every past run's tree lingered forever and the `.antfarm-worktrees` dir grew without
+/// bound — multiple GB of dead checkouts thrashing disk and inflating any file watcher.
+/// This removes any antfarm worktree whose run_id is NOT in the current plan. It keeps
+/// the `antfarm/<run_id>` branch (the actual commits/work) intact — only the on-disk
+/// working tree is deleted, so nothing recoverable is lost.
+fn cleanup_orphan_worktrees(repo: &str, active: &std::collections::HashSet<String>) {
+    let dir = format!("{repo}/.antfarm-worktrees");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return, // no worktrees dir yet — nothing to clean
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if active.contains(&name) {
+            continue; // belongs to the plan about to run — leave it
+        }
+        let wt = format!("{dir}/{name}");
+        // Clean git removal first; fall back to a plain delete so a dir git no longer
+        // tracks (e.g. after a crash) still gets reclaimed. Branch is left untouched.
+        git(repo, &["worktree", "remove", "--force", &wt]).ok();
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+    git(repo, &["worktree", "prune"]).ok();
+}
+
 fn exclude_from_worktree_git(worktree: &str, pattern: &str) -> Result<(), String> {
     let exclude_path = git(worktree, &["rev-parse", "--git-path", "info/exclude"])
         .map(|s| s.trim().to_string())
@@ -835,6 +867,12 @@ fn execute_run(
         let mut guard = shared.lock().unwrap();
         save_state_with(&mut guard, &rs);
     }
+
+    // Write-back: append this run to the memory vault so the agent's memory
+    // compounds across runs instead of resetting each night. Best-effort.
+    crate::memory::append_run_memory(
+        &rs.run_id, &run.goal, &rs.status, &rs.review_verdict, &rs.summary, rs.cost_usd,
+    );
 }
 
 pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
@@ -844,6 +882,23 @@ pub fn execute_plan(app: AppHandle, claude: String, plan: NightPlan,
         let budgets = plan.budgets;
         let defaults = plan.defaults;
         let max_parallel = plan.max_parallel.max(1) as usize;
+
+        // Before this plan creates its worktrees, reclaim disk from orphaned worktrees
+        // of past plans (grouped per repo). Without this, dead checkouts accumulate
+        // unbounded and eventually fill the disk / starve the machine.
+        {
+            let mut by_repo: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for r in &plan.runs {
+                by_repo
+                    .entry(r.project_path.clone())
+                    .or_default()
+                    .insert(r.run_id.clone());
+            }
+            for (repo, active) in &by_repo {
+                cleanup_orphan_worktrees(repo, active);
+            }
+        }
+
         let queue: Arc<Mutex<VecDeque<RunSpec>>> =
             Arc::new(Mutex::new(plan.runs.into_iter().collect()));
 
@@ -1162,7 +1217,7 @@ pub fn author_plan_core(claude: String, description: String, project_path: Strin
         .unwrap_or_default()
         .as_secs();
     let plan_id = format!("authored-{ts}");
-    let brain = format!("{}/Desktop/CD_claude", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+    let brain = format!("{}/Desktop/antfarm-memory", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
     let prompt = PLAN_AUTHOR_PROMPT
         .replace("{description}", &description)
         .replace("{project_path}", &project_path)
@@ -1250,7 +1305,7 @@ pub async fn author_plan(
 }
 
 pub fn propose_plan_core(claude: String, description: String, project_path: String) -> Result<ProposalResult, String> {
-    let brain = format!("{}/Desktop/CD_claude", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+    let brain = format!("{}/Desktop/antfarm-memory", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
     let prompt = PLAN_PROPOSE_PROMPT
         .replace("{description}", &description)
         .replace("{project_path}", &project_path);
@@ -1352,6 +1407,15 @@ pub fn list_plan_states() -> Result<Vec<PlanState>, String> {
         }
     }
     Ok(out)
+}
+
+#[tauri::command]
+pub fn read_plan_step_prompts(plan_path: String) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(&plan_path).map_err(|e| e.to_string())?;
+    let plan: NightPlan = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(plan.runs.iter()
+        .flat_map(|r| r.steps.iter().map(|s| s.prompt.clone()))
+        .collect())
 }
 
 #[tauri::command]

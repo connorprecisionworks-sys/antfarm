@@ -423,6 +423,8 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
         setTimeout(() => {
           if (!mounted) return;
           invoke("write_pty", { paneId, data: seed + "\r" }).catch(() => {});
+          // Clear seed from layout JSON so it never re-fires on workspace restore.
+          api.updateParameters({ ...params, seed: undefined });
         }, 1500);
       }
     }).then(fn => {
@@ -594,6 +596,7 @@ interface DockAreaHandle {
   addPane(type: PaneType, slug: string | null): void;
   buildGrid(kind: GridKind, slug: string | null): void;
   evenOut(): void;
+  delegate(slug: string | null, subtasks: string[]): void;
 }
 
 interface DockAreaProps {
@@ -769,6 +772,28 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
         evenOutPanes(apiRef.current);
       } catch (err) {
         console.error("[DockArea] evenOut failed:", err);
+      }
+    },
+    delegate(slug, subtasks) {
+      const api = apiRef.current;
+      if (!api) return;
+      try {
+        // Add one executor pane per subtask. buildGridLayout will snapshot params
+        // (including seed) via api.toJSON(), clear, and reAddPanel in conductor
+        // order — so seeds survive the relayout and fire on the fresh mounts.
+        for (const subtask of subtasks) {
+          const id = crypto.randomUUID();
+          const panel = api.addPanel({
+            id,
+            component: "terminal",
+            params: { project_slug: slug, role: "executor", seed: subtask } as TerminalParams,
+            title: ROLE_META["executor"].label,
+          });
+          panel.api.setConstraints(TERM_CONSTRAINTS);
+        }
+        buildGridLayout(api, "conductor", slug);
+      } catch (err) {
+        console.error("[DockArea] delegate failed:", err);
       }
     },
   }));
@@ -1785,7 +1810,12 @@ function ValidationReadout({ result, onArm, armError }: { result: AuthorResult; 
   );
 }
 
-function AgentsView() {
+interface AgentsViewProps {
+  dockHandle: DockAreaHandle | null;
+  activeSlug: string | null;
+}
+
+function AgentsView({ dockHandle, activeSlug }: AgentsViewProps) {
   const [plans, setPlans] = useState<HPlanState[]>([]);
   const [loading, setLoading] = useState(true);
   const [hideDev, setHideDev] = useState(true);
@@ -1808,6 +1838,17 @@ function AgentsView() {
   const [proposeResult, setProposeResult] = useState<ProposalResult | null>(null);
   const [selectedOptionId, setSelectedOptionId] = useState("");
   const [proposeNotes, setProposeNotes] = useState("");
+  // Scope & Delegate
+  const [scopeDesc, setScopeDesc] = useState("");
+  const [scopeProject, setScopeProject] = useState<Project | null>(null);
+  const [scopeCustomPath, setScopeCustomPath] = useState("");
+  const [subtasks, setSubtasks] = useState<string[]>([""]);
+  const [autoFillLoading, setAutoFillLoading] = useState(false);
+  const [autoFillError, setAutoFillError] = useState("");
+  const [delegateMsg, setDelegateMsg] = useState("");
+  const [armScopeLoading, setArmScopeLoading] = useState(false);
+  const [armScopeError, setArmScopeError] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   async function refresh() {
     try {
@@ -1855,6 +1896,14 @@ function AgentsView() {
           .then(paths => paths[0]?.path ?? authorCustomPath)
           .catch(() => authorCustomPath)
       : Promise.resolve(authorCustomPath);
+  }
+
+  async function resolveScopePath(): Promise<string> {
+    return scopeProject
+      ? invoke<RepoPath[]>("get_project_paths", { slug: scopeProject.slug })
+          .then(paths => paths[0]?.path ?? scopeCustomPath)
+          .catch(() => scopeCustomPath)
+      : Promise.resolve(scopeCustomPath);
   }
 
   async function runAuthorPlan(description: string) {
@@ -1977,6 +2026,50 @@ function AgentsView() {
     }
   }
 
+  async function handleAutoFill() {
+    const projectPath = await resolveScopePath();
+    if (!projectPath || !scopeDesc.trim()) {
+      setAutoFillError("Enter a description and select a project first");
+      return;
+    }
+    setAutoFillLoading(true);
+    setAutoFillError("");
+    try {
+      const result = await invoke<AuthorResult>("author_plan", { description: scopeDesc, projectPath });
+      const prompts = await invoke<string[]>("read_plan_step_prompts", { planPath: result.planPath });
+      setSubtasks(prompts.length > 0 ? prompts : [""]);
+    } catch (e) {
+      setAutoFillError(String(e));
+    } finally {
+      setAutoFillLoading(false);
+    }
+  }
+
+  function handleDelegateLive() {
+    const filled = subtasks.filter(s => s.trim());
+    if (filled.length === 0) { setDelegateMsg("Add at least one subtask first"); return; }
+    if (!dockHandle) { setDelegateMsg("No active workspace — switch to Live and open a conductor grid first"); return; }
+    dockHandle.delegate(activeSlug, filled);
+    setDelegateMsg(`Delegated ${filled.length} executor pane${filled.length !== 1 ? "s" : ""} — switch to Live to watch`);
+  }
+
+  async function handleArmOvernight() {
+    const projectPath = await resolveScopePath();
+    if (!projectPath || !scopeDesc.trim()) { setArmScopeError("Enter a description and select a project first"); return; }
+    setArmScopeLoading(true);
+    setArmScopeError("");
+    try {
+      const result = await invoke<AuthorResult>("author_plan", { description: scopeDesc, projectPath });
+      await invoke<string>("arm_night_plan", { planPath: result.planPath });
+      setDelegateMsg("Plan armed for overnight run");
+      refresh();
+    } catch (e) {
+      setArmScopeError(String(e));
+    } finally {
+      setArmScopeLoading(false);
+    }
+  }
+
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-hidden" style={{ background: "#0a0a0b" }}>
       <div className="flex items-center gap-3 px-4 h-10 border-b border-zinc-800 shrink-0" style={{ background: "#0d0d0f" }}>
@@ -1995,10 +2088,115 @@ function AgentsView() {
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto">
-        {/* Author a plan panel */}
+        {/* Scope & Delegate panel */}
         <div style={{ padding: "14px 14px 0" }}>
+          {/* ── Scope & Delegate card ── */}
           <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 12, padding: "14px" }}>
-            <p style={{ fontSize: 12, fontWeight: 700, color: "#a1a1aa", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>Author a plan</p>
+            <p style={{ fontSize: 12, fontWeight: 700, color: "#a1a1aa", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>Scope &amp; Delegate</p>
+            <textarea
+              value={scopeDesc}
+              onChange={e => setScopeDesc(e.target.value)}
+              placeholder="Describe the goal — talk to the Orchestrator pane, or click Auto-fill to generate subtasks from a plan…"
+              rows={3}
+              style={{ width: "100%", background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "8px 10px", resize: "vertical", fontFamily: "inherit", outline: "none" }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <select
+                value={scopeProject?.slug ?? ""}
+                onChange={e => {
+                  const p = projects.find(p => p.slug === e.target.value) ?? null;
+                  setScopeProject(p);
+                  if (p) setScopeCustomPath("");
+                }}
+                style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 8px", outline: "none" }}
+              >
+                <option value="">— pick project —</option>
+                {projects.map(p => <option key={p.slug} value={p.slug}>{p.name}</option>)}
+              </select>
+              <input
+                value={scopeCustomPath}
+                onChange={e => { setScopeCustomPath(e.target.value); setScopeProject(null); }}
+                placeholder="or paste path"
+                style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 7, color: "#e4e4e7", fontSize: 12, padding: "6px 10px", outline: "none" }}
+              />
+            </div>
+
+            {/* Subtasks list */}
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#a1a1aa", textTransform: "uppercase", letterSpacing: "0.06em" }}>Subtasks</span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    onClick={() => setSubtasks(s => [...s, ""])}
+                    style={{ fontSize: 11, padding: "2px 8px", borderRadius: 5, border: "1px solid #3f3f46", background: "transparent", color: "#a1a1aa", cursor: "pointer" }}
+                  >+ Add</button>
+                  <button
+                    onClick={handleAutoFill}
+                    disabled={autoFillLoading || !scopeDesc.trim()}
+                    style={{ fontSize: 11, padding: "2px 8px", borderRadius: 5, border: "none", cursor: autoFillLoading || !scopeDesc.trim() ? "not-allowed" : "pointer", background: autoFillLoading ? "#27272a" : "#312e81", color: autoFillLoading ? "#52525b" : "#c7d2fe" }}
+                  >{autoFillLoading ? "Auto-filling… (~30s)" : "Auto-fill from plan"}</button>
+                </div>
+              </div>
+              {subtasks.map((task, i) => (
+                <div key={i} style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+                  <input
+                    value={task}
+                    onChange={e => setSubtasks(s => s.map((t, j) => j === i ? e.target.value : t))}
+                    placeholder={`Subtask ${i + 1}`}
+                    style={{ flex: 1, background: "#0a0a0b", border: "1px solid #3f3f46", borderRadius: 6, color: "#e4e4e7", fontSize: 12, padding: "5px 8px", outline: "none" }}
+                  />
+                  <button
+                    onClick={() => setSubtasks(s => s.filter((_, j) => j !== i))}
+                    style={{ padding: "0 9px", borderRadius: 6, border: "1px solid #3f3f46", background: "transparent", color: "#71717a", cursor: "pointer", fontSize: 14, lineHeight: 1 }}
+                  >×</button>
+                </div>
+              ))}
+            </div>
+
+            {autoFillError && <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 6 }}>{autoFillError}</div>}
+
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button
+                onClick={handleDelegateLive}
+                disabled={subtasks.filter(s => s.trim()).length === 0}
+                style={{
+                  flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none",
+                  cursor: subtasks.filter(s => s.trim()).length === 0 ? "not-allowed" : "pointer",
+                  background: subtasks.filter(s => s.trim()).length === 0 ? "#27272a" : "#065f46",
+                  color: subtasks.filter(s => s.trim()).length === 0 ? "#52525b" : "#6ee7b7",
+                }}
+              >Delegate live</button>
+              <button
+                onClick={handleArmOvernight}
+                disabled={armScopeLoading || !scopeDesc.trim()}
+                style={{
+                  flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none",
+                  cursor: armScopeLoading || !scopeDesc.trim() ? "not-allowed" : "pointer",
+                  background: armScopeLoading ? "#27272a" : "#312e81",
+                  color: armScopeLoading ? "#52525b" : "#c7d2fe",
+                }}
+              >{armScopeLoading ? "Arming…" : "Arm overnight"}</button>
+            </div>
+            {(delegateMsg || armScopeError) && (
+              <div style={{ fontSize: 11, marginTop: 6, color: armScopeError ? "#fca5a5" : "#86efac" }}>
+                {armScopeError || delegateMsg}
+              </div>
+            )}
+          </div>
+
+          {/* ── Advanced disclosure (old author / load plan) ── */}
+          <div style={{ background: "#111113", border: "1px solid #27272a", borderRadius: 12, marginTop: 10, overflow: "hidden" }}>
+            <button
+              onClick={() => setAdvancedOpen(o => !o)}
+              style={{ width: "100%", display: "flex", alignItems: "center", gap: 6, padding: "10px 14px", background: "transparent", border: "none", cursor: "pointer", textAlign: "left" as const }}
+            >
+              <ChevronDown size={12} style={{ transform: advancedOpen ? undefined : "rotate(-90deg)", transition: "transform 0.15s", color: "#52525b", flexShrink: 0 }} />
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#52525b", textTransform: "uppercase" as const, letterSpacing: "0.06em" }}>Advanced</span>
+            </button>
+            {advancedOpen && (
+              <div style={{ padding: "0 14px 14px" }}>
+                <div style={{ background: "#0d0d0f", border: "1px solid #1f1f21", borderRadius: 10, padding: "14px", marginBottom: 10 }}>
+                  <p style={{ fontSize: 12, fontWeight: 700, color: "#a1a1aa", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>Author a plan</p>
             <textarea
               value={authorDesc}
               onChange={e => setAuthorDesc(e.target.value)}
@@ -2139,6 +2337,9 @@ function AgentsView() {
                   setLoadError(String(e));
                 }
               }} armError={""} />
+            )}
+          </div>
+        </div>
             )}
           </div>
         </div>
@@ -2318,10 +2519,20 @@ export function WorkspacePage() {
   });
   const [workspaces, setWorkspaces] = useState<WorkspaceEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [activatedIds, setActivatedIds] = useState<Set<string>>(new Set());
   const [isCreating, setIsCreating] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [loaded, setLoaded] = useState(false);
   const dockRefs = useRef<Record<string, DockAreaHandle | null>>({});
+
+  // Track which workspaces have ever been the active workspace this session.
+  // DockAreas (and their PTYs) only mount for activated workspaces — prevents
+  // background workspaces from spawning idle claude/shell processes on app load.
+  useEffect(() => {
+    if (activeId) {
+      setActivatedIds(prev => prev.has(activeId) ? prev : new Set([...prev, activeId]));
+    }
+  }, [activeId]);
 
   useEffect(() => {
     invoke<WorkspaceEntry[]>("load_workspaces")
@@ -2439,11 +2650,17 @@ export function WorkspacePage() {
         ))}
       </div>
 
-      {mode === "agents" ? (
-        <AgentsView />
-      ) : mode === "chat" ? (
-        <ChatView />
-      ) : (
+      {/* Mode overlays — AgentsView and ChatView are conditionally rendered */}
+      {mode === "agents" && (
+        <AgentsView
+          dockHandle={activeId ? (dockRefs.current[activeId] ?? null) : null}
+          activeSlug={activeWorkspace?.project_slug ?? null}
+        />
+      )}
+      {mode === "chat" && <ChatView />}
+
+      {/* Live-mode chrome — tab bar, HUD, create form, empty state */}
+      {mode === "live" && (
         <>
           {/* Tab bar — outer row does NOT clip; only the tab strip scrolls.
               The Add pane dropdown lives OUTSIDE the scroll container so it
@@ -2506,23 +2723,28 @@ export function WorkspacePage() {
               </button>
             </div>
           )}
-
-          {/* Dock areas — one per workspace, visibility-toggled so PTYs stay alive */}
-          {workspaces.map(ws => (
-            <div
-              key={ws.id}
-              className="flex-1 min-h-0 overflow-hidden"
-              style={{ display: ws.id === activeId ? undefined : "none" }}
-            >
-              <DockArea
-                ref={el => { dockRefs.current[ws.id] = el; }}
-                workspace={ws}
-                onLayoutChange={json => handleLayoutChange(ws.id, json)}
-              />
-            </div>
-          ))}
         </>
       )}
+
+      {/* Dock areas — mounted on first visit, then kept alive so PTYs survive
+          mode switches. Only workspaces the user has activated this session
+          get a DockArea; background workspaces never spawn idle PTYs. */}
+      {workspaces.map(ws => {
+        if (!activatedIds.has(ws.id)) return null;
+        return (
+          <div
+            key={ws.id}
+            className="flex-1 min-h-0 overflow-hidden"
+            style={{ display: mode === "live" && ws.id === activeId ? undefined : "none" }}
+          >
+            <DockArea
+              ref={el => { dockRefs.current[ws.id] = el; }}
+              workspace={ws}
+              onLayoutChange={json => handleLayoutChange(ws.id, json)}
+            />
+          </div>
+        );
+      })}
     </div>
   );
 }
