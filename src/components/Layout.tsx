@@ -1,8 +1,10 @@
 import { Outlet, useLocation } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { WorkspacePage } from "../pages/Workspace";
+import { useAttentionSounds } from "../lib/useAttentionSounds";
 
 export function Layout() {
+  useAttentionSounds();
   const { pathname } = useLocation();
   const isWorkspace = pathname === "/workspace";
 

@@ -9,6 +9,9 @@ export function Settings() {
   const [settings, setSettings] = useState<SettingsType>({
     weekly_cap_tokens: 100_000_000,
     reset_weekday: 0,
+    sound_enabled: true,
+    sound_code_enabled: true,
+    sound_cowork_enabled: true,
   });
   const [capInput, setCapInput] = useState("100000000");
   const [loading, setLoading] = useState(true);
@@ -30,12 +33,19 @@ export function Settings() {
       setError("Enter a valid positive number.");
       return;
     }
-    const updated: SettingsType = { weekly_cap_tokens: cap, reset_weekday: settings.reset_weekday };
+    const updated: SettingsType = {
+      weekly_cap_tokens: cap,
+      reset_weekday: settings.reset_weekday,
+      sound_enabled: settings.sound_enabled,
+      sound_code_enabled: settings.sound_code_enabled,
+      sound_cowork_enabled: settings.sound_cowork_enabled,
+    };
     setSaving(true);
     setError("");
     invoke<void>("save_settings", { settings: updated })
       .then(() => {
         setSettings(updated);
+        window.dispatchEvent(new CustomEvent("antfarm-settings-saved"));
         setSaving(false);
         setSaved(true);
         setTimeout(() => setSaved(false), 2000);
@@ -117,6 +127,49 @@ export function Settings() {
                 {day.slice(0, 3)}
               </button>
             ))}
+          </div>
+        </div>
+
+        {/* Attention sounds */}
+        <div className="rounded-xl border border-zinc-800 bg-surface-2 p-5 space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-zinc-200 mb-1">
+              Attention sounds
+            </label>
+            <p className="text-xs text-zinc-500">
+              Plays a sound when Claude Code needs a response or a Cowork session goes idle.
+            </p>
+          </div>
+          <div className="space-y-3">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.sound_enabled}
+                onChange={(e) => setSettings((s) => ({ ...s, sound_enabled: e.target.checked }))}
+                className="w-4 h-4 accent-indigo-500"
+              />
+              <span className="text-sm text-zinc-200">Enable sounds</span>
+            </label>
+            <div className={settings.sound_enabled ? "" : "opacity-40 pointer-events-none"}>
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.sound_code_enabled}
+                  onChange={(e) => setSettings((s) => ({ ...s, sound_code_enabled: e.target.checked }))}
+                  className="w-4 h-4 accent-indigo-500"
+                />
+                <span className="text-sm text-zinc-400">Claude Code notifications</span>
+              </label>
+              <label className="flex items-center gap-3 cursor-pointer mt-2">
+                <input
+                  type="checkbox"
+                  checked={settings.sound_cowork_enabled}
+                  onChange={(e) => setSettings((s) => ({ ...s, sound_cowork_enabled: e.target.checked }))}
+                  className="w-4 h-4 accent-indigo-500"
+                />
+                <span className="text-sm text-zinc-400">Cowork waiting</span>
+              </label>
+            </div>
           </div>
         </div>
 

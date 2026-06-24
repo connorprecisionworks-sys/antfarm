@@ -90,11 +90,11 @@ fn match_cwd_to_slug_ci(cwd: &str, registry: &Registry) -> Option<String> {
     None
 }
 
-fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry) {
+fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry) -> bool {
     let path = events_file_path();
     let file_size = match fs::metadata(&path) {
         Ok(m) => m.len(),
-        Err(_) => return,
+        Err(_) => return false,
     };
     let mut offset = load_offset();
     if file_size < offset {
@@ -103,16 +103,17 @@ fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry
         save_offset(0);
     }
     if file_size == offset {
-        return;
+        return false;
     }
-    let Ok(mut f) = fs::File::open(&path) else { return };
+    let Ok(mut f) = fs::File::open(&path) else { return false };
     if offset > 0 && f.seek(SeekFrom::Start(offset)).is_err() {
-        return;
+        return false;
     }
     let mut raw = Vec::new();
-    let Ok(bytes_read) = f.read_to_end(&mut raw) else { return };
+    let Ok(bytes_read) = f.read_to_end(&mut raw) else { return false };
     let new_offset = offset + bytes_read as u64;
     let text = String::from_utf8_lossy(&raw);
+    let mut has_notification = false;
     {
         let mut guard = store.lock().unwrap();
         for line in text.lines() {
@@ -128,8 +129,15 @@ fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry
                 "Stop" => "idle",
                 "SessionEnd" => "done",
                 "Notification" => match ev.notification_type.as_deref() {
-                    Some("permission_prompt") => "needs_permission",
-                    _ => "idle", // idle_prompt: muted, no alert
+                    Some("permission_prompt") => {
+                        has_notification = true;
+                        "needs_permission"
+                    }
+                    Some("idle_prompt") => {
+                        has_notification = true;
+                        "idle"
+                    }
+                    _ => "idle",
                 },
                 _ => continue,
             };
@@ -144,6 +152,7 @@ fn process_events_file(store: &Arc<Mutex<EventsStateInner>>, registry: &Registry
         }
     }
     save_offset(new_offset);
+    has_notification
 }
 
 fn spawn_events_watcher(app: tauri::AppHandle, store: Arc<Mutex<EventsStateInner>>) {
@@ -173,8 +182,11 @@ fn spawn_events_watcher(app: tauri::AppHandle, store: Arc<Mutex<EventsStateInner
             match result {
                 Ok(event) if event.paths.iter().any(|p| p == &target) => {
                     let reg = load_registry();
-                    process_events_file(&store, &reg);
+                    let had_notification = process_events_file(&store, &reg);
                     let _ = app.emit("antfarm-events-updated", ());
+                    if had_notification {
+                        let _ = app.emit("antfarm-sound-cue", ());
+                    }
                 }
                 Err(e) => eprintln!("antfarm events: watch error: {e}"),
                 _ => {}
@@ -404,10 +416,18 @@ fn get_file_content(slug: String, filename: String) -> Option<String> {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+fn default_true() -> bool { true }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Settings {
     weekly_cap_tokens: u64,
     reset_weekday: u8, // 0=Mon … 6=Sun
+    #[serde(default = "default_true")]
+    sound_enabled: bool,
+    #[serde(default = "default_true")]
+    sound_code_enabled: bool,
+    #[serde(default = "default_true")]
+    sound_cowork_enabled: bool,
 }
 
 impl Default for Settings {
@@ -415,6 +435,9 @@ impl Default for Settings {
         Self {
             weekly_cap_tokens: 100_000_000,
             reset_weekday: 0,
+            sound_enabled: true,
+            sound_code_enabled: true,
+            sound_cowork_enabled: true,
         }
     }
 }

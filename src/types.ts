@@ -63,6 +63,9 @@ export interface UsageRollup {
 export interface Settings {
   weekly_cap_tokens: number;
   reset_weekday: number; // 0=Mon … 6=Sun
+  sound_enabled: boolean;
+  sound_code_enabled: boolean;
+  sound_cowork_enabled: boolean;
 }
 
 export interface TokenTotals {
