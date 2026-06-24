@@ -144,6 +144,16 @@ export interface RunRecord {
   permissionMode: string;
 }
 
+// Locked R1 contract — every phase after R1 reads this shape.
+export interface RunResult {
+  runId: string;
+  sessionId: string | null;
+  worktreePath: string | null;
+  finalMessage: string | null;
+  diffStat: string | null;
+  acceptCheck: string; // "none" | "pending" | "approved" | "flagged"
+}
+
 export interface RunEvent {
   runId: string;
   kind: "line" | "stderr" | "status";

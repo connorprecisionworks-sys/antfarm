@@ -8,12 +8,13 @@
 //   - native --worktree flag instead of hand-rolled git worktree add
 //   - kill_run writes "killed" immediately; reader thread never overwrites it
 //   - per-run permission-mode choice from the UI
-//   - session_id captured from the stream-json init line
+//   - session_id + cwd captured from the stream-json init line
+//   - RunResult struct locked here (R1+) — every later phase reads this contract
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +61,25 @@ pub struct RunEvent {
     pub run_id:  String,
     pub kind:    String,  // "line" | "stderr" | "status"
     pub payload: String,
+}
+
+// ── RunResult — LOCKED CONTRACT (R1). Every later phase reads this. ──────────
+// Fields:
+//   run_id        — matches RunRecord.run_id
+//   session_id    — stream-json init session_id; ties result to transcript
+//   worktree_path — actual cwd where claude ran (worktree path if --worktree)
+//   final_message — content of the stream-json `result` event
+//   diff_stat     — output of `git diff --stat HEAD` in the worktree
+//   accept_check  — "none" | "pending" | "approved" | "flagged" (R3 fills this)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunResult {
+    pub run_id:        String,
+    pub session_id:    Option<String>,
+    pub worktree_path: Option<String>,
+    pub final_message: Option<String>,
+    pub diff_stat:     Option<String>,
+    pub accept_check:  String,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -191,7 +211,8 @@ pub fn dispatch_run(
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() { continue; }
 
-                // Capture session_id from the stream-json init line
+                // Capture session_id + actual cwd (worktree path when --worktree)
+                // from the stream-json init line.
                 if local.session_id.is_none() {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                         if v.get("type").and_then(|t| t.as_str()) == Some("system")
@@ -199,8 +220,14 @@ pub fn dispatch_run(
                         {
                             if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
                                 local.session_id = Some(sid.to_string());
-                                save_record(&local);
                             }
+                            // effective_cwd updates to the actual worktree path
+                            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                                if !cwd.is_empty() {
+                                    local.effective_cwd = cwd.to_string();
+                                }
+                            }
+                            save_record(&local);
                         }
                     }
                 }
@@ -323,6 +350,116 @@ pub fn open_terminal_resume(cwd: &str, sid: &str) -> Result<(), String> {
         w.write_all(script.as_bytes()).ok();
     }
     Ok(())
+}
+
+// ── RunResult computation ─────────────────────────────────────────────────────
+
+/// Run `git diff --stat HEAD` in `cwd`; return None on any error or empty output.
+fn run_git_diff_stat(cwd: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--stat", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Parse a Claude Code transcript (.jsonl) and extract:
+///   - the final `result` message text
+///   - the `cwd` from the `system/init` line (worktree path when --worktree used)
+fn parse_transcript_result(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(f) = std::fs::File::open(path) else { return (None, None); };
+    let reader = BufReader::new(f);
+    let mut final_msg: Option<String> = None;
+    let mut init_cwd: Option<String> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if typ == "system" && init_cwd.is_none() {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.is_empty() {
+                    init_cwd = Some(cwd.to_string());
+                }
+            }
+        }
+        if typ == "result" {
+            if let Some(r) = v.get("result").and_then(|r| r.as_str()) {
+                final_msg = Some(r.to_string());
+            }
+        }
+    }
+    (final_msg, init_cwd)
+}
+
+/// Search ~/.claude/projects/ for a JSONL transcript file named `<session_id>.jsonl`.
+fn find_transcript(session_id: &str) -> Option<PathBuf> {
+    let projects_dir = home().join(".claude/projects");
+    let dirs = std::fs::read_dir(&projects_dir).ok()?;
+    for dir_entry in dirs.flatten() {
+        let candidate = dir_entry.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Build a `RunResult` for a finished (or in-progress) run.
+/// Tolerant: missing transcript / git errors produce None fields rather than Err.
+#[tauri::command]
+pub fn get_run_result(run_id: String) -> Result<RunResult, String> {
+    let rec_path = runs_dir().join(format!("{run_id}.json"));
+    let text = std::fs::read_to_string(&rec_path)
+        .map_err(|e| format!("run not found: {e}"))?;
+    let rec: RunRecord = serde_json::from_str(&text)
+        .map_err(|e| format!("parse error: {e}"))?;
+
+    let (final_message, transcript_cwd) = rec.session_id
+        .as_deref()
+        .and_then(find_transcript)
+        .map(|p| parse_transcript_result(&p))
+        .unwrap_or((None, None));
+
+    // Worktree path: prefer transcript cwd (actual run dir), then effective_cwd
+    // (updated from init event), then fall back to nothing.
+    let worktree_path = transcript_cwd
+        .clone()
+        .or_else(|| {
+            if !rec.effective_cwd.is_empty() && rec.effective_cwd != rec.project_path {
+                Some(rec.effective_cwd.clone())
+            } else if rec.used_worktree && !rec.effective_cwd.is_empty() {
+                Some(rec.effective_cwd.clone())
+            } else {
+                None
+            }
+        });
+
+    let diff_stat = worktree_path
+        .as_deref()
+        .and_then(run_git_diff_stat)
+        .or_else(|| {
+            if !rec.project_path.is_empty() {
+                run_git_diff_stat(&rec.project_path)
+            } else {
+                None
+            }
+        });
+
+    let accept_check = match rec.status.as_str() {
+        "done" => "none",
+        "failed" | "killed" => "none",
+        _ => "pending",
+    }.to_string();
+
+    Ok(RunResult {
+        run_id:        rec.run_id,
+        session_id:    rec.session_id,
+        worktree_path,
+        final_message,
+        diff_stat,
+        accept_check,
+    })
 }
 
 /// Load all run records without requiring Tauri State (used by wrapped_stats).

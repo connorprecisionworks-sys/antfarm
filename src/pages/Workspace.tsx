@@ -4,6 +4,7 @@ import React, {
   useContext,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -24,7 +25,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { Activity, BarChart2, Bell, BookOpen, ChevronDown, Globe, Layout, Monitor, Plus, SquareTerminal, X, Zap } from "lucide-react";
-import { GitMetricsRollup, Project, ProjectDetail as PD, RepoPath, SessionMeta, Settings, UsageRollup, WorkspaceEntry } from "../types";
+import { GitMetricsRollup, Project, ProjectDetail as PD, RepoPath, RunEvent, RunRecord, RunResult, SessionMeta, Settings, UsageRollup, WorkspaceEntry } from "../types";
 import { MarkdownView } from "../components/MarkdownView";
 import { fmtDollars, fmtTokens } from "../lib/relativeTime";
 
@@ -46,6 +47,22 @@ function toEmbedUrl(raw: string): string {
 // ── Save context (panels call this after updating their params) ────────────
 
 const SaveTrigger = React.createContext<() => void>(() => {});
+
+// ── Relay contexts (R1 select-and-send) ───────────────────────────────────
+// RelaySendContext: used by orchestrator pane to dispatch a prompt.
+// RelayRunContext:  used by executor pane to display the active run.
+
+interface RelaySendCtx {
+  busy: boolean;
+  send: (prompt: string, projectSlug: string | null) => void;
+}
+const RelaySendContext = React.createContext<RelaySendCtx>({ busy: false, send: () => {} });
+
+interface RelayRunCtx {
+  runId: string | null;
+  setBusy: (b: boolean) => void;
+}
+const RelayRunContext = React.createContext<RelayRunCtx>({ runId: null, setBusy: () => {} });
 
 // ── Web / Media pane ───────────────────────────────────────────────────────
 
@@ -346,6 +363,61 @@ function SkillsMenu({ paneId }: { paneId: string }) {
   );
 }
 
+// ── Selection overlay (R1: orchestrator → executor relay) ─────────────────
+// Shows when text is selected in an orchestrator pane. The preview IS the
+// one-line confirm the spec requires — the user sees exactly what will be sent.
+
+function SelectionOverlay({ text, busy, onSend, onDismiss }: {
+  text: string;
+  busy: boolean;
+  onSend: () => void;
+  onDismiss: () => void;
+}) {
+  const preview = text.length > 90 ? text.slice(0, 87) + "…" : text;
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      padding: "5px 8px", flexShrink: 0,
+      background: "#0d1117", borderBottom: "1px solid #10b981",
+    }}>
+      <span style={{ fontSize: 10, color: "#6ee7b7", fontWeight: 700, flexShrink: 0, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+        Send:
+      </span>
+      <span style={{
+        fontSize: 11, color: "#d1d5db", flex: 1, overflow: "hidden",
+        textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace",
+      }}>
+        {preview}
+      </span>
+      <button
+        onClick={onSend}
+        disabled={busy}
+        title={busy ? "Executor is busy" : "Send selection to executor (confirm)"}
+        style={{
+          flexShrink: 0, fontSize: 11, fontWeight: 700,
+          padding: "3px 10px", borderRadius: 5, border: "none",
+          cursor: busy ? "not-allowed" : "pointer",
+          background: busy ? "#27272a" : "#065f46",
+          color: busy ? "#52525b" : "#6ee7b7",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {busy ? "Executor busy" : "Send to executor"}
+      </button>
+      <button
+        onClick={onDismiss}
+        style={{
+          flexShrink: 0, fontSize: 12, padding: "1px 6px", borderRadius: 4,
+          border: "1px solid #3f3f46", background: "transparent", color: "#71717a",
+          cursor: "pointer", lineHeight: 1.4,
+        }}
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
 // ── Terminal pane ──────────────────────────────────────────────────────────
 
 type PaneRole = "shell" | "orchestrator" | "executor";
@@ -378,6 +450,8 @@ const XTERM_THEME = {
 function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
   const paneId = api.id;
   const containerRef = useRef<HTMLDivElement>(null);
+  const relaySend = useContext(RelaySendContext);
+  const [selectedText, setSelectedText] = useState("");
 
   useEffect(() => {
     const el = containerRef.current;
@@ -405,6 +479,13 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
     term.onData(data => {
       invoke("write_pty", { paneId, data }).catch(() => {});
     });
+
+    // Selection → show send-to-executor overlay (orchestrator role only)
+    if (params.role === "orchestrator") {
+      term.onSelectionChange(() => {
+        setSelectedText(term.getSelection() ?? "");
+      });
+    }
 
     // PTY stdout → xterm (base64-encoded bytes).
     // Seed: on the first output event (proves the agent is alive) wait 1.5s
@@ -494,10 +575,162 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
           <SkillsMenu paneId={paneId} />
         </div>
       )}
+      {role === "orchestrator" && selectedText.trim() && (
+        <SelectionOverlay
+          text={selectedText.trim()}
+          busy={relaySend.busy}
+          onSend={() => {
+            relaySend.send(selectedText.trim(), params.project_slug);
+            setSelectedText("");
+          }}
+          onDismiss={() => setSelectedText("")}
+        />
+      )}
       <div
         ref={containerRef}
         style={{ flex: 1, minHeight: 0, overflow: "hidden", padding: "4px", boxSizing: "border-box" }}
       />
+    </div>
+  );
+}
+
+// ── Executor Relay pane (R1) ──────────────────────────────────────────────
+// Renders the stream-json output of a `claude -p` run as a message thread.
+// Reads its current run_id from RelayRunContext (set by DockArea on send).
+
+function ExecutorRelayPane(_: IDockviewPanelProps<Record<string, never>>) {
+  const { runId, setBusy } = useContext(RelayRunContext);
+  const [lines, setLines] = useState<RunEvent[]>([]);
+  const [status, setStatus] = useState("idle");
+  const [result, setResult] = useState<RunResult | null>(null);
+  const trackedRunId = useRef<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Re-subscribe whenever runId changes
+  useEffect(() => {
+    if (!runId) return;
+    if (runId === trackedRunId.current) return;
+    trackedRunId.current = runId;
+    setLines([]);
+    setStatus("running");
+    setResult(null);
+
+    let unlisten: UnlistenFn | null = null;
+    let mounted = true;
+
+    listen<RunEvent>("antfarm-run-event", ev => {
+      if (!mounted) return;
+      const e = ev.payload;
+      if (e.runId !== runId) return;
+      if (e.kind === "status") {
+        setStatus(e.payload);
+        if (["done", "failed", "killed"].includes(e.payload)) {
+          setBusy(false);
+          if (e.payload === "done") {
+            invoke<RunResult>("get_run_result", { runId })
+              .then(r => { if (mounted) setResult(r); })
+              .catch(() => {});
+          }
+        }
+      } else {
+        setLines(prev => [...prev, e]);
+      }
+    }).then(fn => { if (mounted) unlisten = fn; else fn(); });
+
+    return () => { mounted = false; unlisten?.(); };
+  }, [runId, setBusy]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [lines.length]);
+
+  // Parse stream-json lines into renderable message objects
+  const messages = useMemo(() => {
+    const out: { id: string; text: string; isResult: boolean; isError: boolean }[] = [];
+    for (const ev of lines) {
+      if (ev.kind !== "line") continue;
+      try {
+        const v = JSON.parse(ev.payload) as Record<string, unknown>;
+        const typ = v["type"] as string | undefined;
+        if (typ === "assistant") {
+          const content = (v["message"] as Record<string, unknown> | undefined)?.["content"];
+          if (Array.isArray(content)) {
+            for (const block of content as Array<Record<string, unknown>>) {
+              if (block["type"] === "text" && typeof block["text"] === "string" && block["text"].trim()) {
+                out.push({ id: `a-${out.length}`, text: block["text"] as string, isResult: false, isError: false });
+              }
+            }
+          }
+        } else if (typ === "result") {
+          const r = v["result"];
+          if (typeof r === "string" && r.trim()) {
+            out.push({ id: `r-${out.length}`, text: r, isResult: true, isError: !!v["is_error"] });
+          }
+        }
+      } catch { /* non-JSON or unrecognised line — skip */ }
+    }
+    return out;
+  }, [lines]);
+
+  const accent = "#10b981";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0b", borderTop: `2px solid ${accent}`, boxSizing: "border-box" }}>
+      {/* Status header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 8px", background: "rgba(16,185,129,0.10)", borderBottom: "1px solid #18181b", flexShrink: 0 }}>
+        <span style={{ width: 6, height: 6, borderRadius: "50%", background: accent, flexShrink: 0 }} />
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: accent }}>Executor</span>
+        <HStatusChip status={status} />
+        {runId && (
+          <span style={{ fontSize: 10, color: "#3f3f46", fontFamily: "monospace", marginLeft: 4 }}>
+            {runId.slice(-8)}
+          </span>
+        )}
+      </div>
+
+      {/* Message thread */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+        {!runId ? (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", flexDirection: "column", gap: 8 }}>
+            <span style={{ fontSize: 13, color: "#3f3f46" }}>Select text in the Orchestrator</span>
+            <span style={{ fontSize: 11, color: "#27272a" }}>then click "Send to executor" to run it here</span>
+          </div>
+        ) : messages.length === 0 && status === "running" ? (
+          <div style={{ fontSize: 11, color: "#52525b", fontStyle: "italic" }}>Starting run…</div>
+        ) : (
+          messages.map(msg => (
+            <div key={msg.id}>
+              <div style={{
+                maxWidth: "92%",
+                background: msg.isResult ? (msg.isError ? "#450a0a" : "#052e16") : "#111113",
+                border: `1px solid ${msg.isResult ? (msg.isError ? "#991b1b" : "#166534") : "#27272a"}`,
+                borderRadius: msg.isResult ? 10 : "3px 10px 10px 10px",
+                padding: "8px 12px",
+                fontSize: msg.isResult ? 13 : 12,
+                color: msg.isResult ? (msg.isError ? "#fca5a5" : "#86efac") : "#e4e4e7",
+                lineHeight: 1.55,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}>
+                {msg.text}
+              </div>
+            </div>
+          ))
+        )}
+
+        {/* Diff stat card (shown when run completes with git changes) */}
+        {result?.diffStat && (
+          <div style={{
+            background: "#0d1117", border: "1px solid #1f2937", borderRadius: 8,
+            padding: "8px 12px", fontSize: 11, color: "#6ee7b7",
+            fontFamily: "monospace", whiteSpace: "pre-wrap", marginTop: 4,
+          }}>
+            {result.diffStat}
+          </div>
+        )}
+
+        <div ref={bottomRef} />
+      </div>
     </div>
   );
 }
@@ -585,11 +818,12 @@ const DOCK_COMPONENTS = {
   web: WebPane,
   project_info: ProjectInfoPane,
   terminal: TerminalPane,
+  executor_relay: ExecutorRelayPane,
 } as const;
 
 // ── DockArea ───────────────────────────────────────────────────────────────
 
-type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor";
+type PaneType = "web" | "project_info" | "terminal" | "orchestrator" | "executor" | "executor_relay";
 type GridKind = "2across" | "3across" | "2x2" | "conductor";
 
 interface DockAreaHandle {
@@ -717,6 +951,64 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   const onLayoutChangeRef = useRef(onLayoutChange);
   useEffect(() => { onLayoutChangeRef.current = onLayoutChange; }, [onLayoutChange]);
 
+  // ── Relay state (R1) ────────────────────────────────────────────────────
+  const [relayRunId, setRelayRunId] = useState<string | null>(null);
+  const [relayBusy, setRelayBusy] = useState(false);
+
+  // Auto-clear busy when the active run finishes (regardless of whether an
+  // executor pane is mounted — prevents permanent lock if pane is closed).
+  useEffect(() => {
+    if (!relayRunId) return;
+    let unlisten: UnlistenFn | null = null;
+    let mounted = true;
+    listen<RunEvent>("antfarm-run-event", ev => {
+      if (!mounted) return;
+      const e = ev.payload;
+      if (e.runId !== relayRunId) return;
+      if (e.kind === "status" && ["done", "failed", "killed"].includes(e.payload)) {
+        setRelayBusy(false);
+      }
+    }).then(fn => { if (mounted) unlisten = fn; else fn(); });
+    return () => { mounted = false; unlisten?.(); };
+  }, [relayRunId]);
+
+  // Dispatch a prompt to a claude -p worktree run and record its run_id.
+  const sendToExecutor = useCallback(async (prompt: string, projectSlug: string | null) => {
+    if (relayBusy) return;
+    setRelayBusy(true);
+    let projectPath = "";
+    const slug = projectSlug ?? workspace.project_slug ?? null;
+    if (slug) {
+      try {
+        const paths = await invoke<RepoPath[]>("get_project_paths", { slug });
+        projectPath = paths[0]?.path ?? "";
+      } catch { /* ignore */ }
+    }
+    if (!projectPath) { setRelayBusy(false); return; }
+    try {
+      const rec = await invoke<RunRecord>("dispatch_run", {
+        projectPath,
+        prompt,
+        useWorktree: true,
+        permissionMode: "acceptEdits",
+      });
+      setRelayRunId(rec.runId);
+    } catch (err) {
+      console.error("[relay] dispatch_run failed:", err);
+      setRelayBusy(false);
+    }
+  }, [relayBusy, workspace.project_slug]);
+
+  const relaySendCtx = useMemo<RelaySendCtx>(() => ({
+    busy: relayBusy,
+    send: sendToExecutor,
+  }), [relayBusy, sendToExecutor]);
+
+  const relayRunCtx = useMemo<RelayRunCtx>(() => ({
+    runId: relayRunId,
+    setBusy: setRelayBusy,
+  }), [relayRunId]);
+
   const scheduleSave = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => {
@@ -738,6 +1030,8 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       api.addPanel({ id, component: "web", params: { url: "" } as WebParams, title: "Web", position });
     } else if (type === "project_info") {
       api.addPanel({ id, component: "project_info", params: { project_slug: slug } as InfoParams, title: "Project Info", position });
+    } else if (type === "executor_relay") {
+      api.addPanel({ id, component: "executor_relay", params: {}, title: "Executor", position });
     } else {
       const role: PaneRole = type === "orchestrator" ? "orchestrator" : type === "executor" ? "executor" : "shell";
       const panel = api.addPanel({ id, component: "terminal", params: { project_slug: slug, role } as TerminalParams, title: ROLE_META[role].label, position });
@@ -842,12 +1136,16 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
 
   return (
     <SaveTrigger.Provider value={scheduleSave}>
-      <DockviewReact
-        className="h-full dockview-theme-abyss"
-        onReady={handleReady}
-        components={DOCK_COMPONENTS}
-        defaultTabComponent={PanelTab}
-      />
+      <RelaySendContext.Provider value={relaySendCtx}>
+        <RelayRunContext.Provider value={relayRunCtx}>
+          <DockviewReact
+            className="h-full dockview-theme-abyss"
+            onReady={handleReady}
+            components={DOCK_COMPONENTS}
+            defaultTabComponent={PanelTab}
+          />
+        </RelayRunContext.Provider>
+      </RelaySendContext.Provider>
     </SaveTrigger.Provider>
   );
 });
@@ -1085,6 +1383,13 @@ function AddPaneMenu({ onAdd }: { onAdd: (type: PaneType) => void }) {
           >
             <SquareTerminal size={13} className="shrink-0" style={{ color: "#10b981" }} />
             Executor (Claude Code)
+          </button>
+          <button
+            onClick={() => { onAdd("executor_relay"); setOpen(false); }}
+            className="flex items-center gap-2.5 w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
+          >
+            <SquareTerminal size={13} className="shrink-0" style={{ color: "#6ee7b7" }} />
+            Executor (Relay)
           </button>
           <div className="my-1 border-t border-zinc-700" />
           <button

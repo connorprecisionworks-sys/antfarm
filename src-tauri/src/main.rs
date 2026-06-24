@@ -2395,6 +2395,7 @@ fn main() {
             dispatch::list_runs,
             dispatch::kill_run,
             dispatch::take_over_run,
+            dispatch::get_run_result,
             harness::arm_night_plan,
             harness::abort_night_plan,
             harness::list_plan_states,
