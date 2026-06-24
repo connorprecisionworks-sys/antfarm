@@ -48,21 +48,38 @@ function toEmbedUrl(raw: string): string {
 
 const SaveTrigger = React.createContext<() => void>(() => {});
 
-// ── Relay contexts (R1 select-and-send) ───────────────────────────────────
+// ── Relay contexts (R2 multi-pane) ────────────────────────────────────────
 // RelaySendContext: used by orchestrator pane to dispatch a prompt.
-// RelayRunContext:  used by executor pane to display the active run.
+// RelayManagerContext: used by each executor relay pane to read its own slice.
 
 interface RelaySendCtx {
-  busy: boolean;
+  busy: boolean; // always false in R2 — modals handle the all-busy case
   send: (prompt: string, projectSlug: string | null) => void;
 }
 const RelaySendContext = React.createContext<RelaySendCtx>({ busy: false, send: () => {} });
 
-interface RelayRunCtx {
+// Per-pane relay slice — keyed by Dockview panel id in DockArea's relayMap state.
+interface PaneRelaySlice {
   runId: string | null;
-  setBusy: (b: boolean) => void;
+  status: string; // "idle" | "running" | "done" | "failed" | "killed"
+  queue: string[];
+  projectSlug: string | null;
 }
-const RelayRunContext = React.createContext<RelayRunCtx>({ runId: null, setBusy: () => {} });
+
+interface RelayManagerCtx {
+  relayMap: Record<string, PaneRelaySlice>;
+  registerPane: (paneId: string) => void;
+  unregisterPane: (paneId: string) => void;
+  notifyFinished: (paneId: string, finalStatus: string) => void;
+  killRunForPane: (paneId: string) => void;
+}
+const RelayManagerContext = React.createContext<RelayManagerCtx>({
+  relayMap: {},
+  registerPane: () => {},
+  unregisterPane: () => {},
+  notifyFinished: () => {},
+  killRunForPane: () => {},
+});
 
 // ── Web / Media pane ───────────────────────────────────────────────────────
 
@@ -594,25 +611,36 @@ function TerminalPane({ params, api }: IDockviewPanelProps<TerminalParams>) {
   );
 }
 
-// ── Executor Relay pane (R1) ──────────────────────────────────────────────
-// Renders the stream-json output of a `claude -p` run as a message thread.
-// Reads its current run_id from RelayRunContext (set by DockArea on send).
+// ── Executor Relay pane (R2) ──────────────────────────────────────────────
+// Multi-pane variant: reads its own slice from RelayManagerContext keyed by
+// api.id. Registers on mount, unregisters on unmount (orphaning any queue).
 
-function ExecutorRelayPane(_: IDockviewPanelProps<Record<string, never>>) {
-  const { runId, setBusy } = useContext(RelayRunContext);
+function ExecutorRelayPane({ api }: IDockviewPanelProps<Record<string, never>>) {
+  const paneId = api.id;
+  const { relayMap, registerPane, unregisterPane, notifyFinished, killRunForPane } = useContext(RelayManagerContext);
+
+  const slice = relayMap[paneId] ?? { runId: null, status: "idle", queue: [], projectSlug: null };
+  const { runId, status, queue } = slice;
+
   const [lines, setLines] = useState<RunEvent[]>([]);
-  const [status, setStatus] = useState("idle");
   const [result, setResult] = useState<RunResult | null>(null);
   const trackedRunId = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Stable ref so the event listener never closes over a stale notifyFinished
+  const notifyFinishedRef = useRef(notifyFinished);
+  useEffect(() => { notifyFinishedRef.current = notifyFinished; }, [notifyFinished]);
+
+  // Register on mount, unregister (+ orphan queue) on unmount
+  useEffect(() => {
+    registerPane(paneId);
+    return () => unregisterPane(paneId);
+  }, [paneId, registerPane, unregisterPane]);
 
   // Re-subscribe whenever runId changes
   useEffect(() => {
-    if (!runId) return;
-    if (runId === trackedRunId.current) return;
+    if (!runId || runId === trackedRunId.current) return;
     trackedRunId.current = runId;
     setLines([]);
-    setStatus("running");
     setResult(null);
 
     let unlisten: UnlistenFn | null = null;
@@ -620,25 +648,26 @@ function ExecutorRelayPane(_: IDockviewPanelProps<Record<string, never>>) {
 
     listen<RunEvent>("antfarm-run-event", ev => {
       if (!mounted) return;
-      const e = ev.payload;
-      if (e.runId !== runId) return;
-      if (e.kind === "status") {
-        setStatus(e.payload);
-        if (["done", "failed", "killed"].includes(e.payload)) {
-          setBusy(false);
-          if (e.payload === "done") {
-            invoke<RunResult>("get_run_result", { runId })
-              .then(r => { if (mounted) setResult(r); })
-              .catch(() => {});
+      try {
+        const e = ev.payload;
+        if (e.runId !== runId) return;
+        if (e.kind === "status") {
+          if (["done", "failed", "killed"].includes(e.payload)) {
+            notifyFinishedRef.current(paneId, e.payload);
+            if (e.payload === "done") {
+              invoke<RunResult>("get_run_result", { runId })
+                .then(r => { if (mounted) setResult(r); })
+                .catch(() => {});
+            }
           }
+        } else {
+          setLines(prev => [...prev, e]);
         }
-      } else {
-        setLines(prev => [...prev, e]);
-      }
+      } catch { /* skip malformed event — never crash the pane */ }
     }).then(fn => { if (mounted) unlisten = fn; else fn(); });
 
     return () => { mounted = false; unlisten?.(); };
-  }, [runId, setBusy]);
+  }, [runId, paneId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -667,7 +696,7 @@ function ExecutorRelayPane(_: IDockviewPanelProps<Record<string, never>>) {
             out.push({ id: `r-${out.length}`, text: r, isResult: true, isError: !!v["is_error"] });
           }
         }
-      } catch { /* non-JSON or unrecognised line — skip */ }
+      } catch { /* skip non-JSON or unrecognised line */ }
     }
     return out;
   }, [lines]);
@@ -686,7 +715,32 @@ function ExecutorRelayPane(_: IDockviewPanelProps<Record<string, never>>) {
             {runId.slice(-8)}
           </span>
         )}
+        {status === "running" && (
+          <button
+            onClick={() => killRunForPane(paneId)}
+            title="Kill this run"
+            style={{ marginLeft: "auto", fontSize: 10, padding: "1px 7px", borderRadius: 4, border: "1px solid #7f1d1d", background: "transparent", color: "#fca5a5", cursor: "pointer" }}
+          >
+            Kill
+          </button>
+        )}
       </div>
+
+      {/* Queue chips — pending prompts for this pane */}
+      {queue.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, padding: "5px 8px", borderBottom: "1px solid #18181b", flexShrink: 0, background: "#0d0d0f" }}>
+          <span style={{ fontSize: 10, color: "#52525b", alignSelf: "center" }}>Queued:</span>
+          {queue.map((q, i) => (
+            <span key={i} style={{
+              fontSize: 10, padding: "2px 8px", borderRadius: 99,
+              background: "#27272a", color: "#a1a1aa", border: "1px solid #3f3f46",
+              maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+              {q.length > 40 ? q.slice(0, 37) + "…" : q}
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* Message thread */}
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
@@ -941,6 +995,112 @@ function buildGridLayout(api: DockviewApi, kind: GridKind, slug: string | null) 
   }
 }
 
+// ── Relay routing modals & orphan tray (R2) ───────────────────────────────
+
+function NoPaneModal({ prompt, onConfirm, onCancel }: {
+  prompt: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const preview = prompt.length > 80 ? prompt.slice(0, 77) + "…" : prompt;
+  return createPortal(
+    <div style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: "#1c1c1e", border: "1px solid #3f3f46", borderRadius: 12, padding: "20px 24px", width: 400, display: "flex", flexDirection: "column", gap: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.7)" }}>
+        <p style={{ fontSize: 13, fontWeight: 700, color: "#e4e4e7", margin: 0 }}>No executor pane open</p>
+        <div style={{ background: "#0a0a0b", border: "1px solid #27272a", borderRadius: 7, padding: "7px 10px", fontSize: 11, color: "#a1a1aa", fontFamily: "monospace" }}>
+          {preview}
+        </div>
+        <p style={{ fontSize: 12, color: "#71717a", margin: 0 }}>Open an executor relay pane and dispatch this prompt?</p>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button onClick={onCancel} style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #3f3f46", background: "transparent", color: "#a1a1aa", fontSize: 12, cursor: "pointer" }}>Cancel</button>
+          <button onClick={onConfirm} style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#065f46", color: "#6ee7b7", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Open pane</button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function AllBusyModal({ prompt, paneIds, relayMap, onOpenNew, onQueue, onCancel }: {
+  prompt: string;
+  paneIds: string[];
+  relayMap: Record<string, PaneRelaySlice>;
+  onOpenNew: () => void;
+  onQueue: (paneId: string) => void;
+  onCancel: () => void;
+}) {
+  const preview = prompt.length > 80 ? prompt.slice(0, 77) + "…" : prompt;
+  return createPortal(
+    <div style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: "#1c1c1e", border: "1px solid #3f3f46", borderRadius: 12, padding: "20px 24px", width: 440, display: "flex", flexDirection: "column", gap: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.7)" }}>
+        <p style={{ fontSize: 13, fontWeight: 700, color: "#e4e4e7", margin: 0 }}>All executor panes are busy</p>
+        <div style={{ background: "#0a0a0b", border: "1px solid #27272a", borderRadius: 7, padding: "7px 10px", fontSize: 11, color: "#a1a1aa", fontFamily: "monospace" }}>
+          {preview}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <button
+            onClick={onOpenNew}
+            style={{ padding: "8px 14px", borderRadius: 7, border: "none", background: "#065f46", color: "#6ee7b7", fontSize: 12, fontWeight: 700, cursor: "pointer", textAlign: "left" as const }}
+          >
+            Open new executor pane
+          </button>
+          {paneIds.map(id => {
+            const q = relayMap[id]?.queue?.length ?? 0;
+            return (
+              <button
+                key={id}
+                onClick={() => onQueue(id)}
+                style={{ padding: "8px 14px", borderRadius: 7, border: "1px solid #27272a", background: "#111113", color: "#a1a1aa", fontSize: 12, cursor: "pointer", textAlign: "left" as const }}
+              >
+                Queue behind pane {id.slice(-6)} {q > 0 ? `(${q} already queued)` : "(next in line)"}
+              </button>
+            );
+          })}
+        </div>
+        <button onClick={onCancel} style={{ padding: "5px 0", borderRadius: 6, border: "none", background: "transparent", color: "#52525b", fontSize: 11, cursor: "pointer" }}>Cancel</button>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function OrphanTrayBar({ items, onRoute, onDismiss }: {
+  items: Array<{ id: string; prompt: string; slug: string | null }>;
+  onRoute: (id: string) => void;
+  onDismiss: (id: string) => void;
+}) {
+  return (
+    <div style={{
+      position: "absolute", bottom: 0, left: 0, right: 0, zIndex: 50,
+      background: "#1c1c1e", borderTop: "2px solid #78350f",
+      padding: "8px 12px", display: "flex", flexDirection: "column", gap: 5,
+    }}>
+      <span style={{ fontSize: 10, fontWeight: 700, color: "#fcd34d", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        Orphaned prompts ({items.length}) — pane was killed or closed
+      </span>
+      {items.map(item => (
+        <div key={item.id} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ flex: 1, fontSize: 11, color: "#a1a1aa", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {item.prompt.length > 80 ? item.prompt.slice(0, 77) + "…" : item.prompt}
+          </span>
+          <button
+            onClick={() => onRoute(item.id)}
+            style={{ padding: "2px 10px", borderRadius: 5, border: "none", background: "#065f46", color: "#6ee7b7", fontSize: 11, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}
+          >
+            Route
+          </button>
+          <button
+            onClick={() => onDismiss(item.id)}
+            style={{ padding: "2px 6px", borderRadius: 5, border: "1px solid #3f3f46", background: "transparent", color: "#71717a", fontSize: 11, cursor: "pointer", flexShrink: 0 }}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   { workspace, onLayoutChange },
   ref
@@ -951,40 +1111,37 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   const onLayoutChangeRef = useRef(onLayoutChange);
   useEffect(() => { onLayoutChangeRef.current = onLayoutChange; }, [onLayoutChange]);
 
-  // ── Relay state (R1) ────────────────────────────────────────────────────
-  const [relayRunId, setRelayRunId] = useState<string | null>(null);
-  const [relayBusy, setRelayBusy] = useState(false);
+  // ── Relay state (R2 multi-pane manager) ───────────────────────────────────
+  const [relayMap, setRelayMap] = useState<Record<string, PaneRelaySlice>>({});
+  const relayMapRef = useRef<Record<string, PaneRelaySlice>>({});
+  useEffect(() => { relayMapRef.current = relayMap; }, [relayMap]);
+  const workspaceRef = useRef(workspace);
+  useEffect(() => { workspaceRef.current = workspace; }, [workspace]);
 
-  // Auto-clear busy when the active run finishes (regardless of whether an
-  // executor pane is mounted — prevents permanent lock if pane is closed).
-  useEffect(() => {
-    if (!relayRunId) return;
-    let unlisten: UnlistenFn | null = null;
-    let mounted = true;
-    listen<RunEvent>("antfarm-run-event", ev => {
-      if (!mounted) return;
-      const e = ev.payload;
-      if (e.runId !== relayRunId) return;
-      if (e.kind === "status" && ["done", "failed", "killed"].includes(e.payload)) {
-        setRelayBusy(false);
-      }
-    }).then(fn => { if (mounted) unlisten = fn; else fn(); });
-    return () => { mounted = false; unlisten?.(); };
-  }, [relayRunId]);
+  // Modals
+  const [noPaneModal, setNoPaneModal] = useState<{ prompt: string; slug: string | null } | null>(null);
+  const [allBusyModal, setAllBusyModal] = useState<{ prompt: string; slug: string | null; paneIds: string[] } | null>(null);
 
-  // Dispatch a prompt to a claude -p worktree run and record its run_id.
-  const sendToExecutor = useCallback(async (prompt: string, projectSlug: string | null) => {
-    if (relayBusy) return;
-    setRelayBusy(true);
+  // Orphan tray: items whose pane was killed/closed while they were queued
+  const [orphanTray, setOrphanTray] = useState<Array<{ id: string; prompt: string; slug: string | null }>>([]);
+
+  // Pending dispatch: pane id → prompt+slug to dispatch once pane registers
+  const pendingDispatchRef = useRef<Record<string, { prompt: string; slug: string | null }>>({});
+
+  // Stable ref to dispatch function — avoids stale closures in notifyFinished
+  const dispatchRef = useRef<(paneId: string, prompt: string, slug: string | null) => Promise<void>>(async () => {});
+
+  const dispatchToPaneInternal = useCallback(async (paneId: string, prompt: string, slug: string | null): Promise<void> => {
+    const effectiveSlug = slug ?? workspaceRef.current.project_slug ?? null;
     let projectPath = "";
-    const slug = projectSlug ?? workspace.project_slug ?? null;
-    if (slug) {
+    if (effectiveSlug) {
       try {
-        const paths = await invoke<RepoPath[]>("get_project_paths", { slug });
+        const paths = await invoke<RepoPath[]>("get_project_paths", { slug: effectiveSlug });
         projectPath = paths[0]?.path ?? "";
       } catch { /* ignore */ }
     }
-    if (!projectPath) { setRelayBusy(false); return; }
+    if (!projectPath) return;
+    if (!relayMapRef.current[paneId]) return; // pane was removed before dispatch
     try {
       const rec = await invoke<RunRecord>("dispatch_run", {
         projectPath,
@@ -992,22 +1149,125 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
         useWorktree: true,
         permissionMode: "acceptEdits",
       });
-      setRelayRunId(rec.runId);
+      if (!relayMapRef.current[paneId]) {
+        // Pane removed while dispatch was in flight — kill the orphaned run
+        invoke("kill_run", { runId: rec.runId }).catch(() => {});
+        return;
+      }
+      setRelayMap(prev => ({
+        ...prev,
+        [paneId]: { ...(prev[paneId] ?? { queue: [], projectSlug: slug }), runId: rec.runId, status: "running" },
+      }));
     } catch (err) {
       console.error("[relay] dispatch_run failed:", err);
-      setRelayBusy(false);
     }
-  }, [relayBusy, workspace.project_slug]);
+  }, []);
+  useEffect(() => { dispatchRef.current = dispatchToPaneInternal; }, [dispatchToPaneInternal]);
+
+  const registerPane = useCallback((paneId: string) => {
+    setRelayMap(prev => {
+      if (prev[paneId]) return prev;
+      return { ...prev, [paneId]: { runId: null, status: "idle", queue: [], projectSlug: workspaceRef.current.project_slug ?? null } };
+    });
+    // If delegate() pre-registered a pending dispatch, fire it now
+    const pending = pendingDispatchRef.current[paneId];
+    if (pending) {
+      delete pendingDispatchRef.current[paneId];
+      dispatchRef.current(paneId, pending.prompt, pending.slug);
+    }
+  }, []);
+
+  const unregisterPane = useCallback((paneId: string) => {
+    const slice = relayMapRef.current[paneId];
+    if (slice?.runId && slice.status === "running") {
+      invoke("kill_run", { runId: slice.runId }).catch(() => {});
+    }
+    if ((slice?.queue?.length ?? 0) > 0) {
+      setOrphanTray(prev => [
+        ...prev,
+        ...slice!.queue.map(p => ({ id: crypto.randomUUID(), prompt: p, slug: slice!.projectSlug })),
+      ]);
+    }
+    setRelayMap(prev => {
+      const next = { ...prev };
+      delete next[paneId];
+      return next;
+    });
+  }, []);
+
+  const notifyFinished = useCallback((paneId: string, finalStatus: string) => {
+    const slice = relayMapRef.current[paneId];
+    if (!slice) return;
+    if (slice.queue.length > 0) {
+      const [next, ...rest] = slice.queue;
+      setRelayMap(prev => {
+        const s = prev[paneId];
+        if (!s) return prev;
+        return { ...prev, [paneId]: { ...s, status: "idle", queue: rest } };
+      });
+      // Drain: dispatch as macrotask so React commits the state update first
+      setTimeout(() => dispatchRef.current(paneId, next, slice.projectSlug), 0);
+    } else {
+      setRelayMap(prev => {
+        const s = prev[paneId];
+        if (!s) return prev;
+        return { ...prev, [paneId]: { ...s, status: finalStatus } };
+      });
+    }
+  }, []);
+
+  const killRunForPane = useCallback(async (paneId: string) => {
+    const slice = relayMapRef.current[paneId];
+    if (!slice?.runId) return;
+    try {
+      await invoke("kill_run", { runId: slice.runId });
+    } catch (err) {
+      console.error("[relay] kill_run failed:", err);
+    }
+  }, []);
+
+  // Route a prompt: free pane → dispatch; no panes → open modal; all busy → route modal
+  const sendPrompt = useCallback((prompt: string, slug: string | null) => {
+    const map = relayMapRef.current;
+    const paneIds = Object.keys(map);
+    const FREE = ["idle", "done", "failed", "killed"];
+    const freePaneId = paneIds.find(id => FREE.includes(map[id].status));
+    if (freePaneId) {
+      dispatchRef.current(freePaneId, prompt, slug);
+      return;
+    }
+    if (paneIds.length === 0) {
+      setNoPaneModal({ prompt, slug });
+      return;
+    }
+    setAllBusyModal({ prompt, slug, paneIds });
+  }, []);
 
   const relaySendCtx = useMemo<RelaySendCtx>(() => ({
-    busy: relayBusy,
-    send: sendToExecutor,
-  }), [relayBusy, sendToExecutor]);
+    busy: false, // routing modals handle all-busy; send button stays enabled
+    send: sendPrompt,
+  }), [sendPrompt]);
 
-  const relayRunCtx = useMemo<RelayRunCtx>(() => ({
-    runId: relayRunId,
-    setBusy: setRelayBusy,
-  }), [relayRunId]);
+  const relayManagerCtx = useMemo<RelayManagerCtx>(() => ({
+    relayMap,
+    registerPane,
+    unregisterPane,
+    notifyFinished,
+    killRunForPane,
+  }), [relayMap, registerPane, unregisterPane, notifyFinished, killRunForPane]);
+
+  // Open a new executor_relay pane and pre-register a pending dispatch
+  function spawnRelayPane(prompt: string, slug: string | null) {
+    const api = apiRef.current;
+    if (!api) return;
+    const id = crypto.randomUUID();
+    const existing = api.panels;
+    const position = existing.length > 0
+      ? { referencePanel: existing[existing.length - 1].id, direction: "right" as const }
+      : undefined;
+    api.addPanel({ id, component: "executor_relay", params: {}, title: "Executor", position });
+    pendingDispatchRef.current[id] = { prompt, slug };
+  }
 
   const scheduleSave = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
@@ -1072,38 +1332,30 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
       const api = apiRef.current;
       if (!api) return;
       try {
-        // Position executors relative to existing panels so the orchestrator
-        // pane stays alive (its PTY + conversation are NOT killed).
-        //
-        // Anchor selection:
-        //   - If an executor already exists → stack new executors below it
-        //     (preserves the existing right-column layout)
-        //   - Else if an orchestrator exists → first executor goes right,
-        //     subsequent ones stack below
-        //   - Else → no position hint (dock places freely)
+        // Spawn executor_relay panes (not PTY terminals) — one per subtask.
+        // Position them to the right of the orchestrator (conductor-style);
+        // the orchestrator pane stays alive with its PTY session intact.
         const panels = api.panels;
-        const existingExecutor = panels.find(
-          p => (p.params as TerminalParams | null)?.role === "executor"
-        );
         const orchestrator = panels.find(
           p => (p.params as TerminalParams | null)?.role === "orchestrator"
         );
 
-        let refId = (existingExecutor ?? orchestrator)?.id ?? null;
+        let refId = orchestrator?.id ?? (panels.length > 0 ? panels[panels.length - 1].id : null);
         let isFirst = true;
 
         for (const subtask of subtasks) {
           const id = crypto.randomUUID();
-          const dir: "right" | "below" = isFirst && !existingExecutor ? "right" : "below";
+          const dir: "right" | "below" = isFirst && refId === orchestrator?.id ? "right" : "below";
           const position = refId ? { referencePanel: refId, direction: dir } : undefined;
-          const panel = api.addPanel({
+          api.addPanel({
             id,
-            component: "terminal",
-            params: { project_slug: slug, role: "executor", seed: subtask } as TerminalParams,
-            title: ROLE_META["executor"].label,
+            component: "executor_relay",
+            params: {},
+            title: "Executor",
             position,
           });
-          panel.api.setConstraints(TERM_CONSTRAINTS);
+          // Pre-register dispatch so the pane fires as soon as it mounts
+          pendingDispatchRef.current[id] = { prompt: subtask, slug };
           refId = id;
           isFirst = false;
         }
@@ -1137,14 +1389,61 @@ const DockArea = forwardRef<DockAreaHandle, DockAreaProps>(function DockArea(
   return (
     <SaveTrigger.Provider value={scheduleSave}>
       <RelaySendContext.Provider value={relaySendCtx}>
-        <RelayRunContext.Provider value={relayRunCtx}>
-          <DockviewReact
-            className="h-full dockview-theme-abyss"
-            onReady={handleReady}
-            components={DOCK_COMPONENTS}
-            defaultTabComponent={PanelTab}
-          />
-        </RelayRunContext.Provider>
+        <RelayManagerContext.Provider value={relayManagerCtx}>
+          <div style={{ position: "relative", height: "100%", display: "flex", flexDirection: "column" }}>
+            <DockviewReact
+              className="flex-1 min-h-0 dockview-theme-abyss"
+              onReady={handleReady}
+              components={DOCK_COMPONENTS}
+              defaultTabComponent={PanelTab}
+            />
+            {orphanTray.length > 0 && (
+              <OrphanTrayBar
+                items={orphanTray}
+                onRoute={itemId => {
+                  const item = orphanTray.find(x => x.id === itemId);
+                  if (!item) return;
+                  setOrphanTray(prev => prev.filter(x => x.id !== itemId));
+                  sendPrompt(item.prompt, item.slug);
+                }}
+                onDismiss={itemId => setOrphanTray(prev => prev.filter(x => x.id !== itemId))}
+              />
+            )}
+          </div>
+          {noPaneModal && (
+            <NoPaneModal
+              prompt={noPaneModal.prompt}
+              onConfirm={() => {
+                const { prompt, slug } = noPaneModal;
+                setNoPaneModal(null);
+                spawnRelayPane(prompt, slug);
+              }}
+              onCancel={() => setNoPaneModal(null)}
+            />
+          )}
+          {allBusyModal && (
+            <AllBusyModal
+              prompt={allBusyModal.prompt}
+              paneIds={allBusyModal.paneIds}
+              relayMap={relayMap}
+              onOpenNew={() => {
+                const { prompt, slug } = allBusyModal;
+                setAllBusyModal(null);
+                spawnRelayPane(prompt, slug);
+              }}
+              onQueue={paneId => {
+                const { prompt } = allBusyModal;
+                setAllBusyModal(null);
+                setRelayMap(prev => {
+                  const s = prev[paneId];
+                  if (!s) return prev;
+                  return { ...prev, [paneId]: { ...s, queue: [...s.queue, prompt] } };
+                });
+              }}
+              onCancel={() => setAllBusyModal(null)}
+            />
+          )}
+        </RelayManagerContext.Provider>
       </RelaySendContext.Provider>
     </SaveTrigger.Provider>
   );
