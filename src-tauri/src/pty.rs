@@ -76,10 +76,25 @@ pub fn spawn_pty(
         Some("orchestrator") => {
             let claude = crate::dispatch::resolve_claude_path();
             let brain = brain_dir();
-            // Orchestrator: Opus 4.8 (the planner), + cross-project brain via --add-dir.
+            // Orchestrator: Opus 4.8 (the planner), plan mode (cannot edit files or run
+            // state-changing commands), + cross-project brain via --add-dir.
+            // --permission-mode plan: enforced read-only; user can shift+tab to exit.
+            // --append-system-prompt: instructs the model to produce executor prompts
+            // rather than act directly.
+            let system_prompt = "You are the ORCHESTRATOR, a planner and reviewer. \
+                Do not edit files, run commands, or implement changes yourself. \
+                When given a goal, reply with one clear, self-contained prompt that \
+                an executor agent can run to accomplish it, then stop. The human will \
+                select your prompt and route it to an executor. Only act directly if \
+                the user explicitly tells you to execute or make the change yourself.";
             cmd.args([
                 "-lc",
-                &format!("exec \"{}\" --add-dir \"{}\" --model claude-opus-4-8", claude, brain),
+                &format!(
+                    "exec \"{}\" --add-dir \"{}\" --model claude-opus-4-8 \
+                     --permission-mode plan \
+                     --append-system-prompt '{}'",
+                    claude, brain, system_prompt
+                ),
             ]);
         }
         Some("executor") => {
