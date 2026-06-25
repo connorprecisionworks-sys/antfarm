@@ -116,6 +116,71 @@ fn new_agent_run_id(agent_id: &str) -> String {
     format!("agent-{agent_id}-{ts}")
 }
 
+/// Comma-separated allowedTools string for a networked agent, keyed by connector list.
+fn networked_allowed_tools(connectors: &[String]) -> String {
+    let mut tools = vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+    for c in connectors {
+        match c.as_str() {
+            "web" => {
+                tools.push("WebSearch");
+                tools.push("WebFetch");
+            }
+            "gmail" => {
+                tools.extend([
+                    "mcp__claude_ai_Gmail__search_threads",
+                    "mcp__claude_ai_Gmail__get_thread",
+                    "mcp__claude_ai_Gmail__create_draft",
+                    "mcp__claude_ai_Gmail__list_drafts",
+                    "mcp__claude_ai_Gmail__list_labels",
+                    "mcp__claude_ai_Gmail__label_thread",
+                    "mcp__claude_ai_Gmail__label_message",
+                ]);
+            }
+            "calendar" => {
+                tools.extend([
+                    "mcp__claude_ai_Google_Calendar__list_events",
+                    "mcp__claude_ai_Google_Calendar__create_event",
+                    "mcp__claude_ai_Google_Calendar__update_event",
+                    "mcp__claude_ai_Google_Calendar__delete_event",
+                ]);
+            }
+            _ => {}
+        }
+    }
+    tools.join(",")
+}
+
+/// Connector-specific guidance injected into the system prompt for networked agents.
+fn connector_prompt_section(connectors: &[String]) -> String {
+    if connectors.is_empty() {
+        return String::new();
+    }
+    let mut parts = vec!["\n\n## Connectors available this run".to_string()];
+    for c in connectors {
+        match c.as_str() {
+            "web" => parts.push(
+                "**web** — WebSearch and WebFetch are enabled. \
+                 Search multiple queries as needed; cite sources in output.".into(),
+            ),
+            "gmail" => parts.push(
+                "**gmail** — Gmail tools available: search_threads, get_thread, create_draft, \
+                 list_drafts, list_labels, label_thread, label_message. \
+                 Auto-allowed: search, read, triage, label, archive, create drafts. \
+                 GATE (stop and ask): anything that leaves the building (sending). \
+                 To surface a draft for approval: write content to \
+                 `active/drafts/email-<unix-epoch>.md` (sections: Subject, To, Body), \
+                 then end with: NEEDS YOU: <one sentence — what you will do once approved>.".into(),
+            ),
+            "calendar" => parts.push(
+                "**calendar** — Google Calendar tools for reading and creating events. \
+                 Note: calendar may need re-authentication if not yet authorized.".into(),
+            ),
+            _ => {}
+        }
+    }
+    parts.join("\n\n")
+}
+
 // ── Registry commands ─────────────────────────────────────────────────────────
 
 /// All agents: orchestrator first, then alphabetically by name.
@@ -227,14 +292,22 @@ pub fn run_agent(
         String::new()
     };
 
+    // ── Networked profile: connector tool allowlist + prompt guidance ─────────
+    let is_networked = agent.profile == "networked";
+    let connector_prompt = if is_networked {
+        connector_prompt_section(&agent.connectors)
+    } else {
+        String::new()
+    };
+
     // ── Build full -p prompt ──────────────────────────────────────────────────
     let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
     let full_prompt = match base_prompt {
         Some(sys) => format!(
-            "{sys}{write_scope}{daily_preamble}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
+            "{sys}{write_scope}{daily_preamble}{connector_prompt}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
         ),
         None => format!(
-            "Current date and time: {now}{write_scope}{daily_preamble}{role_note}\n\nUser: {task}"
+            "Current date and time: {now}{write_scope}{daily_preamble}{connector_prompt}{role_note}\n\nUser: {task}"
         ),
     };
 
@@ -242,15 +315,31 @@ pub fn run_agent(
     let claude  = dispatch.claude_path.lock().unwrap().clone();
     let add_dir = vault.to_string_lossy().into_owned(); // full vault = full read access
 
-    let mut child = Command::new(&claude)
-        .args([
-            "-p", &full_prompt,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--permission-mode", "dontAsk",
-            "--model", &agent.model,
-            "--add-dir", &add_dir,
-        ])
+    let mut cmd = Command::new(&claude);
+    cmd.args([
+        "-p", &full_prompt,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--permission-mode", "dontAsk",
+        "--model", &agent.model,
+        "--add-dir", &add_dir,
+    ]);
+
+    // Networked agents get explicit tool allowlist + optional settings file.
+    if is_networked {
+        let allowed = networked_allowed_tools(&agent.connectors);
+        if !allowed.is_empty() {
+            cmd.args(["--allowedTools", &allowed]);
+        }
+        let settings_path = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".claude")
+            .join("settings.networked.json");
+        if settings_path.exists() {
+            cmd.arg("--settings").arg(&settings_path);
+        }
+    }
+
+    let mut child = cmd
         .current_dir(&vault)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -355,4 +444,42 @@ pub fn run_agent(
     }
 
     Ok(run_id)
+}
+
+// ── Networked settings scaffold ───────────────────────────────────────────────
+
+/// Write ~/.claude/settings.networked.json and mirror to the vault.
+/// Called once to bootstrap the allowlist that networked agents load via --settings.
+#[tauri::command]
+pub fn scaffold_networked_settings() -> Result<String, String> {
+    let home = PathBuf::from(std::env::var("HOME").map_err(|e| e.to_string())?);
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&claude_dir).map_err(|e| e.to_string())?;
+
+    let settings = serde_json::json!({
+        "permissions": {
+            "allow": [
+                "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+                "WebSearch", "WebFetch",
+                "mcp__claude_ai_Gmail__search_threads",
+                "mcp__claude_ai_Gmail__get_thread",
+                "mcp__claude_ai_Gmail__create_draft",
+                "mcp__claude_ai_Gmail__list_drafts",
+                "mcp__claude_ai_Gmail__list_labels",
+                "mcp__claude_ai_Gmail__label_thread",
+                "mcp__claude_ai_Gmail__label_message"
+            ],
+            "deny": []
+        }
+    });
+
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    let dest = claude_dir.join("settings.networked.json");
+    fs::write(&dest, &json).map_err(|e| e.to_string())?;
+
+    // Mirror to vault so Connor can review/edit it there too.
+    let vault_copy = vault_root().join("settings.networked.json");
+    let _ = fs::write(vault_copy, &json);
+
+    Ok(dest.to_string_lossy().into_owned())
 }
