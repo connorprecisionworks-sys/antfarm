@@ -1,11 +1,13 @@
 // agents.rs — Agent registry + runner backend.
 //
 // Phase 1: list_agents() and get_agent(id) reading antfarm-memory/agents/*/agent.json.
-// Phase 2: run_agent(agent_id, task) — spawns claude -p, streams stdout back as
-//   "agent-stream" Tauri events, appends outcome to agent's log.md.
+// Phase 2: run_agent() — spawns claude -p, streams stdout as "agent-stream" events,
+//          appends outcome to agent's log.md.
+// Phase 3: delegation fan-out support (parent_run_id), write-scope hardening via
+//          system prompt, NEEDS YOU injection for subagents.
 //
-// Reuses the vault-path pattern from memory.rs. Tolerant parser: missing/malformed
-// files surface as empty results rather than errors.
+// READ access: full vault via --add-dir so agents can read active/, agents/*, etc.
+// WRITE scope: constrained by prompt instruction to agents/<id>/ and active/ only.
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,7 @@ fn vault_root() -> PathBuf {
         .join("antfarm-memory")
 }
 
-// ── State for tracking live agent processes ───────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 
 pub struct AgentRunState {
     pub children: Arc<Mutex<HashMap<String, Child>>>,
@@ -62,7 +64,7 @@ pub struct Agent {
     pub created: Option<String>,
 }
 
-/// Per-event payload emitted as "agent-stream" to the frontend.
+/// Event payload emitted as "agent-stream" Tauri event.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStreamEvent {
@@ -71,13 +73,13 @@ pub struct AgentStreamEvent {
     /// "start" | "text" | "done" | "error"
     pub kind: String,
     pub text: String,
+    /// Non-null for subagent runs spawned by orchestrator fan-out.
+    pub parent_run_id: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Extract the usable system prompt from prompt.md.
-/// The file is structured as: title/intro, "---", actual prompt.
-/// Returns everything after the first horizontal rule (or the full file if none).
+/// Extract the actual system prompt from prompt.md (content after the first `---` rule).
 fn extract_system_prompt(content: &str) -> String {
     if let Some(idx) = content.find("\n---\n") {
         return content[idx + 5..].trim().to_string();
@@ -85,12 +87,12 @@ fn extract_system_prompt(content: &str) -> String {
     content.trim().to_string()
 }
 
-/// Append a one-line outcome entry to the agent's log.md. Best-effort.
+/// Append a dated outcome entry to the agent's log.md. Best-effort, never panics.
 fn append_agent_log(vault: &PathBuf, agent_id: &str, run_id: &str, task: &str, result: &str, is_error: bool) {
     let log_path = vault.join("agents").join(agent_id).join("log.md");
     let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
     let status = if is_error { "error" } else { "done" };
-    let task_short: String = task.chars().take(80).collect();
+    let task_short: String  = task.chars().take(80).collect();
     let result_short: String = result.chars().take(300).collect();
     let entry = format!(
         "\n## {now} — {status}: {task_short}\n- run: {run_id}\n- result: {result_short}\n"
@@ -106,7 +108,6 @@ fn append_agent_log(vault: &PathBuf, agent_id: &str, run_id: &str, task: &str, r
     let _ = fs::write(&log_path, doc);
 }
 
-/// Run-id generator — timestamp + agent prefix.
 fn new_agent_run_id(agent_id: &str) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -144,7 +145,7 @@ pub fn list_agents() -> Vec<Agent> {
     agents
 }
 
-/// Single agent by id. Returns None if not found or malformed.
+/// Single agent by id.
 #[tauri::command]
 pub fn get_agent(id: String) -> Option<Agent> {
     if id.is_empty() || id.contains('/') || id.contains("..") {
@@ -156,9 +157,12 @@ pub fn get_agent(id: String) -> Option<Agent> {
 
 // ── run_agent ─────────────────────────────────────────────────────────────────
 
-/// Spawn an agent run: reads agent.json + prompt.md, fires claude -p, streams
-/// stdout as "agent-stream" events, and appends an outcome line to log.md.
-/// Returns the run_id immediately; the run continues in background threads.
+/// Spawn a claude -p agent run. Reads agent.json + prompt.md, injects write-scope
+/// and (for subagents) NEEDS YOU instructions, streams "agent-stream" events,
+/// appends to log.md on completion.
+///
+/// `parent_run_id` — set by the orchestrator fan-out so the frontend can group
+/// subagent chatter under the parent turn.
 #[tauri::command]
 pub fn run_agent(
     app: AppHandle,
@@ -166,35 +170,69 @@ pub fn run_agent(
     agent_run: State<'_, AgentRunState>,
     agent_id: String,
     task: String,
+    parent_run_id: Option<String>,
 ) -> Result<String, String> {
     let vault = vault_root();
 
     // ── Load agent definition ──────────────────────────────────────────────────
-    let agent_json = vault.join("agents").join(&agent_id).join("agent.json");
-    let agent: Agent = fs::read_to_string(&agent_json)
+    let agent: Agent = fs::read_to_string(vault.join("agents").join(&agent_id).join("agent.json"))
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
         .ok_or_else(|| format!("agent not found: {agent_id}"))?;
 
     // ── Load system prompt from prompt.md (optional) ──────────────────────────
-    let prompt_path = vault.join("agents").join(&agent_id).join("prompt.md");
-    let system_prompt = fs::read_to_string(&prompt_path)
+    let base_prompt = fs::read_to_string(vault.join("agents").join(&agent_id).join("prompt.md"))
         .ok()
         .map(|c| extract_system_prompt(&c));
 
-    // ── Build the -p value ────────────────────────────────────────────────────
-    let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
-    let full_prompt = match system_prompt {
-        Some(sys) => format!("{sys}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"),
-        None      => format!("Current date and time: {now}\n\nUser: {task}"),
+    // ── Write-scope constraint (injected for all agents) ──────────────────────
+    // --add-dir gives full READ access to the vault; writes are soft-constrained
+    // via prompt so agents don't touch other agents' directories or the brain index.
+    let write_scope = format!(
+        "\n\nVault write scope: you may only create or modify files under \
+         `agents/{}/` and `active/`. Do not write to any other vault paths.",
+        agent_id
+    );
+
+    // ── Role-specific tail instructions ──────────────────────────────────────
+    // Orchestrator: delegation block protocol so the app can wire real subagent runs.
+    // Subagents: NEEDS YOU gate for irreversible actions.
+    let role_note: String = if agent.role == "orchestrator" {
+        "\n\nDelegation protocol: when you want to dispatch work to a subagent, end \
+         your message with a fenced delegate block (and ONLY when you're actually \
+         dispatching — omit it when you're just answering). Valid agent ids: \
+         scout, scribe, clerk, builder. One line per agent, id then colon then task.\n\
+         \n\
+         ```delegate\n\
+         scout: research the specific topic\n\
+         clerk: the specific ops task\n\
+         ```\n\
+         \n\
+         Produce the block at the very end of your message, after everything else. \
+         Do not include it for agents you're not dispatching this turn."
+            .to_string()
+    } else {
+        "\n\nIf completing this task requires Connor's approval before an irreversible \
+         action (sending email, merging code, posting, spending money), end your \
+         response with exactly:\nNEEDS YOU: <one sentence — what you'll do once approved>"
+            .to_string()
     };
 
-    // ── Resolve claude path + vault --add-dir ─────────────────────────────────
-    let claude = dispatch.claude_path.lock().unwrap().clone();
-    // Pass the full vault root so the agent can read active/, agents/*, etc.
-    let add_dir = vault.to_string_lossy().into_owned();
+    // ── Build full -p prompt ──────────────────────────────────────────────────
+    let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
+    let full_prompt = match base_prompt {
+        Some(sys) => format!(
+            "{sys}{write_scope}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
+        ),
+        None => format!(
+            "Current date and time: {now}{write_scope}{role_note}\n\nUser: {task}"
+        ),
+    };
 
     // ── Spawn child ───────────────────────────────────────────────────────────
+    let claude  = dispatch.claude_path.lock().unwrap().clone();
+    let add_dir = vault.to_string_lossy().into_owned(); // full vault = full read access
+
     let mut child = Command::new(&claude)
         .args([
             "-p", &full_prompt,
@@ -215,12 +253,15 @@ pub fn run_agent(
     let stdout = child.stdout.take().ok_or("no stdout handle")?;
     agent_run.children.lock().unwrap().insert(run_id.clone(), child);
 
-    // Emit "start" so the frontend knows the run is live
+    let prid = parent_run_id.clone();
+
+    // Emit "start" immediately so the frontend can match future events.
     app.emit("agent-stream", AgentStreamEvent {
-        run_id: run_id.clone(),
-        agent_id: agent_id.clone(),
-        kind: "start".into(),
-        text: String::new(),
+        run_id:        run_id.clone(),
+        agent_id:      agent_id.clone(),
+        kind:          "start".into(),
+        text:          String::new(),
+        parent_run_id: prid.clone(),
     }).ok();
 
     // ── stdout reader thread ──────────────────────────────────────────────────
@@ -234,7 +275,7 @@ pub fn run_agent(
 
         std::thread::spawn(move || {
             let reader      = BufReader::new(stdout);
-            let mut last_text   = String::new(); // accumulate assistant turns
+            let mut last_text   = String::new();
             let mut result_text = String::new();
 
             for line in reader.lines().map_while(Result::ok) {
@@ -244,7 +285,6 @@ pub fn run_agent(
                 let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
                 if typ == "assistant" {
-                    // Extract text content from message.content[]
                     let mut chunks = Vec::new();
                     if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
                         for block in content {
@@ -259,10 +299,11 @@ pub fn run_agent(
                         let chunk_text = chunks.join("");
                         last_text = chunk_text.clone();
                         app2.emit("agent-stream", AgentStreamEvent {
-                            run_id:   rid.clone(),
-                            agent_id: aid.clone(),
-                            kind:     "text".into(),
-                            text:     chunk_text,
+                            run_id:        rid.clone(),
+                            agent_id:      aid.clone(),
+                            kind:          "text".into(),
+                            text:          chunk_text,
+                            parent_run_id: prid.clone(),
                         }).ok();
                     }
                 } else if typ == "result" {
@@ -271,35 +312,34 @@ pub fn run_agent(
                         .unwrap_or(&last_text)
                         .to_string();
 
-                    append_agent_log(
-                        &vault_clone,
-                        &aid,
-                        &rid,
-                        &task_clone,
-                        &result_text,
-                        is_error,
-                    );
+                    append_agent_log(&vault_clone, &aid, &rid, &task_clone, &result_text, is_error);
 
                     app2.emit("agent-stream", AgentStreamEvent {
-                        run_id:   rid.clone(),
-                        agent_id: aid.clone(),
-                        kind:     if is_error { "error".into() } else { "done".into() },
-                        text:     result_text.clone(),
+                        run_id:        rid.clone(),
+                        agent_id:      aid.clone(),
+                        kind:          if is_error { "error".into() } else { "done".into() },
+                        text:          result_text.clone(),
+                        parent_run_id: prid.clone(),
                     }).ok();
                 }
             }
 
-            // Reap child
+            // Reap child.
             children_arc.lock().unwrap().remove(&rid).and_then(|mut c| c.wait().ok());
 
-            // Emit done if we never got a "result" event (e.g. claude errored immediately)
+            // Safety net: emit done if we never got a `result` event.
             if result_text.is_empty() {
-                let msg = if last_text.is_empty() { "Agent run ended without output.".into() } else { last_text };
+                let msg = if last_text.is_empty() {
+                    "Agent run ended without output.".into()
+                } else {
+                    last_text
+                };
                 app2.emit("agent-stream", AgentStreamEvent {
-                    run_id:   rid,
-                    agent_id: aid.clone(),
-                    kind:     "done".into(),
-                    text:     msg,
+                    run_id:        rid,
+                    agent_id:      aid,
+                    kind:          "done".into(),
+                    text:          msg,
+                    parent_run_id: prid,
                 }).ok();
             }
         });
