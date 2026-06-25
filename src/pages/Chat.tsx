@@ -748,9 +748,10 @@ export function Chat() {
   const [recipientId, setRecipientId]   = useState<string | null>(null);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [isListening, setIsListening]   = useState(false);
-  const textareaRef   = useRef<HTMLTextAreaElement>(null);
-  const recognitionRef = useRef<any>(null);
-  const bottomRef     = useRef<HTMLDivElement>(null);
+  const textareaRef      = useRef<HTMLTextAreaElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef   = useRef<Blob[]>([]);
+  const bottomRef        = useRef<HTMLDivElement>(null);
 
   // ── Load agents + plan state ─────────────────────────────────────────────────
   useEffect(() => {
@@ -838,34 +839,58 @@ export function Chat() {
     }
   }
 
-  // ── Mic handler ───────────────────────────────────────────────────────────────
-  function handleMicClick() {
+  // ── Mic handler — MediaRecorder → voice_stt Tauri command ────────────────────
+  async function handleMicClick() {
+    // If already recording, stop and let onstop handle transcription.
     if (isListening) {
-      recognitionRef.current?.stop();
-      setIsListening(false);
+      mediaRecorderRef.current?.stop();
       return;
     }
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      textareaRef.current?.focus();
-      return;
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      return; // mic denied — do nothing silently
     }
-    const rec = new SpeechRecognition();
-    rec.continuous = false;
-    rec.interimResults = false;
-    rec.lang = "en-US";
-    rec.onresult = (e: any) => {
-      const transcript = Array.from(e.results as any[])
-        .map((r: any) => r[0].transcript)
-        .join("");
-      setDraft((prev) => (prev ? prev + " " : "") + transcript);
-      setIsListening(false);
+
+    audioChunksRef.current = [];
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+    const rec = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
     };
-    rec.onerror = () => setIsListening(false);
-    rec.onend   = () => setIsListening(false);
+
+    rec.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      const effectiveMime =
+        (audioChunksRef.current[0]?.type) || mimeType || "audio/webm";
+      const blob = new Blob(audioChunksRef.current, { type: effectiveMime });
+      audioChunksRef.current = [];
+
+      // Convert blob → base64 and invoke the Tauri STT command.
+      try {
+        const arrayBuf = await blob.arrayBuffer();
+        const uint8    = new Uint8Array(arrayBuf);
+        const binary   = uint8.reduce((s, b) => s + String.fromCharCode(b), "");
+        const b64      = btoa(binary);
+        const transcript = await invoke<string>("voice_stt", {
+          audioBase64: b64,
+          contentType: effectiveMime,
+        });
+        if (transcript.trim()) {
+          setDraft((prev) => (prev ? prev + " " : "") + transcript.trim());
+        }
+      } catch {
+        // STT failed — leave draft unchanged
+      } finally {
+        setIsListening(false);
+      }
+    };
+
     rec.start();
-    recognitionRef.current = rec;
+    mediaRecorderRef.current = rec;
     setIsListening(true);
   }
 
