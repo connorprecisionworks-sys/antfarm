@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agents;
 mod chat;
 mod dispatch;
 mod harness;
@@ -2470,6 +2471,8 @@ fn main() {
             memory::memory_read,
             memory::memory_write,
             memory::memory_search,
+            agents::list_agents,
+            agents::get_agent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
