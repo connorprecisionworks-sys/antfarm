@@ -3,8 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  AtSign, Bot, Check, ChevronDown, ChevronRight, FileText,
-  GitMerge, Loader, Mic, Moon, Play, Send, X, Zap,
+  AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
+  FileText, GitMerge, Loader, Mic, Moon, Play, Send, X, Zap,
 } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -25,6 +25,16 @@ interface AgentStreamPayload {
   kind: string;   // "start" | "text" | "done" | "error"
   text: string;
   parentRunId: string | null;
+}
+
+interface PlanState {
+  date: string;
+  today: string;
+  stale: boolean;
+  file_exists: boolean;
+  days_old: number;
+  focus: string | null;
+  open_items: number | null;
 }
 
 type Filter = "needs-you" | "all";
@@ -581,10 +591,77 @@ function AgentCard({
   );
 }
 
+// ── Plan banner ───────────────────────────────────────────────────────────────
+
+function PlanBanner({
+  plan,
+  onAskClerk,
+  clerkRunning,
+}: {
+  plan: PlanState | null;
+  onAskClerk: (task: string) => void;
+  clerkRunning: boolean;
+}) {
+  if (!plan) return null;
+
+  if (!plan.file_exists) {
+    return (
+      <div className="flex items-center gap-2.5 px-4 py-2.5 border-b border-zinc-800/60 bg-zinc-950">
+        <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 shrink-0" />
+        <span className="text-xs text-zinc-500">No plan for today</span>
+        <button
+          onClick={() => onAskClerk("Plan today: read yesterday's plan and the recent commits, carry forward open items, and write a fresh plan-" + plan.today + ".json to active/state/.")}
+          disabled={clerkRunning}
+          className="ml-auto flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg border border-zinc-700/50 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600 disabled:opacity-40 transition-colors"
+        >
+          {clerkRunning ? <Loader size={10} className="animate-spin" /> : <Calendar size={10} />}
+          Ask Clerk to plan today
+        </button>
+      </div>
+    );
+  }
+
+  if (plan.stale) {
+    const noun = plan.days_old === 1 ? "day" : "days";
+    const openNote = plan.open_items != null ? ` · ${plan.open_items} open` : "";
+    return (
+      <div className="flex items-center gap-2.5 px-4 py-2.5 border-b border-amber-900/30 bg-amber-950/10">
+        <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0 animate-pulse" />
+        <span className="text-xs text-amber-400/80">
+          Plan stale · from {plan.date} ({plan.days_old} {noun} ago{openNote})
+        </span>
+        <button
+          onClick={() => onAskClerk("Reconcile the plan: the last plan is from " + plan.date + " and today is " + plan.today + ". Read what actually got done (git log, agent logs), carry forward open items, and write a fresh plan-" + plan.today + ".json to active/state/. Keep it tight.")}
+          disabled={clerkRunning}
+          className="ml-auto flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg border border-amber-700/40 text-amber-400/80 hover:text-amber-300 hover:border-amber-600/50 disabled:opacity-40 transition-colors"
+        >
+          {clerkRunning ? <Loader size={10} className="animate-spin" /> : <Calendar size={10} />}
+          Reconcile
+        </button>
+      </div>
+    );
+  }
+
+  // Current plan
+  const openNote = plan.open_items != null
+    ? plan.open_items === 0 ? " · all done" : ` · ${plan.open_items} open`
+    : "";
+  return (
+    <div className="flex items-center gap-2.5 px-4 py-2 border-b border-zinc-800/40 bg-zinc-950">
+      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+      <span className="text-[11px] text-zinc-500">
+        Plan: today{openNote}
+        {plan.focus && <span className="text-zinc-600 ml-1.5">· {plan.focus}</span>}
+      </span>
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function Chat() {
   const [agents, setAgents]             = useState<Agent[]>([]);
+  const [planState, setPlanState]       = useState<PlanState | null>(null);
   const [messages, setMessages]         = useState<Msg[]>(PLACEHOLDER_MESSAGES);
   const [streamEntries, setStreamEntries] = useState<StreamEntry[]>([]);
   const [runningAgents, setRunningAgents] = useState<Set<string>>(new Set());
@@ -600,11 +677,14 @@ export function Chat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef   = useRef<HTMLDivElement>(null);
 
-  // ── Load agents ──────────────────────────────────────────────────────────────
+  // ── Load agents + plan state ─────────────────────────────────────────────────
   useEffect(() => {
     invoke<Agent[]>("list_agents")
       .then(setAgents)
       .catch(() => setAgents([]));
+    invoke<PlanState>("get_plan_state")
+      .then(setPlanState)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -644,6 +724,10 @@ export function Chat() {
           s.delete(agentId);
           return s;
         });
+        // Clerk may have written a new plan — refresh plan state.
+        if (agentId === "clerk" && kind === "done") {
+          invoke<PlanState>("get_plan_state").then(setPlanState).catch(() => {});
+        }
       }
     }).then((fn) => {
       unlisten = fn;
@@ -656,6 +740,28 @@ export function Chat() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [streamEntries]);
+
+  // ── Ask Clerk handler (plan banner) ──────────────────────────────────────────
+  async function handleAskClerk(task: string) {
+    const clerk = agents.find((a) => a.id === "clerk");
+    if (!clerk) return;
+    const entryId = `stream-clerk-${Date.now()}`;
+    setStreamEntries((prev) => [
+      ...prev,
+      { id: entryId, runId: "", agentId: "clerk", agentName: clerk.name, text: "", status: "thinking", time: nowTime() },
+    ]);
+    setRunningAgents((prev) => new Set([...prev, "clerk"]));
+    try {
+      const runId = await invoke<string>("run_agent", { agentId: "clerk", task, parentRunId: null });
+      setStreamEntries((prev) => prev.map((e) => (e.id === entryId ? { ...e, runId } : e)));
+      // Refresh plan state after Clerk finishes (handled via done event)
+    } catch (err) {
+      setStreamEntries((prev) =>
+        prev.map((e) => e.id === entryId ? { ...e, text: `Failed: ${err}`, status: "error" } : e)
+      );
+      setRunningAgents((prev) => { const s = new Set(prev); s.delete("clerk"); return s; });
+    }
+  }
 
   // ── Send handler ──────────────────────────────────────────────────────────────
   async function handleSend() {
@@ -862,6 +968,13 @@ export function Chat() {
           </button>
         </div>
       </div>
+
+      {/* Plan banner */}
+      <PlanBanner
+        plan={planState}
+        onAskClerk={handleAskClerk}
+        clerkRunning={runningAgents.has("clerk")}
+      />
 
       {/* Body */}
       <div className="flex flex-1 min-h-0">

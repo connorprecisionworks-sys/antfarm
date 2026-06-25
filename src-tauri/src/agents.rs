@@ -218,14 +218,23 @@ pub fn run_agent(
             .to_string()
     };
 
+    // ── Daily context preamble (orchestrator + clerk) ─────────────────────────
+    // Injects plan staleness, recent commits, and today's agent activity so
+    // these agents never work blind. Other agents stay lean.
+    let daily_preamble = if agent.role == "orchestrator" || agent_id == "clerk" {
+        crate::daily::daily_context_preamble(&vault)
+    } else {
+        String::new()
+    };
+
     // ── Build full -p prompt ──────────────────────────────────────────────────
     let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
     let full_prompt = match base_prompt {
         Some(sys) => format!(
-            "{sys}{write_scope}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
+            "{sys}{write_scope}{daily_preamble}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
         ),
         None => format!(
-            "Current date and time: {now}{write_scope}{role_note}\n\nUser: {task}"
+            "Current date and time: {now}{write_scope}{daily_preamble}{role_note}\n\nUser: {task}"
         ),
     };
 

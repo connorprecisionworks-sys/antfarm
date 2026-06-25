@@ -2,6 +2,7 @@
 
 mod agents;
 mod chat;
+mod daily;
 mod dispatch;
 mod harness;
 mod memory;
@@ -2476,6 +2477,10 @@ fn main() {
             agents::list_agents,
             agents::get_agent,
             agents::run_agent,
+            daily::get_plan_state,
+            daily::get_daily_context,
+            daily::write_daily_recap,
+            daily::write_plan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
