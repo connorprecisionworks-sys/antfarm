@@ -61,6 +61,7 @@ interface StreamEntry {
   status: "thinking" | "streaming" | "done" | "error";
   time: string;
   parentId?: string;   // local id of the orchestrator entry that spawned this
+  userMsg?: string;    // the message Connor sent that triggered this run
 }
 
 // A parsed delegation task from Jack's ```delegate block
@@ -657,6 +658,77 @@ function PlanBanner({
   );
 }
 
+// ── User message bubble ───────────────────────────────────────────────────────
+
+function UserMsgBubble({ text, time }: { text: string; time: string }) {
+  return (
+    <div className="flex justify-end">
+      <div className="max-w-[80%] bg-zinc-800 border border-zinc-700/50 rounded-xl px-4 py-2.5">
+        <p className="text-sm text-zinc-100 leading-relaxed whitespace-pre-wrap">{text}</p>
+        <p className="text-[10px] text-zinc-600 mt-1 text-right">{time}</p>
+      </div>
+    </div>
+  );
+}
+
+// ── @mention dropdown ─────────────────────────────────────────────────────────
+
+function MentionDropdown({
+  query,
+  agents,
+  onSelect,
+}: {
+  query: string;
+  agents: Agent[];
+  onSelect: (a: Agent) => void;
+}) {
+  const filtered = agents.filter(
+    (a) =>
+      a.name.toLowerCase().startsWith(query) ||
+      a.id.startsWith(query)
+  );
+  if (!filtered.length) return null;
+  return (
+    <div className="absolute bottom-full mb-1 left-0 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl z-50 min-w-[180px] overflow-hidden">
+      {filtered.map((a) => (
+        <button
+          key={a.id}
+          onMouseDown={(e) => { e.preventDefault(); onSelect(a); }}
+          className="w-full text-left px-3 py-2 text-xs text-zinc-200 hover:bg-zinc-700/80 flex items-center gap-2 transition-colors"
+        >
+          <Bot size={10} className="text-zinc-500 shrink-0" />
+          <span className="flex-1">{a.name}</span>
+          <span className="text-[10px] text-zinc-600">
+            {a.role === "orchestrator" ? "Orch" : "Agent"}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Draft highlight renderer ───────────────────────────────────────────────────
+
+function renderDraftHighlighted(text: string, agents: Agent[]) {
+  const parts = text.split(/(@\S+)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("@")) {
+      const slug = part.slice(1).toLowerCase();
+      const matched = agents.find(
+        (a) => a.name.toLowerCase() === slug || a.id === slug
+      );
+      if (matched) {
+        return (
+          <span key={i} className="bg-blue-500/25 text-blue-300 rounded px-0.5">
+            {part}
+          </span>
+        );
+      }
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function Chat() {
@@ -674,8 +746,11 @@ export function Chat() {
   const [draft, setDraft]               = useState("");
   const [overnight, setOvernight]       = useState(false);
   const [recipientId, setRecipientId]   = useState<string | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const bottomRef   = useRef<HTMLDivElement>(null);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [isListening, setIsListening]   = useState(false);
+  const textareaRef   = useRef<HTMLTextAreaElement>(null);
+  const recognitionRef = useRef<any>(null);
+  const bottomRef     = useRef<HTMLDivElement>(null);
 
   // ── Load agents + plan state ─────────────────────────────────────────────────
   useEffect(() => {
@@ -763,19 +838,68 @@ export function Chat() {
     }
   }
 
+  // ── Mic handler ───────────────────────────────────────────────────────────────
+  function handleMicClick() {
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      textareaRef.current?.focus();
+      return;
+    }
+    const rec = new SpeechRecognition();
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = "en-US";
+    rec.onresult = (e: any) => {
+      const transcript = Array.from(e.results as any[])
+        .map((r: any) => r[0].transcript)
+        .join("");
+      setDraft((prev) => (prev ? prev + " " : "") + transcript);
+      setIsListening(false);
+    };
+    rec.onerror = () => setIsListening(false);
+    rec.onend   = () => setIsListening(false);
+    rec.start();
+    recognitionRef.current = rec;
+    setIsListening(true);
+  }
+
   // ── Send handler ──────────────────────────────────────────────────────────────
   async function handleSend() {
-    const task = draft.trim();
-    if (!task || !recipient) return;
+    const raw = draft.trim();
+    if (!raw || !recipient) return;
+
+    // Parse leading @mention to override recipient.
+    // "@scout research X" → target scout, task = "research X"
+    const mentionMatch = raw.match(/^@(\S+)\s*([\s\S]*)$/);
+    let targetAgent = recipient;
+    let task = raw;
+    if (mentionMatch) {
+      const slug  = mentionMatch[1].toLowerCase();
+      const found = agents.find(
+        (a) => a.name.toLowerCase() === slug || a.id === slug
+      );
+      if (found) {
+        targetAgent = found;
+        task = mentionMatch[2].trim() || raw;
+      }
+    }
+
     setDraft("");
+    setMentionQuery(null);
 
     const entryId   = `stream-${Date.now()}`;
-    const agentId   = recipient.id;
-    const agentName = recipient.name;
+    const agentId   = targetAgent.id;
+    const agentName = targetAgent.name;
 
     setStreamEntries((prev) => [
       ...prev,
-      { id: entryId, runId: "", agentId, agentName, text: "", status: "thinking", time: nowTime() },
+      { id: entryId, runId: "", agentId, agentName, text: "", status: "thinking", time: nowTime(), userMsg: raw },
     ]);
     setRunningAgents((prev) => new Set([...prev, agentId]));
 
@@ -1004,7 +1128,10 @@ export function Chat() {
                 {rootEntries.map((entry) => {
                   const kids = childrenOf(entry.id);
                   return (
-                    <div key={entry.id} className="space-y-0">
+                    <div key={entry.id} className="space-y-2">
+                      {entry.userMsg && (
+                        <UserMsgBubble text={entry.userMsg} time={entry.time} />
+                      )}
                       <StreamBubble
                         entry={entry}
                         agents={agents}
@@ -1063,32 +1190,109 @@ export function Chat() {
               ) : (
                 <span className="text-xs text-zinc-600 italic">no recipient</span>
               )}
-              <button className="flex items-center gap-1 text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors">
+              <button
+                onClick={() => {
+                  const t = textareaRef.current;
+                  if (!t) return;
+                  const pos = t.selectionStart ?? draft.length;
+                  const before = draft.slice(0, pos);
+                  const after  = draft.slice(pos);
+                  const insert = before.endsWith("@") ? "" : "@";
+                  setDraft(before + insert + after);
+                  setMentionQuery("");
+                  setTimeout(() => t.focus(), 0);
+                }}
+                className="flex items-center gap-1 text-[11px] text-zinc-600 hover:text-zinc-400 transition-colors"
+              >
                 <AtSign size={11} />
                 mention
               </button>
             </div>
 
             <div className="relative">
+              {/* @mention dropdown */}
+              {mentionQuery !== null && (
+                <MentionDropdown
+                  query={mentionQuery}
+                  agents={agents}
+                  onSelect={(a) => {
+                    // Replace the trailing @... with @AgentName<space>
+                    const lastAt = draft.lastIndexOf("@");
+                    const before = lastAt !== -1 ? draft.slice(0, lastAt) : draft;
+                    setDraft(before + "@" + a.name + " ");
+                    setRecipientId(a.id);
+                    setMentionQuery(null);
+                    setTimeout(() => textareaRef.current?.focus(), 0);
+                  }}
+                />
+              )}
+
+              {/* Highlight overlay — same font/padding as the textarea */}
+              <div
+                aria-hidden
+                className="absolute inset-0 px-4 py-3 text-sm leading-6 whitespace-pre-wrap break-words pointer-events-none rounded-xl overflow-hidden pr-12"
+                style={{ fontFamily: "inherit" }}
+              >
+                {draft
+                  ? renderDraftHighlighted(draft, agents)
+                  : <span className="text-zinc-600">{
+                      recipient
+                        ? `Message ${recipient.name}… type /dispatch or /plan to start a run`
+                        : "Type a message…"
+                    }</span>
+                }
+              </div>
+
               <textarea
                 ref={textareaRef}
                 rows={2}
                 value={draft}
-                onChange={(e) => setDraft(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setDraft(val);
+                  // Detect live @mention query
+                  const lastAt = val.lastIndexOf("@");
+                  if (lastAt !== -1) {
+                    const afterAt = val.slice(lastAt + 1);
+                    if (!/\s/.test(afterAt)) {
+                      setMentionQuery(afterAt.toLowerCase());
+                    } else {
+                      // Completed @Name — update recipient if matched
+                      const m = val.match(/@(\S+)/);
+                      if (m) {
+                        const slug  = m[1].toLowerCase();
+                        const found = agents.find(
+                          (a) => a.name.toLowerCase() === slug || a.id === slug
+                        );
+                        if (found) setRecipientId(found.id);
+                      }
+                      setMentionQuery(null);
+                    }
+                  } else {
+                    setMentionQuery(null);
+                  }
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     handleSend();
                   }
+                  if (e.key === "Escape" && mentionQuery !== null) {
+                    setMentionQuery(null);
+                  }
                 }}
-                placeholder={
-                  recipient
-                    ? `Message ${recipient.name}… type /dispatch or /plan to start a run`
-                    : "Type a message…"
-                }
-                className="w-full resize-none bg-zinc-900/60 border border-zinc-700/60 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-zinc-600 pr-12 transition-colors"
+                style={{ color: "transparent", caretColor: "white" }}
+                className="w-full relative resize-none bg-zinc-900/60 border border-zinc-700/60 rounded-xl px-4 py-3 text-sm leading-6 placeholder-transparent focus:outline-none focus:border-zinc-600 pr-12 transition-colors"
               />
-              <button className="absolute right-3 top-3 text-zinc-600 hover:text-zinc-400 transition-colors">
+              <button
+                onClick={handleMicClick}
+                className={`absolute right-3 top-3 transition-colors ${
+                  isListening
+                    ? "text-red-400 animate-pulse"
+                    : "text-zinc-600 hover:text-zinc-400"
+                }`}
+                title={isListening ? "Stop listening" : "Dictate"}
+              >
                 <Mic size={15} />
               </button>
             </div>
