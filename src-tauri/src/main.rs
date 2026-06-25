@@ -2366,6 +2366,7 @@ fn main() {
 
     let dispatch_state  = dispatch::DispatchState::default();
     let dispatch_claude = dispatch_state.claude_path.clone();
+    let agent_run_state = agents::AgentRunState::default();
 
     let harness_state = harness::HarnessState::default();
 
@@ -2376,6 +2377,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(events_state)
         .manage(dispatch_state)
+        .manage(agent_run_state)
         .manage(harness_state)
         .manage(pty_state)
         .manage(mobile::VoicePendingState::default())
@@ -2473,6 +2475,7 @@ fn main() {
             memory::memory_search,
             agents::list_agents,
             agents::get_agent,
+            agents::run_agent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

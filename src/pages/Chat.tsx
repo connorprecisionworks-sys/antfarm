@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
-  AtSign, Bot, Check, ChevronDown, ChevronRight, Mic,
-  Moon, Send, X, Zap,
+  AtSign, Bot, Check, ChevronDown, ChevronRight, Loader,
+  Mic, Moon, Send, X, Zap,
 } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -17,8 +18,17 @@ interface Agent {
   schedule: string | null;
 }
 
+interface AgentStreamPayload {
+  runId: string;
+  agentId: string;
+  /** "start" | "text" | "done" | "error" */
+  kind: string;
+  text: string;
+}
+
 type Filter = "needs-you" | "all";
 
+// Placeholder messages (Phase 1 sample data)
 interface Msg {
   id: string;
   from: string;
@@ -30,9 +40,21 @@ interface Msg {
   collapsed: boolean;
 }
 
-// ── Placeholder messages (Phase 1) ────────────────────────────────────────────
+// Live streaming entry from a real agent run
+interface StreamEntry {
+  id: string;          // local UI id
+  runId: string;
+  agentId: string;
+  agentName: string;
+  text: string;
+  /** "thinking" | "streaming" | "done" | "error" */
+  status: "thinking" | "streaming" | "done" | "error";
+  time: string;
+}
 
-const INITIAL_MESSAGES: Msg[] = [
+// ── Placeholder messages ───────────────────────────────────────────────────────
+
+const PLACEHOLDER_MESSAGES: Msg[] = [
   {
     id: "m1",
     from: "Captain Jack",
@@ -89,7 +111,11 @@ function roleLabel(role: string): string {
   return role === "orchestrator" ? "Orchestrator" : "Subagent";
 }
 
-// ── Sub-components ────────────────────────────────────────────────────────────
+function nowTime(): string {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// ── Message components ────────────────────────────────────────────────────────
 
 function NeedsYouMessage({
   msg,
@@ -156,14 +182,8 @@ function ChatterMessage({
       ) : (
         <ChevronDown size={11} className="text-zinc-700 shrink-0" />
       )}
-      <span className="text-[11px] text-zinc-600 font-medium shrink-0">
-        {msg.from}
-      </span>
-      <span
-        className={`text-[11px] flex-1 truncate ${
-          msg.collapsed ? "text-zinc-700" : "text-zinc-600"
-        }`}
-      >
+      <span className="text-[11px] text-zinc-600 font-medium shrink-0">{msg.from}</span>
+      <span className={`text-[11px] flex-1 truncate ${msg.collapsed ? "text-zinc-700" : "text-zinc-600"}`}>
         {msg.content}
       </span>
       <span className="text-[10px] text-zinc-700 shrink-0">{msg.time}</span>
@@ -171,19 +191,90 @@ function ChatterMessage({
   );
 }
 
-function AgentCard({ agent }: { agent: Agent }) {
-  const isActive = agent.status === "active";
+// ── Streaming message bubble ──────────────────────────────────────────────────
+
+function StreamBubble({ entry }: { entry: StreamEntry }) {
+  const isLive   = entry.status === "thinking" || entry.status === "streaming";
+  const isError  = entry.status === "error";
+  const isEmpty  = !entry.text;
+
   return (
-    <div className="rounded-xl border border-zinc-800/60 bg-zinc-900/50 p-3">
-      <div className="flex items-center gap-2 mb-1.5">
-        <span
-          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-            isActive ? "bg-emerald-400" : "bg-zinc-600"
+    <div
+      className={`border rounded-xl p-4 transition-colors ${
+        isError
+          ? "border-red-800/50 border-l-[3px] border-l-red-500/60 bg-zinc-900/70"
+          : isLive
+          ? "border-zinc-700/60 border-l-[3px] border-l-blue-500/60 bg-zinc-900/70"
+          : "border-zinc-800 border-l-[3px] border-l-zinc-600/60 bg-zinc-900/40"
+      }`}
+    >
+      <div className="flex items-center gap-2 mb-2.5">
+        {isLive ? (
+          <Loader size={12} className="text-blue-400 shrink-0 animate-spin" />
+        ) : isError ? (
+          <Zap size={12} className="text-red-400 shrink-0" />
+        ) : (
+          <Bot size={12} className="text-zinc-500 shrink-0" />
+        )}
+        <span className="text-xs font-medium text-zinc-200">{entry.agentName}</span>
+        {isLive && (
+          <span className="text-[10px] text-blue-400/70 bg-blue-500/10 px-1.5 py-0.5 rounded-full">
+            {isEmpty ? "thinking…" : "responding…"}
+          </span>
+        )}
+        <span className="ml-auto text-[11px] text-zinc-500">{entry.time}</span>
+      </div>
+
+      {isEmpty && isLive ? (
+        /* Thinking dots */
+        <div className="flex gap-1 mt-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce [animation-delay:0ms]" />
+          <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce [animation-delay:150ms]" />
+          <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce [animation-delay:300ms]" />
+        </div>
+      ) : (
+        <p
+          className={`text-sm leading-relaxed whitespace-pre-wrap ${
+            isError ? "text-red-300" : "text-zinc-100"
           }`}
-        />
-        <span className="text-[13px] font-medium text-zinc-200 truncate">
-          {agent.name}
-        </span>
+        >
+          {entry.text}
+          {isLive && entry.text && (
+            <span className="inline-block w-0.5 h-4 bg-blue-400 ml-0.5 align-text-bottom animate-pulse" />
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ── Agent crew card ───────────────────────────────────────────────────────────
+
+function AgentCard({
+  agent,
+  isRunning,
+  onClick,
+}: {
+  agent: Agent;
+  isRunning: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="w-full text-left rounded-xl border border-zinc-800/60 bg-zinc-900/50 hover:bg-zinc-900/80 p-3 transition-colors"
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        {isRunning ? (
+          <Loader size={10} className="text-blue-400 shrink-0 animate-spin" />
+        ) : (
+          <span
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+              agent.status === "active" ? "bg-emerald-400" : "bg-zinc-600"
+            }`}
+          />
+        )}
+        <span className="text-[13px] font-medium text-zinc-200 truncate">{agent.name}</span>
         {agent.role === "orchestrator" && (
           <Zap size={10} className="text-amber-400 shrink-0" />
         )}
@@ -192,17 +283,12 @@ function AgentCard({ agent }: { agent: Agent }) {
         <span className="text-[10px] text-zinc-500 bg-zinc-800/70 px-1.5 py-0.5 rounded">
           {roleLabel(agent.role)}
         </span>
-        <span className="text-[10px] text-zinc-600">
-          {shortModel(agent.model)}
-        </span>
+        <span className="text-[10px] text-zinc-600">{shortModel(agent.model)}</span>
       </div>
       {agent.connectors.length > 0 && (
         <div className="mt-1.5 flex gap-1 flex-wrap">
           {agent.connectors.map((c) => (
-            <span
-              key={c}
-              className="text-[9px] text-zinc-600 bg-zinc-800/40 px-1 py-0.5 rounded"
-            >
+            <span key={c} className="text-[9px] text-zinc-600 bg-zinc-800/40 px-1 py-0.5 rounded">
               {c}
             </span>
           ))}
@@ -211,28 +297,25 @@ function AgentCard({ agent }: { agent: Agent }) {
       {agent.schedule && (
         <div className="mt-1 text-[9px] text-zinc-700">⏰ {agent.schedule}</div>
       )}
-    </div>
+    </button>
   );
 }
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function Chat() {
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [messages, setMessages] = useState<Msg[]>(INITIAL_MESSAGES);
-  const [filter, setFilter] = useState<Filter>("needs-you");
-  const [draft, setDraft] = useState("");
-  const [overnight, setOvernight] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // Default recipient = first orchestrator, or first agent
-  const defaultRecipient =
-    agents.find((a) => a.role === "orchestrator") ?? agents[0] ?? null;
+  const [agents, setAgents]           = useState<Agent[]>([]);
+  const [messages, setMessages]       = useState<Msg[]>(PLACEHOLDER_MESSAGES);
+  const [streamEntries, setStreamEntries] = useState<StreamEntry[]>([]);
+  const [runningAgents, setRunningAgents] = useState<Set<string>>(new Set());
+  const [filter, setFilter]           = useState<Filter>("needs-you");
+  const [draft, setDraft]             = useState("");
+  const [overnight, setOvernight]     = useState(false);
   const [recipientId, setRecipientId] = useState<string | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const bottomRef   = useRef<HTMLDivElement>(null);
 
-  const recipient =
-    agents.find((a) => a.id === recipientId) ?? defaultRecipient;
-
+  // ── Load agents ──────────────────────────────────────────────────────────────
   useEffect(() => {
     invoke<Agent[]>("list_agents")
       .then(setAgents)
@@ -242,10 +325,114 @@ export function Chat() {
   // Set default recipient once agents load
   useEffect(() => {
     if (agents.length > 0 && recipientId === null) {
-      const orchestrator = agents.find((a) => a.role === "orchestrator");
-      setRecipientId(orchestrator?.id ?? agents[0]?.id ?? null);
+      const orch = agents.find((a) => a.role === "orchestrator");
+      setRecipientId(orch?.id ?? agents[0]?.id ?? null);
     }
   }, [agents, recipientId]);
+
+  // ── Listen for agent-stream events ──────────────────────────────────────────
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    listen<AgentStreamPayload>("agent-stream", (event) => {
+      const { agentId, kind, text } = event.payload;
+
+      if (kind === "start") {
+        // Placeholder added on send; nothing to do here.
+        return;
+      }
+
+      if (kind === "text") {
+        setStreamEntries((prev) =>
+          prev.map((e) =>
+            e.agentId === agentId && (e.status === "thinking" || e.status === "streaming")
+              ? { ...e, text, status: "streaming" }
+              : e
+          )
+        );
+        return;
+      }
+
+      if (kind === "done" || kind === "error") {
+        setStreamEntries((prev) =>
+          prev.map((e) =>
+            e.agentId === agentId && (e.status === "thinking" || e.status === "streaming")
+              ? { ...e, text: text || e.text, status: kind === "error" ? "error" : "done" }
+              : e
+          )
+        );
+        setRunningAgents((prev) => {
+          const next = new Set(prev);
+          next.delete(agentId);
+          return next;
+        });
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  // Auto-scroll to bottom when new entries arrive
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [streamEntries, messages]);
+
+  // ── Send handler ─────────────────────────────────────────────────────────────
+  async function handleSend() {
+    const task = draft.trim();
+    if (!task || !recipient) return;
+    setDraft("");
+
+    const entryId  = `stream-${Date.now()}`;
+    const agentId  = recipient.id;
+    const agentName = recipient.name;
+
+    // Optimistic: add thinking bubble
+    setStreamEntries((prev) => [
+      ...prev,
+      { id: entryId, runId: "", agentId, agentName, text: "", status: "thinking", time: nowTime() },
+    ]);
+    setRunningAgents((prev) => new Set([...prev, agentId]));
+
+    try {
+      await invoke<string>("run_agent", { agentId, task });
+    } catch (err) {
+      setStreamEntries((prev) =>
+        prev.map((e) =>
+          e.id === entryId
+            ? { ...e, text: `Failed to start agent: ${err}`, status: "error" }
+            : e
+        )
+      );
+      setRunningAgents((prev) => {
+        const next = new Set(prev);
+        next.delete(agentId);
+        return next;
+      });
+    }
+  }
+
+  // ── Recipient + filter ────────────────────────────────────────────────────────
+  const defaultAgent = agents.find((a) => a.role === "orchestrator") ?? agents[0] ?? null;
+  const recipient    = agents.find((a) => a.id === recipientId) ?? defaultAgent;
+
+  const needsYouCount = messages.filter((m) => m.tier === "needs-you").length;
+
+  const visibleMessages =
+    filter === "needs-you"
+      ? messages.filter((m) => m.tier === "needs-you")
+      : messages;
+
+  // Always show stream entries regardless of filter (they're from real interactions)
+  const visibleEntries = streamEntries;
+
+  function dismissMessage(id: string) {
+    setMessages((msgs) => msgs.filter((m) => m.id !== id));
+  }
 
   function toggleCollapse(id: string) {
     setMessages((msgs) =>
@@ -253,35 +440,26 @@ export function Chat() {
     );
   }
 
-  function dismissMessage(id: string) {
-    setMessages((msgs) => msgs.filter((m) => m.id !== id));
+  function selectRecipient(agent: Agent) {
+    setRecipientId(agent.id);
+    textareaRef.current?.focus();
   }
 
-  const visibleMessages =
-    filter === "needs-you"
-      ? messages.filter((m) => m.tier === "needs-you")
-      : messages;
-
-  const needsYouCount = messages.filter((m) => m.tier === "needs-you").length;
-
+  // ── Render ────────────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col h-full bg-zinc-950 overflow-hidden">
-      {/* Header */}
+      {/* ── Header ── */}
       <div className="flex items-center gap-4 px-5 h-14 border-b border-zinc-800 shrink-0">
         <div>
-          <h1 className="text-sm font-semibold text-zinc-100 leading-none">
-            Chat
-          </h1>
+          <h1 className="text-sm font-semibold text-zinc-100 leading-none">Chat</h1>
           <p className="text-[11px] text-zinc-500 mt-0.5">
             {agents.length > 0
-              ? `${agents.length} agents · ${agents
-                  .filter((a) => a.status === "active")
-                  .length} active`
+              ? `${agents.length} agents · ${agents.filter((a) => a.status === "active").length} active`
               : "Loading crew…"}
           </p>
         </div>
 
-        {/* Filter tabs */}
+        {/* Filter toggle */}
         <div className="ml-auto flex items-center gap-1 bg-zinc-900 border border-zinc-800 rounded-lg p-0.5">
           <button
             onClick={() => setFilter("needs-you")}
@@ -311,13 +489,13 @@ export function Chat() {
         </div>
       </div>
 
-      {/* Body */}
+      {/* ── Body ── */}
       <div className="flex flex-1 min-h-0">
-        {/* Thread */}
+        {/* ── Thread ── */}
         <div className="flex flex-col flex-1 min-w-0">
-          {/* Messages */}
           <div className="flex-1 overflow-y-auto px-5 py-5 space-y-2">
-            {visibleMessages.length === 0 ? (
+            {/* Placeholder messages */}
+            {visibleMessages.length === 0 && visibleEntries.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-center pb-16">
                 <div className="w-10 h-10 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center mb-3">
                   <Zap size={16} className="text-zinc-600" />
@@ -326,31 +504,27 @@ export function Chat() {
                 <p className="text-xs text-zinc-600 mt-1">Switch to All to see the full thread</p>
               </div>
             ) : (
-              visibleMessages.map((msg) => {
-                if (msg.tier === "needs-you") {
-                  return (
-                    <NeedsYouMessage
-                      key={msg.id}
-                      msg={msg}
-                      onDismiss={dismissMessage}
-                    />
-                  );
-                }
-                if (msg.tier === "chatter") {
-                  return (
-                    <ChatterMessage
-                      key={msg.id}
-                      msg={msg}
-                      onToggle={toggleCollapse}
-                    />
-                  );
-                }
-                return <FyiMessage key={msg.id} msg={msg} />;
-              })
+              <>
+                {visibleMessages.map((msg) => {
+                  if (msg.tier === "needs-you") {
+                    return <NeedsYouMessage key={msg.id} msg={msg} onDismiss={dismissMessage} />;
+                  }
+                  if (msg.tier === "chatter") {
+                    return <ChatterMessage key={msg.id} msg={msg} onToggle={toggleCollapse} />;
+                  }
+                  return <FyiMessage key={msg.id} msg={msg} />;
+                })}
+
+                {/* Live agent stream bubbles */}
+                {visibleEntries.map((entry) => (
+                  <StreamBubble key={entry.id} entry={entry} />
+                ))}
+              </>
             )}
+            <div ref={bottomRef} />
           </div>
 
-          {/* Composer */}
+          {/* ── Composer ── */}
           <div className="shrink-0 border-t border-zinc-800 bg-zinc-950 px-5 pt-4 pb-5">
             {/* Recipient row */}
             <div className="flex items-center gap-2 mb-3">
@@ -384,6 +558,7 @@ export function Chat() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
+                    handleSend();
                   }
                 }}
                 placeholder={
@@ -444,35 +619,42 @@ export function Chat() {
 
               {/* Send */}
               <button
-                disabled={!draft.trim()}
+                onClick={handleSend}
+                disabled={!draft.trim() || !recipient || runningAgents.has(recipient?.id ?? "")}
                 className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors border border-zinc-700"
               >
-                <Send size={12} />
+                {runningAgents.has(recipient?.id ?? "") ? (
+                  <Loader size={12} className="animate-spin" />
+                ) : (
+                  <Send size={12} />
+                )}
                 Send
               </button>
             </div>
           </div>
         </div>
 
-        {/* Right rail — Crew */}
+        {/* ── Crew rail ── */}
         <div className="w-[220px] shrink-0 border-l border-zinc-800 flex flex-col bg-zinc-950">
           <div className="flex items-center gap-2 px-4 py-3 border-b border-zinc-800">
             <span className="text-xs font-medium text-zinc-400">Crew</span>
             {agents.length > 0 && (
               <span className="ml-auto text-[10px] text-zinc-600">
-                {agents.filter((a) => a.status === "active").length}/
-                {agents.length}
+                {agents.filter((a) => a.status === "active").length}/{agents.length}
               </span>
             )}
           </div>
           <div className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
             {agents.length === 0 ? (
-              <div className="text-[11px] text-zinc-700 text-center mt-6">
-                Loading…
-              </div>
+              <div className="text-[11px] text-zinc-700 text-center mt-6">Loading…</div>
             ) : (
               agents.map((agent) => (
-                <AgentCard key={agent.id} agent={agent} />
+                <AgentCard
+                  key={agent.id}
+                  agent={agent}
+                  isRunning={runningAgents.has(agent.id)}
+                  onClick={() => selectRecipient(agent)}
+                />
               ))
             )}
           </div>
