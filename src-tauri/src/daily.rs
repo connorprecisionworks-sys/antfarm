@@ -387,7 +387,7 @@ pub fn daily_context_preamble(vault: &PathBuf) -> String {
     // ── CC sessions today ────────────────────────────────────────────────────
     if !cc_sessions.is_empty() {
         out.push_str("\n\n## Claude Code sessions today\n");
-        for s in &cc_sessions {
+        for s in cc_sessions.iter().take(4) {
             out.push_str(&format!("- {s}\n"));
         }
     }
@@ -395,13 +395,16 @@ pub fn daily_context_preamble(vault: &PathBuf) -> String {
     // ── Recent commits (all registry repos + antfarm, last 48h) ──────────────
     if !commits.is_empty() {
         out.push_str("\n\n## Recent commits (last 48h)\n");
-        out.push_str(&commits.join("\n"));
+        for line in commits.iter().take(8) {
+            out.push_str(line);
+            out.push('\n');
+        }
     }
 
     // ── Agent activity today ──────────────────────────────────────────────────
     if !agent_logs.is_empty() {
         out.push_str("\n\n## Agent runs today\n");
-        for line in agent_logs.iter().take(20) {
+        for line in agent_logs.iter().take(6) {
             out.push_str(line);
             out.push('\n');
         }

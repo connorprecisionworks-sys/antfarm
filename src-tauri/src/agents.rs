@@ -21,6 +21,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::dispatch::DispatchState;
 
+const COMPACT_THRESHOLD_PCT: f32 = 50.0;
+const MODEL_CONTEXT_WINDOW: u32  = 200_000;
+
 // ── Path ──────────────────────────────────────────────────────────────────────
 
 fn vault_root() -> PathBuf {
@@ -75,6 +78,12 @@ pub struct AgentStreamEvent {
     pub text: String,
     /// Non-null for subagent runs spawned by orchestrator fan-out.
     pub parent_run_id: Option<String>,
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub usage_pct: f32,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -114,6 +123,38 @@ fn new_agent_run_id(agent_id: &str) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("agent-{agent_id}-{ts}")
+}
+
+fn agent_sessions_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let d = PathBuf::from(home).join(".antfarm/agent-sessions");
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+fn load_agent_session_id(agent_id: &str) -> Option<String> {
+    let path = agent_sessions_dir().join(format!("{agent_id}.txt"));
+    // Expire sessions after 24 hours
+    let meta = std::fs::metadata(&path).ok()?;
+    let age = meta.modified().ok()?
+        .elapsed()
+        .unwrap_or(std::time::Duration::from_secs(u64::MAX));
+    if age > std::time::Duration::from_secs(86_400) {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_agent_session_id(agent_id: &str, sid: &str) {
+    let _ = std::fs::write(agent_sessions_dir().join(format!("{agent_id}.txt")), sid);
+}
+
+fn clear_agent_session_id(agent_id: &str) {
+    let _ = std::fs::remove_file(agent_sessions_dir().join(format!("{agent_id}.txt")));
 }
 
 // ── Networked permission helpers ──────────────────────────────────────────────
@@ -272,6 +313,15 @@ pub fn get_agent(id: String) -> Option<Agent> {
     serde_json::from_str(&content).ok()
 }
 
+#[tauri::command]
+pub fn reset_agent_session(agent_id: String) -> Result<(), String> {
+    if agent_id.is_empty() || agent_id.contains('/') || agent_id.contains("..") {
+        return Err("invalid agent_id".into());
+    }
+    clear_agent_session_id(&agent_id);
+    Ok(())
+}
+
 // ── run_agent ─────────────────────────────────────────────────────────────────
 
 /// Spawn a claude -p agent run. Reads agent.json + prompt.md, injects write-scope
@@ -288,6 +338,7 @@ pub fn run_agent(
     agent_id: String,
     task: String,
     parent_run_id: Option<String>,
+    resume_session: bool,
 ) -> Result<String, String> {
     let vault = vault_root();
 
@@ -363,39 +414,50 @@ pub fn run_agent(
         ),
     };
 
+    // ── Session reuse ──────────────────────────────────────────────────────────
+    let existing_sid = if resume_session { load_agent_session_id(&agent_id) } else { None };
+    let is_resuming  = existing_sid.is_some();
+
     // ── Spawn child ───────────────────────────────────────────────────────────
-    let claude  = dispatch.claude_path.lock().unwrap().clone();
-    let add_dir = vault.to_string_lossy().into_owned(); // full vault = full read access
+    let claude    = dispatch.claude_path.lock().unwrap().clone();
+    let vault_str = vault.to_string_lossy().into_owned();
 
     let mut cmd = Command::new(&claude);
-    cmd.args([
-        "-p", &full_prompt,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--permission-mode", "dontAsk",
-        "--model", &agent.model,
-        "--add-dir", &add_dir,
-    ]);
+    if let Some(ref sid) = existing_sid {
+        // Warm resume: only user task (+ current time). No --add-dir needed.
+        let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
+        let msg  = format!("Current date and time: {now}\n\nUser: {task}");
+        cmd.args(["--resume", sid, "-p", &msg,
+                  "--output-format", "stream-json",
+                  "--verbose",
+                  "--permission-mode", "dontAsk",
+                  "--model", &agent.model]);
+    } else {
+        // Cold start: full system prompt + --add-dir (scope depends on agent role).
+        cmd.args(["-p", &full_prompt,
+                  "--output-format", "stream-json",
+                  "--verbose",
+                  "--permission-mode", "dontAsk",
+                  "--model", &agent.model]);
+        // Orchestrator + Clerk reason from the full brain; all others use scoped dirs.
+        if agent.role == "orchestrator" || agent_id == "clerk" {
+            cmd.args(["--add-dir", &vault_str]);
+        } else {
+            let active_dir = format!("{vault_str}/active");
+            let agent_dir  = format!("{vault_str}/agents/{agent_id}");
+            cmd.args(["--add-dir", &active_dir, "--add-dir", &agent_dir]);
+        }
+    }
 
-    // Networked agents:
-    //   --allowedTools  documents intent (pre-approves listed tools)
-    //   --disallowedTools enforces the gate (removes tools from the model's set)
-    //   --settings loads the vault allowlist file if Connor has installed it
+    // Networked agents: tool allowlist/denylist applies on every turn (resume or cold).
     if is_networked {
         let allowed = networked_allowed_tools(&agent.connectors);
-        if !allowed.is_empty() {
-            cmd.args(["--allowedTools", &allowed]);
-        }
+        if !allowed.is_empty() { cmd.args(["--allowedTools", &allowed]); }
         let denied = networked_disallowed_tools(&agent.connectors);
-        if !denied.is_empty() {
-            cmd.args(["--disallowedTools", &denied]);
-        }
+        if !denied.is_empty() { cmd.args(["--disallowedTools", &denied]); }
         let settings_path = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".claude")
-            .join("settings.networked.json");
-        if settings_path.exists() {
-            cmd.arg("--settings").arg(&settings_path);
-        }
+            .join(".claude").join("settings.networked.json");
+        if settings_path.exists() { cmd.arg("--settings").arg(&settings_path); }
     }
 
     let mut child = cmd
@@ -419,6 +481,9 @@ pub fn run_agent(
         kind:          "start".into(),
         text:          String::new(),
         parent_run_id: prid.clone(),
+        input_tokens:  0,
+        output_tokens: 0,
+        usage_pct:     0.0,
     }).ok();
 
     // ── stdout reader thread ──────────────────────────────────────────────────
@@ -429,15 +494,27 @@ pub fn run_agent(
         let task_clone   = task.clone();
         let vault_clone  = vault.clone();
         let children_arc = agent_run.children.clone();
+        let is_resuming_clone     = is_resuming;
+        let resume_session_clone  = resume_session;
 
         std::thread::spawn(move || {
             let reader      = BufReader::new(stdout);
             let mut last_text   = String::new();
             let mut result_text = String::new();
+            let mut captured_sid: Option<String> = None;
+            let mut input_tokens:  u32 = 0;
+            let mut output_tokens: u32 = 0;
 
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() { continue; }
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+
+                // Capture session_id from any stream line (appears in init line)
+                if captured_sid.is_none() {
+                    if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+                        captured_sid = Some(sid.to_string());
+                    }
+                }
 
                 let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -461,6 +538,9 @@ pub fn run_agent(
                             kind:          "text".into(),
                             text:          chunk_text,
                             parent_run_id: prid.clone(),
+                            input_tokens:  0,
+                            output_tokens: 0,
+                            usage_pct:     0.0,
                         }).ok();
                     }
                 } else if typ == "result" {
@@ -468,6 +548,12 @@ pub fn run_agent(
                     result_text = v.get("result").and_then(|r| r.as_str())
                         .unwrap_or(&last_text)
                         .to_string();
+
+                    input_tokens  = v.pointer("/usage/input_tokens")
+                        .and_then(|t| t.as_u64()).unwrap_or(0) as u32;
+                    output_tokens = v.pointer("/usage/output_tokens")
+                        .and_then(|t| t.as_u64()).unwrap_or(0) as u32;
+                    let usage_pct = (input_tokens as f32 / MODEL_CONTEXT_WINDOW as f32 * 100.0).min(100.0);
 
                     append_agent_log(&vault_clone, &aid, &rid, &task_clone, &result_text, is_error);
 
@@ -477,7 +563,22 @@ pub fn run_agent(
                         kind:          if is_error { "error".into() } else { "done".into() },
                         text:          result_text.clone(),
                         parent_run_id: prid.clone(),
+                        input_tokens,
+                        output_tokens,
+                        usage_pct,
                     }).ok();
+
+                    // Persist or clear session based on usage.
+                    if is_resuming_clone || resume_session_clone {
+                        if let Some(ref sid) = captured_sid {
+                            if usage_pct < COMPACT_THRESHOLD_PCT {
+                                save_agent_session_id(&aid, sid);
+                            } else {
+                                // Context over threshold — clear so next turn starts fresh.
+                                clear_agent_session_id(&aid);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -497,6 +598,9 @@ pub fn run_agent(
                     kind:          "done".into(),
                     text:          msg,
                     parent_run_id: prid,
+                    input_tokens:  0,
+                    output_tokens: 0,
+                    usage_pct:     0.0,
                 }).ok();
             }
         });

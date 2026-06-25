@@ -25,6 +25,9 @@ interface AgentStreamPayload {
   kind: string;   // "start" | "text" | "done" | "error"
   text: string;
   parentRunId: string | null;
+  inputTokens?: number;
+  outputTokens?: number;
+  usagePct?: number;
 }
 
 interface PlanState {
@@ -62,6 +65,9 @@ interface StreamEntry {
   time: string;
   parentId?: string;   // local id of the orchestrator entry that spawned this
   userMsg?: string;    // the message Connor sent that triggered this run
+  inputTokens?: number;
+  outputTokens?: number;
+  usagePct?: number;
 }
 
 // A parsed delegation task from Jack's ```delegate block
@@ -392,6 +398,27 @@ function StreamBubble({
         />
       )}
 
+      {/* Context meter — shown when done and usage data is available */}
+      {isDone && (entry.usagePct ?? 0) > 0 && (
+        <div className="mt-2 flex items-center gap-2">
+          <div className="flex-1 h-0.5 rounded-full bg-zinc-800 overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all ${
+                (entry.usagePct ?? 0) > 60
+                  ? "bg-red-500/70"
+                  : (entry.usagePct ?? 0) > 40
+                  ? "bg-amber-500/70"
+                  : "bg-emerald-500/60"
+              }`}
+              style={{ width: `${Math.min(entry.usagePct ?? 0, 100)}%` }}
+            />
+          </div>
+          <span className="text-[10px] text-zinc-700 shrink-0 tabular-nums">
+            {Math.round(entry.usagePct ?? 0)}% ctx
+          </span>
+        </div>
+      )}
+
       {/* Builder done card */}
       {isBuilder && isDone && !isError && (
         <BuilderDoneCard onDismiss={onDismissBuilder} />
@@ -588,6 +615,16 @@ function AgentCard({
       {isRunning && (
         <div className="mt-1.5 text-[10px] text-blue-400/70">running…</div>
       )}
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          invoke("reset_agent_session", { agentId: agent.id });
+        }}
+        className="mt-1.5 text-[9px] text-zinc-700 hover:text-zinc-500 transition-colors w-full text-left"
+        title="Start a new conversation with this agent"
+      >
+        ↺ new conversation
+      </button>
     </button>
   );
 }
@@ -775,7 +812,7 @@ export function Chat() {
     let unlisten: (() => void) | null = null;
 
     listen<AgentStreamPayload>("agent-stream", (event) => {
-      const { runId, agentId, kind, text } = event.payload;
+      const { runId, agentId, kind, text, inputTokens = 0, outputTokens = 0, usagePct = 0 } = event.payload;
       if (kind === "start") return;
 
       setStreamEntries((prev) =>
@@ -788,7 +825,7 @@ export function Chat() {
               (e.status === "thinking" || e.status === "streaming"));
           if (!hit) return e;
           if (kind === "text")  return { ...e, text, status: "streaming" };
-          if (kind === "done")  return { ...e, text: text || e.text, status: "done" };
+          if (kind === "done")  return { ...e, text: text || e.text, status: "done", inputTokens, outputTokens, usagePct };
           if (kind === "error") return { ...e, text: text || e.text, status: "error" };
           return e;
         })
@@ -828,7 +865,7 @@ export function Chat() {
     ]);
     setRunningAgents((prev) => new Set([...prev, "clerk"]));
     try {
-      const runId = await invoke<string>("run_agent", { agentId: "clerk", task, parentRunId: null });
+      const runId = await invoke<string>("run_agent", { agentId: "clerk", task, parentRunId: null, resumeSession: true });
       setStreamEntries((prev) => prev.map((e) => (e.id === entryId ? { ...e, runId } : e)));
       // Refresh plan state after Clerk finishes (handled via done event)
     } catch (err) {
@@ -930,7 +967,7 @@ export function Chat() {
 
     try {
       const runId = await invoke<string>("run_agent", {
-        agentId, task, parentRunId: null,
+        agentId, task, parentRunId: null, resumeSession: true,
       });
       setStreamEntries((prev) =>
         prev.map((e) => (e.id === entryId ? { ...e, runId } : e))
@@ -978,6 +1015,7 @@ export function Chat() {
         agentId: child.agentId,
         task,
         parentRunId: null,
+        resumeSession: false,
       })
         .then((runId) => {
           setStreamEntries((prev) =>
@@ -1022,6 +1060,7 @@ export function Chat() {
         agentId: entry.agentId,
         task:    "APPROVED — please proceed with the action you described.",
         parentRunId: null,
+        resumeSession: true,
       });
       setStreamEntries((prev) =>
         prev.map((e) => (e.id === entryId ? { ...e, runId } : e))

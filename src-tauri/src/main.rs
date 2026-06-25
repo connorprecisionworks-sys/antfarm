@@ -2477,6 +2477,7 @@ fn main() {
             agents::list_agents,
             agents::get_agent,
             agents::run_agent,
+            agents::reset_agent_session,
             agents::scaffold_networked_settings,
             daily::get_plan_state,
             daily::get_daily_context,
