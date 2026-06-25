@@ -116,9 +116,23 @@ fn new_agent_run_id(agent_id: &str) -> String {
     format!("agent-{agent_id}-{ts}")
 }
 
-/// Comma-separated allowedTools string for a networked agent, keyed by connector list.
+// ── Networked permission helpers ──────────────────────────────────────────────
+//
+// Empirically verified (2026-06-25):
+//   • --permission-mode dontAsk (and default) auto-approve ALL tool calls in
+//     headless -p mode; --allowedTools is pre-approval only, NOT exclusive.
+//   • --disallowedTools IS authoritative: listed tools are removed from the
+//     model's toolset entirely and cannot be called.
+//
+// Therefore networked agents use BOTH flags:
+//   --allowedTools  → documents the intended set (harmless; may matter in
+//                     future modes or interactive fallback)
+//   --disallowedTools → the actual enforcement gate
+
+/// Comma-separated --allowedTools list for a networked agent.
+/// Bash is intentionally absent — no shell for networked agents.
 fn networked_allowed_tools(connectors: &[String]) -> String {
-    let mut tools = vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+    let mut tools = vec!["Read", "Write", "Edit", "Glob", "Grep"];
     for c in connectors {
         match c.as_str() {
             "web" => {
@@ -134,20 +148,58 @@ fn networked_allowed_tools(connectors: &[String]) -> String {
                     "mcp__claude_ai_Gmail__list_labels",
                     "mcp__claude_ai_Gmail__label_thread",
                     "mcp__claude_ai_Gmail__label_message",
+                    "mcp__claude_ai_Gmail__unlabel_message",
+                    "mcp__claude_ai_Gmail__unlabel_thread",
                 ]);
             }
             "calendar" => {
-                tools.extend([
-                    "mcp__claude_ai_Google_Calendar__list_events",
-                    "mcp__claude_ai_Google_Calendar__create_event",
-                    "mcp__claude_ai_Google_Calendar__update_event",
-                    "mcp__claude_ai_Google_Calendar__delete_event",
-                ]);
+                // Reads only; writes are always denied below
+                tools.push("mcp__claude_ai_Google_Calendar__list_events");
             }
             _ => {}
         }
     }
     tools.join(",")
+}
+
+/// Comma-separated --disallowedTools list — the enforcing gate for networked agents.
+/// Bash always denied. Tools outside the connector set explicitly denied.
+/// Calendar mutations always denied (need a separate Needs-You approval path).
+fn networked_disallowed_tools(connectors: &[String]) -> String {
+    let has_web = connectors.iter().any(|c| c == "web");
+    let has_gmail = connectors.iter().any(|c| c == "gmail");
+
+    let mut deny: Vec<&str> = vec!["Bash"]; // no shell for networked agents
+
+    if !has_web {
+        deny.extend(["WebSearch", "WebFetch"]);
+    }
+
+    if !has_gmail {
+        deny.extend([
+            "mcp__claude_ai_Gmail__search_threads",
+            "mcp__claude_ai_Gmail__get_thread",
+            "mcp__claude_ai_Gmail__create_draft",
+            "mcp__claude_ai_Gmail__list_drafts",
+            "mcp__claude_ai_Gmail__list_labels",
+            "mcp__claude_ai_Gmail__label_thread",
+            "mcp__claude_ai_Gmail__label_message",
+            "mcp__claude_ai_Gmail__create_label",
+            "mcp__claude_ai_Gmail__delete_label",
+            "mcp__claude_ai_Gmail__unlabel_message",
+            "mcp__claude_ai_Gmail__unlabel_thread",
+            "mcp__claude_ai_Gmail__update_label",
+        ]);
+    }
+
+    // Calendar writes always denied — mutations go through Needs-You
+    deny.extend([
+        "mcp__claude_ai_Google_Calendar__create_event",
+        "mcp__claude_ai_Google_Calendar__update_event",
+        "mcp__claude_ai_Google_Calendar__delete_event",
+    ]);
+
+    deny.join(",")
 }
 
 /// Connector-specific guidance injected into the system prompt for networked agents.
@@ -325,11 +377,18 @@ pub fn run_agent(
         "--add-dir", &add_dir,
     ]);
 
-    // Networked agents get explicit tool allowlist + optional settings file.
+    // Networked agents:
+    //   --allowedTools  documents intent (pre-approves listed tools)
+    //   --disallowedTools enforces the gate (removes tools from the model's set)
+    //   --settings loads the vault allowlist file if Connor has installed it
     if is_networked {
         let allowed = networked_allowed_tools(&agent.connectors);
         if !allowed.is_empty() {
             cmd.args(["--allowedTools", &allowed]);
+        }
+        let denied = networked_disallowed_tools(&agent.connectors);
+        if !denied.is_empty() {
+            cmd.args(["--disallowedTools", &denied]);
         }
         let settings_path = PathBuf::from(std::env::var("HOME").unwrap_or_default())
             .join(".claude")
@@ -459,7 +518,7 @@ pub fn scaffold_networked_settings() -> Result<String, String> {
     let settings = serde_json::json!({
         "permissions": {
             "allow": [
-                "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+                "Read", "Write", "Edit", "Glob", "Grep",
                 "WebSearch", "WebFetch",
                 "mcp__claude_ai_Gmail__search_threads",
                 "mcp__claude_ai_Gmail__get_thread",
@@ -467,9 +526,16 @@ pub fn scaffold_networked_settings() -> Result<String, String> {
                 "mcp__claude_ai_Gmail__list_drafts",
                 "mcp__claude_ai_Gmail__list_labels",
                 "mcp__claude_ai_Gmail__label_thread",
-                "mcp__claude_ai_Gmail__label_message"
+                "mcp__claude_ai_Gmail__label_message",
+                "mcp__claude_ai_Gmail__unlabel_message",
+                "mcp__claude_ai_Gmail__unlabel_thread"
             ],
-            "deny": []
+            "deny": [
+                "Bash",
+                "mcp__claude_ai_Google_Calendar__create_event",
+                "mcp__claude_ai_Google_Calendar__update_event",
+                "mcp__claude_ai_Google_Calendar__delete_event"
+            ]
         }
     });
 
