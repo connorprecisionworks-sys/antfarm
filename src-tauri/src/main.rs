@@ -2480,6 +2480,7 @@ fn main() {
             agents::get_agent,
             agents::run_agent,
             agents::stop_agent,
+            agents::open_path,
             agents::reset_agent_session,
             agents::drain_scheduled_runs,
             agents::scaffold_networked_settings,

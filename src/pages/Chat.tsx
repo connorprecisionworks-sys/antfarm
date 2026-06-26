@@ -6,7 +6,6 @@ import {
   AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
   Clock, FileText, GitMerge, Loader, Mic, Moon, Play, Send, Square, X, Zap,
 } from "lucide-react";
-import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -80,50 +79,6 @@ interface DelegationTask {
   task: string;
 }
 
-// ── Placeholder messages ───────────────────────────────────────────────────────
-
-const PLACEHOLDER_MESSAGES: Msg[] = [
-  {
-    id: "m1",
-    from: "Captain Jack",
-    fromRole: "orchestrator",
-    tier: "needs-you",
-    content:
-      "Ready to kick off today's research sprint. Scout will pull Anthropic pricing updates; Clerk will reconcile the plan. Want me to fan out in parallel?",
-    action: "Fan out now",
-    time: "9:14 AM",
-    collapsed: false,
-  },
-  {
-    id: "m2",
-    from: "Scout",
-    fromRole: "subagent",
-    tier: "fyi",
-    content: "Research complete — findings saved to memory/research/anthropic-pricing-2026-06.md",
-    time: "8:47 AM",
-    collapsed: false,
-  },
-  {
-    id: "m3",
-    from: "Builder → Scribe",
-    fromRole: "chatter",
-    tier: "chatter",
-    content: "README diff ready. Handing off for copy pass.",
-    time: "8:32 AM",
-    collapsed: true,
-  },
-  {
-    id: "m4",
-    from: "Scribe",
-    fromRole: "subagent",
-    tier: "needs-you",
-    content:
-      "Gmail draft ready: reply to Lena re investor update. Approve to send, or open for edits.",
-    action: "Approve & send",
-    time: "8:15 AM",
-    collapsed: false,
-  },
-];
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
@@ -426,7 +381,7 @@ function StreamBubble({
             return (
               <button
                 key={path}
-                onClick={() => shellOpen(path)}
+                onClick={() => invoke("open_path", { path }).catch((err) => console.error("open_path failed", err))}
                 className="flex items-center gap-1 text-[10px] text-zinc-500 bg-zinc-800/60 hover:bg-zinc-700/60 border border-zinc-700/40 hover:border-zinc-600/50 px-2 py-0.5 rounded-full transition-colors"
                 title={path}
               >
@@ -830,7 +785,7 @@ function renderDraftHighlighted(text: string, agents: Agent[]) {
 export function Chat() {
   const [agents, setAgents]             = useState<Agent[]>([]);
   const [planState, setPlanState]       = useState<PlanState | null>(null);
-  const [messages, setMessages]         = useState<Msg[]>(PLACEHOLDER_MESSAGES);
+  const [messages, setMessages]         = useState<Msg[]>([]);
   const [streamEntries, setStreamEntries] = useState<StreamEntry[]>([]);
   const [runningAgents, setRunningAgents] = useState<Set<string>>(new Set());
   /** Set of parent entry IDs whose delegation has been fanned out. */
@@ -844,10 +799,11 @@ export function Chat() {
   const [recipientId, setRecipientId]   = useState<string | null>(null);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [isListening, setIsListening]   = useState(false);
-  const textareaRef      = useRef<HTMLTextAreaElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef   = useRef<Blob[]>([]);
-  const bottomRef        = useRef<HTMLDivElement>(null);
+  const textareaRef         = useRef<HTMLTextAreaElement>(null);
+  const mediaRecorderRef    = useRef<MediaRecorder | null>(null);
+  const audioChunksRef      = useRef<Blob[]>([]);
+  const bottomRef           = useRef<HTMLDivElement>(null);
+  const didInitRecipient    = useRef(false);
 
   // ── Load agents + plan state ─────────────────────────────────────────────────
   useEffect(() => {
@@ -877,11 +833,12 @@ export function Chat() {
   }, []);
 
   useEffect(() => {
-    if (agents.length > 0 && recipientId === null) {
+    if (agents.length > 0 && !didInitRecipient.current) {
+      didInitRecipient.current = true;
       const orch = agents.find((a) => a.role === "orchestrator");
       setRecipientId(orch?.id ?? agents[0]?.id ?? null);
     }
-  }, [agents, recipientId]);
+  }, [agents]);
 
   // ── agent-stream event listener ──────────────────────────────────────────────
   useEffect(() => {
@@ -1168,8 +1125,7 @@ export function Chat() {
   }
 
   // ── Derived values ────────────────────────────────────────────────────────────
-  const defaultAgent = agents.find((a) => a.role === "orchestrator") ?? agents[0] ?? null;
-  const recipient    = agents.find((a) => a.id === recipientId) ?? defaultAgent;
+  const recipient = agents.find((a) => a.id === recipientId) ?? null;
 
   const needsYouCount  = messages.filter((m) => m.tier === "needs-you").length;
   const visibleMsgs    = filter === "needs-you"

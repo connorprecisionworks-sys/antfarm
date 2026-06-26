@@ -864,6 +864,17 @@ pub fn stop_agent(agent_run: State<'_, AgentRunState>, run_id: String) -> Result
     Ok(())
 }
 
+// ── open_path ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn open_path(path: String) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ── Networked settings scaffold ───────────────────────────────────────────────
 
 /// Write ~/.claude/settings.networked.json and mirror to the vault.
