@@ -325,10 +325,92 @@ pub fn start_agent_scheduler(app: AppHandle) {
 //   • --disallowedTools IS authoritative: listed tools are removed from the
 //     model's toolset entirely and cannot be called.
 //
-// Therefore networked agents use BOTH flags:
-//   --allowedTools  → documents the intended set (harmless; may matter in
-//                     future modes or interactive fallback)
-//   --disallowedTools → the actual enforcement gate
+// Therefore every agent gets a single --disallowedTools call that covers:
+//   • Role-specific tools (Write/Edit/Bash for builder; Bash for networked)
+//   • GWS MCP universe minus this agent's granted GWS tools
+// Applied on EVERY turn (cold start and resume) so no path slips through.
+
+// ── GWS MCP constants ─────────────────────────────────────────────────────────
+
+const GWS_PREFIXES: &[&str] = &[
+    "mcp__google_workspace_dore__",
+    "mcp__google_workspace_pw__",
+];
+
+const GWS_GMAIL_SUFFIXES: &[&str] = &[
+    "search_gmail_messages",
+    "get_gmail_message_content",
+    "get_gmail_messages_content_batch",
+    "get_gmail_thread_content",
+    "get_gmail_threads_content_batch",
+    "draft_gmail_message",
+    "send_gmail_message",
+    "list_gmail_labels",
+    "manage_gmail_label",
+    "modify_gmail_message_labels",
+    "batch_modify_gmail_message_labels",
+    "list_gmail_filters",
+    "manage_gmail_filter",
+    "get_gmail_attachment_content",
+    "start_google_auth",
+];
+
+const GWS_CAL_SUFFIXES: &[&str] = &[
+    "list_calendars",
+    "get_events",
+    "manage_event",
+    "create_calendar",
+    "manage_focus_time",
+    "manage_out_of_office",
+    "query_freebusy",
+];
+
+// Granted gmail suffixes (subset of GWS_GMAIL_SUFFIXES, excluding send, manage_*, list_filters, start_auth)
+const GMAIL_GRANTED_SUFFIXES: &[&str] = &[
+    "search_gmail_messages",
+    "get_gmail_message_content",
+    "get_gmail_messages_content_batch",
+    "get_gmail_thread_content",
+    "get_gmail_threads_content_batch",
+    "list_gmail_labels",
+    "get_gmail_attachment_content",
+    "draft_gmail_message",
+    "modify_gmail_message_labels",
+    "batch_modify_gmail_message_labels",
+    "send_gmail_message",
+];
+
+// Granted calendar suffixes (reads + manage_event; create/focus/ooo/freebusy excluded or separate)
+const CAL_GRANTED_SUFFIXES: &[&str] = &[
+    "list_calendars",
+    "get_events",
+    "query_freebusy",
+    "manage_event",
+];
+
+/// Full 44-tool GWS universe (2 prefixes × 22 suffixes).
+fn gws_universe() -> Vec<String> {
+    let mut tools = Vec::with_capacity(GWS_PREFIXES.len() * (GWS_GMAIL_SUFFIXES.len() + GWS_CAL_SUFFIXES.len()));
+    for pfx in GWS_PREFIXES {
+        for sfx in GWS_GMAIL_SUFFIXES { tools.push(format!("{pfx}{sfx}")); }
+        for sfx in GWS_CAL_SUFFIXES  { tools.push(format!("{pfx}{sfx}")); }
+    }
+    tools
+}
+
+/// GWS tools granted to this agent based on connectors.
+fn gws_granted(connectors: &[String]) -> Vec<String> {
+    let mut granted = Vec::new();
+    for pfx in GWS_PREFIXES {
+        if connectors.iter().any(|c| c == "gmail") {
+            for sfx in GMAIL_GRANTED_SUFFIXES { granted.push(format!("{pfx}{sfx}")); }
+        }
+        if connectors.iter().any(|c| c == "calendar") {
+            for sfx in CAL_GRANTED_SUFFIXES { granted.push(format!("{pfx}{sfx}")); }
+        }
+    }
+    granted
+}
 
 /// Comma-separated --allowedTools list for a networked agent.
 /// Bash is intentionally absent — no shell for networked agents.
@@ -340,65 +422,47 @@ fn networked_allowed_tools(connectors: &[String]) -> String {
                 tools.push("WebSearch");
                 tools.push("WebFetch");
             }
-            "gmail" => {
-                tools.extend([
-                    "mcp__claude_ai_Gmail__search_threads",
-                    "mcp__claude_ai_Gmail__get_thread",
-                    "mcp__claude_ai_Gmail__create_draft",
-                    "mcp__claude_ai_Gmail__list_drafts",
-                    "mcp__claude_ai_Gmail__list_labels",
-                    "mcp__claude_ai_Gmail__label_thread",
-                    "mcp__claude_ai_Gmail__label_message",
-                    "mcp__claude_ai_Gmail__unlabel_message",
-                    "mcp__claude_ai_Gmail__unlabel_thread",
-                ]);
-            }
-            "calendar" => {
-                // Reads only; writes are always denied below
-                tools.push("mcp__claude_ai_Google_Calendar__list_events");
-            }
             _ => {}
         }
     }
-    tools.join(",")
+    let granted = gws_granted(connectors);
+    let mut result = tools.join(",");
+    if !granted.is_empty() {
+        result.push(',');
+        result.push_str(&granted.join(","));
+    }
+    result
 }
 
-/// Comma-separated --disallowedTools list — the enforcing gate for networked agents.
-/// Bash always denied. Tools outside the connector set explicitly denied.
-/// Calendar mutations always denied (need a separate Needs-You approval path).
-fn networked_disallowed_tools(connectors: &[String]) -> String {
-    let has_web = connectors.iter().any(|c| c == "web");
-    let has_gmail = connectors.iter().any(|c| c == "gmail");
+/// Single unified --disallowedTools string for any agent.
+/// Applied on every turn (cold + resume) — exactly one call per run.
+///
+/// Composition:
+///   • builder (offline-code):  Write,Edit,MultiEdit,NotebookEdit,Bash + all 44 GWS tools
+///   • networked agents:        Bash + (44 GWS universe minus this agent's granted GWS tools)
+///   • start_google_auth always denied for everyone
+fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String]) -> String {
+    let mut deny: Vec<String> = Vec::new();
 
-    let mut deny: Vec<&str> = vec!["Bash"]; // no shell for networked agents
-
-    if !has_web {
-        deny.extend(["WebSearch", "WebFetch"]);
+    if profile == "networked" {
+        deny.push("Bash".to_string());
+        if !connectors.iter().any(|c| c == "web") {
+            deny.push("WebSearch".to_string());
+            deny.push("WebFetch".to_string());
+        }
     }
 
-    if !has_gmail {
-        deny.extend([
-            "mcp__claude_ai_Gmail__search_threads",
-            "mcp__claude_ai_Gmail__get_thread",
-            "mcp__claude_ai_Gmail__create_draft",
-            "mcp__claude_ai_Gmail__list_drafts",
-            "mcp__claude_ai_Gmail__list_labels",
-            "mcp__claude_ai_Gmail__label_thread",
-            "mcp__claude_ai_Gmail__label_message",
-            "mcp__claude_ai_Gmail__create_label",
-            "mcp__claude_ai_Gmail__delete_label",
-            "mcp__claude_ai_Gmail__unlabel_message",
-            "mcp__claude_ai_Gmail__unlabel_thread",
-            "mcp__claude_ai_Gmail__update_label",
-        ]);
+    if agent_id == "builder" {
+        deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
     }
 
-    // Calendar writes always denied — mutations go through Needs-You
-    deny.extend([
-        "mcp__claude_ai_Google_Calendar__create_event",
-        "mcp__claude_ai_Google_Calendar__update_event",
-        "mcp__claude_ai_Google_Calendar__delete_event",
-    ]);
+    // GWS deny: universe minus granted for this agent
+    let granted = gws_granted(connectors);
+    for tool in gws_universe() {
+        if !granted.contains(&tool) {
+            deny.push(tool);
+        }
+    }
 
     deny.join(",")
 }
@@ -416,17 +480,27 @@ fn connector_prompt_section(connectors: &[String]) -> String {
                  Search multiple queries as needed; cite sources in output.".into(),
             ),
             "gmail" => parts.push(
-                "**gmail** — Gmail tools available: search_threads, get_thread, create_draft, \
-                 list_drafts, list_labels, label_thread, label_message. \
-                 Auto-allowed: search, read, triage, label, archive, create drafts. \
-                 GATE (stop and ask): anything that leaves the building (sending). \
+                "**gmail** — Gmail tools via mcp__google_workspace_dore__* (default, connordore36@gmail.com) \
+                 and mcp__google_workspace_pw__* (precisionworks account only). \
+                 Use the dore__ prefix by default; switch to pw__ only when the task is explicitly \
+                 about the precisionworks account. Do not pass a user_google_email parameter — \
+                 the prefix selects the account.\n\
+                 Auto-allowed: search, read, triage, draft, archive (archive = modify_gmail_message_labels removing INBOX label), \
+                 read attachments, label/modify messages.\n\
+                 GATE (NEEDS YOU — stop and surface for approval before proceeding): send_gmail_message. \
                  To surface a draft for approval: write content to \
                  `active/drafts/email-<unix-epoch>.md` (sections: Subject, To, Body), \
                  then end with: NEEDS YOU: <one sentence — what you will do once approved>.".into(),
             ),
             "calendar" => parts.push(
-                "**calendar** — Google Calendar tools for reading and creating events. \
-                 Note: calendar may need re-authentication if not yet authorized.".into(),
+                "**calendar** — Calendar tools via mcp__google_workspace_dore__* (default, connordore36@gmail.com) \
+                 and mcp__google_workspace_pw__* (precisionworks account only). \
+                 Use the dore__ prefix by default; switch to pw__ only when the task is explicitly \
+                 about the precisionworks account. Do not pass a user_google_email parameter.\n\
+                 Read operations (always allowed): list_calendars, get_events, query_freebusy.\n\
+                 Create/update operations (allowed): manage_event with action=create or action=update.\n\
+                 GATE (NEEDS YOU — stop and surface for approval before proceeding): manage_event with \
+                 action=delete or any destructive calendar change.".into(),
             ),
             _ => {}
         }
@@ -453,8 +527,8 @@ fn crew_roster() -> String {
         let capability = if !agent.connectors.is_empty() {
             let parts: Vec<String> = agent.connectors.iter().map(|c| match c.as_str() {
                 "web"      => "web research (WebSearch + WebFetch)".to_string(),
-                "gmail"    => "email / Gmail (read, triage, draft; sending gated)".to_string(),
-                "calendar" => "calendar (read)".to_string(),
+                "gmail"    => "email both accounts (read, triage, draft, archive; sending gated)".to_string(),
+                "calendar" => "calendar both accounts (read + create/update; delete gated)".to_string(),
                 other      => other.to_string(),
             }).collect();
             parts.join(" + ")
@@ -667,10 +741,6 @@ pub fn run_agent(
             let agent_dir  = format!("{vault_str}/agents/{agent_id}");
             cmd.args(["--add-dir", &active_dir, "--add-dir", &agent_dir]);
         }
-        // Builder in the chat lane is read-only: no writes, no shell.
-        if agent_id == "builder" {
-            cmd.args(["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash"]);
-        }
         // Optional repo directory (chat lane only; warm resume carries scope via session).
         if let Some(ref rp) = repo_path {
             if std::path::Path::new(rp).is_dir() {
@@ -679,12 +749,15 @@ pub fn run_agent(
         }
     }
 
-    // Networked agents: tool allowlist/denylist applies on every turn (resume or cold).
+    // Unified deny list — applied on every turn (cold + resume) for all agents.
+    // Exactly one --disallowedTools call. Builder and networked both covered here.
+    let deny = build_deny_list(&agent_id, &agent.profile, &agent.connectors);
+    if !deny.is_empty() { cmd.args(["--disallowedTools", &deny]); }
+
+    // Networked agents: allowed list + settings file (applied every turn).
     if is_networked {
         let allowed = networked_allowed_tools(&agent.connectors);
         if !allowed.is_empty() { cmd.args(["--allowedTools", &allowed]); }
-        let denied = networked_disallowed_tools(&agent.connectors);
-        if !denied.is_empty() { cmd.args(["--disallowedTools", &denied]); }
         let settings_path = PathBuf::from(std::env::var("HOME").unwrap_or_default())
             .join(".claude").join("settings.networked.json");
         if settings_path.exists() { cmd.arg("--settings").arg(&settings_path); }
@@ -796,8 +869,8 @@ pub fn run_agent(
                                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
                                 let label = match name {
                                     "WebSearch" | "WebFetch" => "searching the web",
-                                    n if n.contains("Gmail")    => "reading inbox",
-                                    n if n.contains("Calendar") => "checking calendar",
+                                    n if n.contains("gmail")    => "reading inbox",
+                                    n if n.contains("calendar") || n.contains("event") => "checking calendar",
                                     "Read" | "Glob" | "Grep"    => "reading files",
                                     "Write" | "Edit"            => "writing files",
                                     "Bash"                      => "running a command",
@@ -997,27 +1070,40 @@ pub fn scaffold_networked_settings() -> Result<String, String> {
     let claude_dir = home.join(".claude");
     fs::create_dir_all(&claude_dir).map_err(|e| e.to_string())?;
 
+    // Build allow list: base tools + union of all possible GWS grants across connectors.
+    // Per-agent restriction is enforced via --disallowedTools at runtime; this file
+    // acts as a defense-in-depth layer for tools that no networked agent should ever call.
+    let mut allow_list: Vec<serde_json::Value> = vec![
+        "Read".into(), "Write".into(), "Edit".into(), "Glob".into(), "Grep".into(),
+        "WebSearch".into(), "WebFetch".into(),
+    ];
+    // Add the full granted sets (union across connectors) as allowed
+    for pfx in GWS_PREFIXES {
+        for sfx in GMAIL_GRANTED_SUFFIXES { allow_list.push(format!("{pfx}{sfx}").into()); }
+        for sfx in CAL_GRANTED_SUFFIXES   { allow_list.push(format!("{pfx}{sfx}").into()); }
+    }
+
+    // Globally denied for all networked agents regardless of connector.
+    // Includes Bash + the permanently-off GWS tool suffixes across both prefixes.
+    let always_deny_suffixes = [
+        "start_google_auth",
+        "manage_gmail_filter",
+        "manage_gmail_label",
+        "create_calendar",
+        "manage_focus_time",
+        "manage_out_of_office",
+    ];
+    let mut deny_list: Vec<serde_json::Value> = vec!["Bash".into()];
+    for pfx in GWS_PREFIXES {
+        for sfx in always_deny_suffixes {
+            deny_list.push(format!("{pfx}{sfx}").into());
+        }
+    }
+
     let settings = serde_json::json!({
         "permissions": {
-            "allow": [
-                "Read", "Write", "Edit", "Glob", "Grep",
-                "WebSearch", "WebFetch",
-                "mcp__claude_ai_Gmail__search_threads",
-                "mcp__claude_ai_Gmail__get_thread",
-                "mcp__claude_ai_Gmail__create_draft",
-                "mcp__claude_ai_Gmail__list_drafts",
-                "mcp__claude_ai_Gmail__list_labels",
-                "mcp__claude_ai_Gmail__label_thread",
-                "mcp__claude_ai_Gmail__label_message",
-                "mcp__claude_ai_Gmail__unlabel_message",
-                "mcp__claude_ai_Gmail__unlabel_thread"
-            ],
-            "deny": [
-                "Bash",
-                "mcp__claude_ai_Google_Calendar__create_event",
-                "mcp__claude_ai_Google_Calendar__update_event",
-                "mcp__claude_ai_Google_Calendar__delete_event"
-            ]
+            "allow": allow_list,
+            "deny":  deny_list,
         }
     });
 
