@@ -143,12 +143,25 @@ fn load_agent_session_id(agent_id: &str) -> Option<String> {
     let path = agent_sessions_dir().join(format!("{agent_id}.txt"));
     // Expire sessions after 24 hours
     let meta = std::fs::metadata(&path).ok()?;
-    let age = meta.modified().ok()?
+    let session_mtime = meta.modified().ok()?;
+    let age = session_mtime
         .elapsed()
         .unwrap_or(std::time::Duration::from_secs(u64::MAX));
     if age > std::time::Duration::from_secs(86_400) {
         let _ = std::fs::remove_file(&path);
         return None;
+    }
+    // Invalidate if prompt.md or agent.json was modified after the session was saved
+    let agent_dir = vault_root().join("agents").join(agent_id);
+    for config_file in &["prompt.md", "agent.json"] {
+        if let Ok(cfg_meta) = std::fs::metadata(agent_dir.join(config_file)) {
+            if let Ok(cfg_mtime) = cfg_meta.modified() {
+                if cfg_mtime > session_mtime {
+                    let _ = std::fs::remove_file(&path);
+                    return None;
+                }
+            }
+        }
     }
     std::fs::read_to_string(&path)
         .ok()
