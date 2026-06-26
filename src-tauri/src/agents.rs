@@ -77,7 +77,7 @@ pub struct Agent {
 pub struct AgentStreamEvent {
     pub run_id: String,
     pub agent_id: String,
-    /// "start" | "text" | "done" | "error"
+    /// "start" | "text" | "activity" | "done" | "error" | "timeout" | "stopped"
     pub kind: String,
     pub text: String,
     /// Non-null for subagent runs spawned by orchestrator fan-out.
@@ -88,6 +88,9 @@ pub struct AgentStreamEvent {
     pub output_tokens: u32,
     #[serde(default)]
     pub usage_pct: f32,
+    /// Absolute paths of files written during this run (populated on "done"/"error").
+    #[serde(default)]
+    pub outputs: Vec<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -628,6 +631,7 @@ pub fn run_agent(
         input_tokens:  0,
         output_tokens: 0,
         usage_pct:     0.0,
+        outputs:       vec![],
     }).ok();
 
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
@@ -679,6 +683,7 @@ pub fn run_agent(
             let mut captured_sid: Option<String> = None;
             let mut input_tokens:  u32 = 0;
             let mut output_tokens: u32 = 0;
+            let mut outputs: Vec<String> = Vec::new();
 
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() { continue; }
@@ -698,9 +703,49 @@ pub fn run_agent(
                     let mut chunks = Vec::new();
                     if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
                         for block in content {
-                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                            if block_type == "text" {
                                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                     chunks.push(text.to_string());
+                                }
+                            } else if block_type == "tool_use" {
+                                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                let label = match name {
+                                    "WebSearch" | "WebFetch" => "searching the web",
+                                    n if n.contains("Gmail")    => "reading inbox",
+                                    n if n.contains("Calendar") => "checking calendar",
+                                    "Read" | "Glob" | "Grep"    => "reading files",
+                                    "Write" | "Edit"            => "writing files",
+                                    "Bash"                      => "running a command",
+                                    other                       => other,
+                                };
+                                app2.emit("agent-stream", AgentStreamEvent {
+                                    run_id:        rid.clone(),
+                                    agent_id:      aid.clone(),
+                                    kind:          "activity".into(),
+                                    text:          label.to_string(),
+                                    parent_run_id: prid.clone(),
+                                    input_tokens:  0,
+                                    output_tokens: 0,
+                                    usage_pct:     0.0,
+                                    outputs:       vec![],
+                                }).ok();
+                                // Collect output file paths from Write/Edit calls.
+                                if name == "Write" || name == "Edit" {
+                                    if let Some(fp) = block.pointer("/input/file_path")
+                                        .and_then(|p| p.as_str())
+                                        .filter(|p| !p.is_empty())
+                                    {
+                                        let abs = if std::path::Path::new(fp).is_absolute() {
+                                            fp.to_string()
+                                        } else {
+                                            vault_clone.join(fp).to_string_lossy().into_owned()
+                                        };
+                                        if outputs.len() < 10 && !outputs.contains(&abs) {
+                                            outputs.push(abs);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -717,6 +762,7 @@ pub fn run_agent(
                             input_tokens:  0,
                             output_tokens: 0,
                             usage_pct:     0.0,
+                            outputs:       vec![],
                         }).ok();
                     }
                 } else if typ == "result" {
@@ -742,6 +788,7 @@ pub fn run_agent(
                         input_tokens,
                         output_tokens,
                         usage_pct,
+                        outputs:       outputs.clone(),
                     }).ok();
 
                     // Persist or clear session based on usage.
@@ -797,6 +844,7 @@ pub fn run_agent(
                     input_tokens:  0,
                     output_tokens: 0,
                     usage_pct:     0.0,
+                    outputs:       vec![],
                 }).ok();
             }
         });
