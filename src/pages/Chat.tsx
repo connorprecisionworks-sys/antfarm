@@ -442,9 +442,22 @@ function StreamBubble({
   );
 }
 
-// ── Chatter group (collapsed subagent runs) ───────────────────────────────────
+// ── Tabbed delegation panel (replaces ChatterGroup) ──────────────────────────
 
-function ChatterGroup({
+function defaultDelegationTab(entries: StreamEntry[]): string | null {
+  if (entries.length === 0) return null;
+  const needsYouEntry = entries.find(
+    (e) => e.status === "done" && !!parseNeedsYou(e.text)
+  );
+  if (needsYouEntry) return needsYouEntry.id;
+  const liveEntry = entries.find(
+    (e) => e.status === "thinking" || e.status === "streaming"
+  );
+  if (liveEntry) return liveEntry.id;
+  return entries[0].id;
+}
+
+function TabbedDelegation({
   children,
   collapsed,
   onToggle,
@@ -466,10 +479,21 @@ function ChatterGroup({
   const liveCount = children.filter(
     (e) => e.status === "thinking" || e.status === "streaming"
   ).length;
-  const names = children.map((e) => e.agentName).join(", ");
+
+  // Track explicit user tab click separately from derived active tab.
+  const [userPickedId, setUserPickedId] = useState<string | null>(null);
+
+  // Derived active tab: honour user pick if still present, else compute default.
+  const activeId = (() => {
+    if (userPickedId && children.some((e) => e.id === userPickedId)) return userPickedId;
+    return defaultDelegationTab(children);
+  })();
+
+  const activeEntry = children.find((e) => e.id === activeId) ?? null;
 
   return (
     <div className="ml-5 border-l-2 border-zinc-800/60 pl-3">
+      {/* Collapse toggle header */}
       <button
         onClick={onToggle}
         className="flex items-center gap-2 text-[11px] text-zinc-600 hover:text-zinc-400 py-1.5 transition-colors"
@@ -479,32 +503,75 @@ function ChatterGroup({
         ) : (
           <ChevronDown size={11} className="shrink-0" />
         )}
-        <span>watching agent chatter</span>
-        <span className="text-zinc-700">· {children.length}</span>
+        <span>Jack delegated</span>
+        <span className="text-zinc-700">· {children.length} agent{children.length !== 1 ? "s" : ""}</span>
         {liveCount > 0 && (
           <span className="text-blue-400/60 ml-1">· {liveCount} running</span>
         )}
-        {collapsed && (
-          <span className="text-zinc-700 truncate max-w-[160px]">{names}</span>
-        )}
       </button>
 
-      {!collapsed && (
-        <div className="space-y-2 mt-1 mb-3">
-          {children.map((entry) => (
+      {!collapsed && children.length > 0 && (
+        <div className="mb-3">
+          {/* Tab bar */}
+          <div className="flex gap-1 flex-wrap mt-1 mb-2">
+            {children.map((entry) => {
+              const isLive = entry.status === "thinking" || entry.status === "streaming";
+              const hasNeedsYou = entry.status === "done" && !!parseNeedsYou(entry.text);
+              const isActive = entry.id === activeId;
+              return (
+                <button
+                  key={entry.id}
+                  onClick={() => setUserPickedId(entry.id)}
+                  className={`flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md transition-colors ${
+                    isActive
+                      ? "bg-zinc-800 text-zinc-100"
+                      : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/40"
+                  }`}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                      isLive
+                        ? "bg-blue-400 animate-pulse"
+                        : hasNeedsYou
+                        ? "bg-amber-400"
+                        : entry.status === "done"
+                        ? "bg-emerald-400"
+                        : entry.status === "error"
+                        ? "bg-red-400"
+                        : entry.status === "timeout"
+                        ? "bg-amber-500"
+                        : "bg-zinc-500"
+                    }`}
+                  />
+                  <span>{entry.agentName}</span>
+                  {isLive && (
+                    <span className="text-[10px] text-blue-400/60">
+                      {entry.activity ?? "thinking"}
+                    </span>
+                  )}
+                  {/* Amber badge for pending approval on inactive tabs */}
+                  {hasNeedsYou && !isActive && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Active tab content */}
+          {activeEntry && (
             <StreamBubble
-              key={entry.id}
-              entry={entry}
+              entry={activeEntry}
               agents={agents}
               runningAgents={runningAgents}
               isChild={true}
               isFanned={false}
               onFanout={() => {}}
-              onApprove={() => onApprove(entry)}
-              onReject={() => onReject(entry)}
-              onDismissBuilder={() => onDismissBuilder(entry.id)}
+              onApprove={() => onApprove(activeEntry)}
+              onReject={() => onReject(activeEntry)}
+              onDismissBuilder={() => onDismissBuilder(activeEntry.id)}
             />
-          ))}
+          )}
         </div>
       )}
     </div>
@@ -1283,7 +1350,7 @@ export function Chat() {
                         }
                       />
                       {kids.length > 0 && (
-                        <ChatterGroup
+                        <TabbedDelegation
                           children={kids}
                           collapsed={!chattersOpen.has(entry.id)}
                           onToggle={() =>
