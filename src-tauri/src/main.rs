@@ -428,6 +428,15 @@ struct Settings {
     sound_code_enabled: bool,
     #[serde(default = "default_true")]
     sound_cowork_enabled: bool,
+    // Feature flags — all default OFF; backward-compat via serde(default)
+    #[serde(default)]
+    feature_morning: bool,
+    #[serde(default)]
+    feature_tonight: bool,
+    #[serde(default)]
+    feature_voice: bool,
+    #[serde(default)]
+    feature_builder_write: bool,
 }
 
 impl Default for Settings {
@@ -438,6 +447,10 @@ impl Default for Settings {
             sound_enabled: true,
             sound_code_enabled: true,
             sound_cowork_enabled: true,
+            feature_morning: false,
+            feature_tonight: false,
+            feature_voice: false,
+            feature_builder_write: false,
         }
     }
 }
@@ -460,6 +473,43 @@ fn save_settings(settings: Settings) -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(), json).map_err(|e| e.to_string())
+}
+
+// ── Builder commit/push ───────────────────────────────────────────────────────
+
+#[tauri::command]
+fn builder_commit_push(repo_path: String, commit_message: String) -> Result<String, String> {
+    let path = std::path::Path::new(&repo_path);
+    if !path.is_dir() {
+        return Err(format!("not a directory: {repo_path}"));
+    }
+    if !path.join(".git").exists() {
+        return Err("not a git repository".into());
+    }
+    let add = std::process::Command::new("git")
+        .args(["-C", &repo_path, "add", "-A"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !add.status.success() {
+        return Err(format!("git add failed: {}", String::from_utf8_lossy(&add.stderr)));
+    }
+    let commit = std::process::Command::new("git")
+        .args(["-C", &repo_path, "commit", "-m", &commit_message])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !commit.status.success() {
+        let err = String::from_utf8_lossy(&commit.stderr);
+        return Err(format!("git commit failed: {err}"));
+    }
+    let push = std::process::Command::new("git")
+        .args(["-C", &repo_path, "push"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !push.status.success() {
+        return Err(format!("git push failed: {}", String::from_utf8_lossy(&push.stderr)));
+    }
+    let first_line = commit_message.lines().next().unwrap_or("").to_string();
+    Ok(format!("Committed and pushed: {first_line}"))
 }
 
 // ── Usage rollup ──────────────────────────────────────────────────────────────
@@ -2413,6 +2463,7 @@ fn main() {
             get_file_content,
             get_settings,
             save_settings,
+            builder_commit_push,
             usage_rollup,
             list_sessions,
             active_session_count,

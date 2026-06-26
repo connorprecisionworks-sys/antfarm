@@ -12,6 +12,10 @@ export function Settings() {
     sound_enabled: true,
     sound_code_enabled: true,
     sound_cowork_enabled: true,
+    feature_morning: false,
+    feature_tonight: false,
+    feature_voice: false,
+    feature_builder_write: false,
   });
   const [capInput, setCapInput] = useState("100000000");
   const [loading, setLoading] = useState(true);
@@ -39,6 +43,10 @@ export function Settings() {
       sound_enabled: settings.sound_enabled,
       sound_code_enabled: settings.sound_code_enabled,
       sound_cowork_enabled: settings.sound_cowork_enabled,
+      feature_morning: settings.feature_morning,
+      feature_tonight: settings.feature_tonight,
+      feature_voice: settings.feature_voice,
+      feature_builder_write: settings.feature_builder_write,
     };
     setSaving(true);
     setError("");
@@ -170,6 +178,53 @@ export function Settings() {
                 <span className="text-sm text-zinc-400">Cowork waiting</span>
               </label>
             </div>
+          </div>
+        </div>
+
+        {/* Feature flags */}
+        <div className="rounded-xl border border-zinc-800 bg-surface-2 p-5 space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-zinc-200 mb-1">
+              Features
+            </label>
+            <p className="text-xs text-zinc-500">
+              Enable or disable surfaces and capabilities. All default OFF. Restart not required.
+            </p>
+          </div>
+          <div className="space-y-3">
+            {([
+              { key: "feature_morning"       as const, label: "Morning briefing", desc: "Shows the Morning page and fires its scheduled run." },
+              { key: "feature_tonight"       as const, label: "Tonight / night report", desc: "Shows the Tonight planning page." },
+              { key: "feature_voice"         as const, label: "Voice (mic / STT)", desc: "Shows mic buttons in Chat and Morning. Does not initialize the mic unless turned on." },
+              { key: "feature_builder_write" as const, label: "Builder write mode", desc: "Grants Builder Write, Edit, and Bash access. Required for coding tasks. STOP-before-push enforced." },
+            ] as const).map(({ key, label, desc }) => (
+              <label key={key} className="flex items-start gap-3 cursor-pointer">
+                <div className="relative mt-0.5">
+                  <input
+                    type="checkbox"
+                    checked={settings[key]}
+                    onChange={(e) => setSettings((s) => ({ ...s, [key]: e.target.checked }))}
+                    className="sr-only"
+                  />
+                  <div
+                    onClick={() => setSettings((s) => ({ ...s, [key]: !s[key] }))}
+                    className={[
+                      "w-8 h-4 rounded-full transition-colors cursor-pointer",
+                      settings[key] ? "bg-indigo-600" : "bg-zinc-700",
+                    ].join(" ")}
+                  >
+                    <div className={[
+                      "absolute top-0.5 w-3 h-3 rounded-full bg-white shadow-sm transition-transform",
+                      settings[key] ? "translate-x-4" : "translate-x-0.5",
+                    ].join(" ")} />
+                  </div>
+                </div>
+                <div>
+                  <p className="text-sm text-zinc-200">{label}</p>
+                  <p className="text-xs text-zinc-500 mt-0.5">{desc}</p>
+                </div>
+              </label>
+            ))}
           </div>
         </div>
 

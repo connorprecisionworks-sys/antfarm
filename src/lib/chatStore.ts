@@ -16,6 +16,8 @@ export interface StreamEntry {
   usagePct?: number;
   activity?: string;
   outputs?: string[];
+  repoPath?: string;
+  builderWrite?: boolean;
 }
 
 export interface Msg {

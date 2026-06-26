@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronRight, Mic, Moon, RefreshCw, Send, X } from "lucide-react";
 import { useVoice } from "../lib/useVoice";
-import { Project, RepoPath } from "../types";
+import { Project, RepoPath, Settings as SettingsType } from "../types";
 
 // ── Animation styles ──────────────────────────────────────────────────────────
 
@@ -809,9 +809,10 @@ function TypingIndicator() {
 interface MorningChatProps {
   briefingJson: string;
   dateKey: string;
+  featureVoice?: boolean;
 }
 
-function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
+function MorningChat({ briefingJson, dateKey, featureVoice = false }: MorningChatProps) {
   const reducedMotion = useMemo(
     () => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches,
     []
@@ -942,7 +943,7 @@ function MorningChat({ briefingJson, dateKey }: MorningChatProps) {
         </div>
 
         <div className="flex gap-2 items-center px-4 py-2.5 border-t border-zinc-800/50">
-          {voiceSupported && (
+          {voiceSupported && featureVoice && (
             <button
               onMouseDown={() => { if (voiceState === "speaking") { stopAll(); setSpeakingId(null); } else startRecording(); }}
               onMouseUp={() => { if (voiceState === "recording") stopRecording(); }}
@@ -1121,6 +1122,7 @@ export function Morning() {
   const [briefingJson, setBriefingJson] = useState<string>("");
   const [whoopState, setWhoopState]     = useState<WhoopState>("idle");
   const [showPlanNudge, setShowPlanNudge] = useState(false);
+  const [featureVoice, setFeatureVoice] = useState(false);
   // Instant-shell state (no LLM)
   const [whoopRaw, setWhoopRaw]         = useState<WhoopRaw | null>(null);
   const [planMd, setPlanMd]             = useState<string | null>(null);
@@ -1141,6 +1143,7 @@ export function Morning() {
 
   useEffect(() => {
     invoke<Project[]>("list_projects").then(setProjects).catch(() => {});
+    invoke<SettingsType>("get_settings").then((s) => setFeatureVoice(s.feature_voice)).catch(() => {});
   }, []);
 
   function toggleDone(id: string) {
@@ -1353,7 +1356,7 @@ export function Morning() {
 
       {/* Docked chat */}
       {briefingJson && (
-        <MorningChat briefingJson={briefingJson} dateKey={dateKey} />
+        <MorningChat briefingJson={briefingJson} dateKey={dateKey} featureVoice={featureVoice} />
       )}
     </div>
   );

@@ -17,6 +17,7 @@ import {
   setChattersOpen,
   setDismissedBuilders,
 } from "../lib/chatStore";
+import { Settings as SettingsType } from "../types";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -242,7 +243,72 @@ function NeedsYouAction({
 
 // ── Builder done card ─────────────────────────────────────────────────────────
 
-function BuilderDoneCard({ agentId, onDismiss }: { agentId: string; onDismiss: () => void }) {
+function BuilderDoneCard({ entry, onDismiss }: { entry: StreamEntry; onDismiss: () => void }) {
+  const [pushing, setPushing]   = useState(false);
+  const [pushed, setPushed]     = useState(false);
+  const [pushError, setPushError] = useState<string | null>(null);
+
+  const commitMatch = entry.builderWrite ? entry.text.match(/---COMMIT:\s*(.+?)---/) : null;
+  const commitMsg   = commitMatch ? commitMatch[1].trim() : null;
+  const isWriteMode = !!(entry.builderWrite && entry.repoPath && commitMsg);
+
+  async function handleApprovePush() {
+    if (!entry.repoPath || !commitMsg) return;
+    setPushing(true);
+    setPushError(null);
+    try {
+      await invoke<string>("builder_commit_push", { repoPath: entry.repoPath, commitMessage: commitMsg });
+      setPushed(true);
+    } catch (e) {
+      setPushError(String(e));
+    } finally {
+      setPushing(false);
+    }
+  }
+
+  if (isWriteMode) {
+    return (
+      <div className="mt-3 border border-emerald-700/40 rounded-lg bg-emerald-950/20 px-3 py-2.5">
+        <div className="flex items-center gap-2 mb-2">
+          <GitMerge size={11} className="text-emerald-400" />
+          <span className="text-xs font-medium text-zinc-300">Build green — ready to push</span>
+        </div>
+        <p className="text-[10px] text-zinc-400 font-mono mb-2.5 bg-zinc-900/60 rounded px-2 py-1.5 break-all">
+          {commitMsg}
+        </p>
+        {pushError && (
+          <p className="text-[10px] text-red-400 mb-2 break-all">{pushError}</p>
+        )}
+        <div className="flex gap-2 flex-wrap">
+          {pushed ? (
+            <span className="flex items-center gap-1 text-xs text-emerald-400">
+              <Check size={11} /> Committed and pushed
+            </span>
+          ) : (
+            <button
+              onClick={handleApprovePush}
+              disabled={pushing}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-emerald-700/60 hover:bg-emerald-700 disabled:opacity-50 text-emerald-100 border border-emerald-600/50 transition-colors"
+            >
+              <GitMerge size={11} />
+              {pushing ? "Pushing…" : "Approve & push"}
+            </button>
+          )}
+          <button
+            onClick={() => invoke("open_agent_log", { agentId: entry.agentId }).catch(() => {})}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-zinc-700/60 text-zinc-300 hover:bg-zinc-700 border border-zinc-600/50 transition-colors"
+          >
+            <FileText size={11} />
+            View log
+          </button>
+          <button onClick={onDismiss} className="ml-auto text-xs text-zinc-600 hover:text-zinc-400 transition-colors">
+            Dismiss
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="mt-3 border border-zinc-700/50 rounded-lg bg-zinc-800/30 px-3 py-2.5">
       <div className="flex items-center gap-2 mb-2">
@@ -251,7 +317,7 @@ function BuilderDoneCard({ agentId, onDismiss }: { agentId: string; onDismiss: (
       </div>
       <div className="flex gap-2">
         <button
-          onClick={() => invoke("open_agent_log", { agentId }).catch((err) => console.error("open_agent_log failed", err))}
+          onClick={() => invoke("open_agent_log", { agentId: entry.agentId }).catch((err) => console.error("open_agent_log failed", err))}
           className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-zinc-700/60 text-zinc-300 hover:bg-zinc-700 border border-zinc-600/50 transition-colors"
         >
           <FileText size={11} />
@@ -573,7 +639,7 @@ function StreamBubble({
 
       {/* Builder done card */}
       {isBuilder && isDone && !isError && (
-        <BuilderDoneCard agentId={entry.agentId} onDismiss={onDismissBuilder} />
+        <BuilderDoneCard entry={entry} onDismiss={onDismissBuilder} />
       )}
 
       {/* Trace view — available on any run once a runId is assigned */}
@@ -1009,6 +1075,7 @@ export function Chat() {
   const [repoProjects, setRepoProjects] = useState<Project[]>([]);
   const [selectedRepoSlug, setSelectedRepoSlug] = useState<string>("");
   const [selectedRepoPath, setSelectedRepoPath] = useState<string | null>(null);
+  const [settings, setSettings]         = useState<SettingsType | null>(null);
   const { streamEntries, messages, runningAgents, fannedIds, chattersOpen } =
     useSyncExternalStore(subscribeToChatStore, getSnapshot);
   const [filter, setFilter]             = useState<Filter>("needs-you");
@@ -1036,7 +1103,7 @@ export function Chat() {
   // Keep agentsRef in sync so the stream listener can resolve names without a stale closure.
   useEffect(() => { agentsRef.current = agents; }, [agents]);
 
-  // ── Load agents + plan state ─────────────────────────────────────────────────
+  // ── Load agents + plan state + settings ─────────────────────────────────────
   useEffect(() => {
     invoke<Agent[]>("list_agents")
       .then(setAgents)
@@ -1047,6 +1114,7 @@ export function Chat() {
     invoke<Project[]>("list_projects")
       .then((ps) => setRepoProjects(ps.filter((p) => p.repos.length > 0)))
       .catch(() => {});
+    invoke<SettingsType>("get_settings").then(setSettings).catch(() => {});
 
     // Drain any scheduled runs that fired while Chat was closed.
     invoke<Array<{ agentId: string; agentName: string; time: string }>>(
@@ -1064,6 +1132,10 @@ export function Chat() {
       }));
       setStreamEntries((prev) => [...injected, ...prev]);
     }).catch(() => {});
+
+    function onSettingsSaved() { invoke<SettingsType>("get_settings").then(setSettings).catch(() => {}); }
+    window.addEventListener("antfarm-settings-saved", onSettingsSaved);
+    return () => window.removeEventListener("antfarm-settings-saved", onSettingsSaved);
   }, []);
 
   useEffect(() => {
@@ -1310,9 +1382,15 @@ export function Chat() {
     const agentId   = targetAgent.id;
     const agentName = targetAgent.name;
 
+    const isBuilderWrite = agentId === "builder" && (settings?.feature_builder_write ?? false);
+
     setStreamEntries((prev) => [
       ...prev,
-      { id: entryId, runId: "", agentId, agentName, text: "", status: "thinking", time: nowTime(), userMsg: raw },
+      {
+        id: entryId, runId: "", agentId, agentName, text: "", status: "thinking", time: nowTime(), userMsg: raw,
+        repoPath: agentId === "builder" ? (selectedRepoPath ?? undefined) : undefined,
+        builderWrite: isBuilderWrite || undefined,
+      },
     ]);
     setRunningAgents((prev) => new Set([...prev, agentId]));
 
@@ -1320,6 +1398,7 @@ export function Chat() {
       const runId = await invoke<string>("run_agent", {
         agentId, task, parentRunId: null, resumeSession: true,
         repoPath: agentId === "builder" ? selectedRepoPath : null,
+        builderWrite: isBuilderWrite,
       });
       setStreamEntries((prev) =>
         prev.map((e) => (e.id === entryId ? { ...e, runId } : e))
@@ -1753,17 +1832,19 @@ export function Chat() {
                 style={{ color: "transparent", caretColor: "white" }}
                 className="w-full relative resize-none bg-zinc-900/60 border border-zinc-700/60 rounded-xl px-4 py-3 text-sm leading-6 placeholder-transparent focus:outline-none focus:border-zinc-600 pr-12 transition-colors"
               />
-              <button
-                onClick={handleMicClick}
-                className={`absolute right-3 top-3 transition-colors ${
-                  isListening
-                    ? "text-red-400 animate-pulse"
-                    : "text-zinc-600 hover:text-zinc-400"
-                }`}
-                title={isListening ? "Stop listening" : "Dictate"}
-              >
-                <Mic size={15} />
-              </button>
+              {(settings?.feature_voice ?? false) && (
+                <button
+                  onClick={handleMicClick}
+                  className={`absolute right-3 top-3 transition-colors ${
+                    isListening
+                      ? "text-red-400 animate-pulse"
+                      : "text-zinc-600 hover:text-zinc-400"
+                  }`}
+                  title={isListening ? "Stop listening" : "Dictate"}
+                >
+                  <Mic size={15} />
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-3 mt-3">

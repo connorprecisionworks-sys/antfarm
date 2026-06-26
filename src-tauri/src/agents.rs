@@ -291,6 +291,16 @@ fn pending_runs_path() -> PathBuf {
         .join(".antfarm/scheduled-runs-pending.json")
 }
 
+/// Read a bool feature flag from the persisted settings.json without importing main.rs.
+fn read_feature_flag(key: &str) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = PathBuf::from(home)
+        .join("Library/Application Support/com.connordore.antfarm/settings.json");
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+    v.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 fn push_pending_run(agent_id: &str, agent_name: &str, time: &str) {
     let path = pending_runs_path();
     let mut list: Vec<serde_json::Value> = path
@@ -354,6 +364,8 @@ pub fn start_agent_scheduler(app: AppHandle) {
                 };
                 if !cron_matches_now(&sched)              { continue; }
                 if schedule_is_locked(&agent.id, &slot)   { continue; }
+                // Morning feature gate: skip Clerk's scheduled run when morning is OFF
+                if agent.id == "clerk" && !read_feature_flag("feature_morning") { continue; }
 
                 schedule_lock(&agent.id, &slot);
                 push_pending_run(&agent.id, &agent.name, &time_str);
@@ -364,7 +376,7 @@ pub fn start_agent_scheduler(app: AppHandle) {
                 std::thread::spawn(move || {
                     let dispatch  = app2.state::<DispatchState>();
                     let agent_run = app2.state::<AgentRunState>();
-                    let _ = run_agent(app2.clone(), dispatch, agent_run, agent_id, task, None, false, None);
+                    let _ = run_agent(app2.clone(), dispatch, agent_run, agent_id, task, None, false, None, None);
                 });
             }
 
@@ -494,10 +506,11 @@ fn networked_allowed_tools(connectors: &[String]) -> String {
 /// Applied on every turn (cold + resume) — exactly one call per run.
 ///
 /// Composition:
-///   • builder (offline-code):  Write,Edit,MultiEdit,NotebookEdit,Bash + all 44 GWS tools
-///   • networked agents:        Bash + (44 GWS universe minus this agent's granted GWS tools)
+///   • builder advisory (default): Write,Edit,MultiEdit,NotebookEdit,Bash + all 44 GWS tools
+///   • builder write mode:         NotebookEdit + all 44 GWS tools (Write/Edit/Bash granted)
+///   • networked agents:           Bash + (44 GWS universe minus this agent's granted GWS tools)
 ///   • start_google_auth always denied for everyone
-fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String]) -> String {
+fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String], builder_write: bool) -> String {
     let mut deny: Vec<String> = Vec::new();
 
     if profile == "networked" {
@@ -509,7 +522,13 @@ fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String]) -> Stri
     }
 
     if agent_id == "builder" {
-        deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
+        if builder_write {
+            // Write mode: grant Write/Edit/MultiEdit/Bash; still deny NotebookEdit (not needed)
+            deny.push("NotebookEdit".to_string());
+        } else {
+            // Advisory mode: deny all write and execution tools
+            deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
+        }
     }
 
     // GWS deny: universe minus granted for this agent
@@ -687,6 +706,7 @@ pub fn run_agent(
     parent_run_id: Option<String>,
     resume_session: bool,
     repo_path: Option<String>,
+    builder_write: Option<bool>,
 ) -> Result<String, String> {
     let vault = vault_root();
 
@@ -733,13 +753,35 @@ pub fn run_agent(
          response with exactly:\nNEEDS YOU: <one sentence — what you'll do once approved>"
             .to_string();
         if agent_id == "builder" {
-            note.push_str(
-                "\n\nYou are in read-only advisory mode in chat: read the repo and answer \
-                 Connor's question, do not write files or run commands. Be surgical and \
-                 token-efficient — use Glob/Grep to find the few relevant files and read only \
-                 those, never slurp the whole tree. For real code changes, Connor dispatches \
-                 you to the build harness."
-            );
+            let builder_write_mode = builder_write.unwrap_or(false);
+            if builder_write_mode {
+                note.push_str(
+                    "\n\n## Builder — write mode\n\n\
+                     You are in write mode. You have Write, Edit, Bash access. These rules are non-negotiable:\n\n\
+                     REPO SCOPE: Only create or modify files under the repo directory added to your context \
+                     via --add-dir. Do not create or modify files anywhere else on the filesystem.\n\n\
+                     STOP BEFORE PUSH: When the build is green, STOP. Do NOT run git commit, git push, \
+                     or any push command autonomously. End your response with a plain-English summary of \
+                     what changed, then the full diff (git diff HEAD), then exactly this line on its own:\n\
+                     ---COMMIT: <one-line commit message>---\n\n\
+                     MIGRATION HARD-STOP: If the task requires `supabase db push`, `supabase migration`, \
+                     `prisma migrate`, or any database schema change command, STOP immediately and end with:\n\
+                     NEEDS YOU: Migration required — <what migration is needed and why>. Never run migrations.\n\n\
+                     BUILD GATE: After making changes, run the appropriate build check: `cargo check` for \
+                     Rust projects, `npm run build` for TypeScript/frontend. If it fails, read the errors, \
+                     fix them, and re-run. Cap retries at 5, then stop and report the errors in plain English.\n\n\
+                     DESTRUCTIVE OPS: Never run rm -rf, git reset --hard, git push --force, or any \
+                     destructive command without surfacing for approval first via NEEDS YOU."
+                );
+            } else {
+                note.push_str(
+                    "\n\nYou are in read-only advisory mode in chat: read the repo and answer \
+                     Connor's question, do not write files or run commands. Be surgical and \
+                     token-efficient — use Glob/Grep to find the few relevant files and read only \
+                     those, never slurp the whole tree. For real code changes, Connor dispatches \
+                     you to the build harness."
+                );
+            }
         }
         note
     };
@@ -822,7 +864,7 @@ pub fn run_agent(
 
     // Unified deny list — applied on every turn (cold + resume) for all agents.
     // Exactly one --disallowedTools call. Builder and networked both covered here.
-    let deny = build_deny_list(&agent_id, &agent.profile, &agent.connectors);
+    let deny = build_deny_list(&agent_id, &agent.profile, &agent.connectors, builder_write.unwrap_or(false));
     if !deny.is_empty() { cmd.args(["--disallowedTools", &deny]); }
 
     // Networked agents: allowed list only. Do NOT load settings.networked.json via

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router-dom";
 import { Lock, Mic, Moon, Send } from "lucide-react";
+import { Settings as SettingsType } from "../types";
 
 // ── Animation styles ──────────────────────────────────────────────────────────
 
@@ -95,6 +96,7 @@ export function Tonight() {
   const [locking, setLocking]           = useState(false);
   const [lockedMd, setLockedMd]         = useState<string | null>(null);
   const [lockError, setLockError]       = useState<string | null>(null);
+  const [featureVoice, setFeatureVoice] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef  = useRef<HTMLInputElement>(null);
 
@@ -103,6 +105,7 @@ export function Tonight() {
     invoke<TomorrowPlan>("get_tomorrow_plan")
       .then((p) => { if (p.locked || p.markdown) setExistingPlan(p); })
       .catch(() => {});
+    invoke<SettingsType>("get_settings").then((s) => setFeatureVoice(s.feature_voice)).catch(() => {});
   }, []);
 
   // Auto-scroll chat
@@ -161,14 +164,16 @@ export function Tonight() {
           <h1 className="text-base font-semibold text-zinc-100">Tonight</h1>
           <p className="text-xs text-zinc-500">Plan for {tomorrowLabel()}</p>
         </div>
-        <button
-          onClick={() => navigate("/voice?mode=night")}
-          className="ml-auto flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
-          title="Plan out loud with Captain Jack"
-        >
-          <Mic size={12} strokeWidth={1.75} />
-          Plan out loud
-        </button>
+        {featureVoice && (
+          <button
+            onClick={() => navigate("/voice?mode=night")}
+            className="ml-auto flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+            title="Plan out loud with Captain Jack"
+          >
+            <Mic size={12} strokeWidth={1.75} />
+            Plan out loud
+          </button>
+        )}
       </div>
 
       {/* Locked plan card */}

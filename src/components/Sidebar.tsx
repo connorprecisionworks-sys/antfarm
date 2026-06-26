@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { Settings as SettingsType } from "../types";
 import {
   Home,
   Layers,
@@ -35,6 +36,18 @@ const NAV = [
 export function Sidebar() {
   const [liveCount, setLiveCount]     = useState(0);
   const [showPlanNudge, setShowPlanNudge] = useState(false);
+  const [features, setFeatures] = useState({ morning: false, tonight: false, voice: false });
+
+  useEffect(() => {
+    function loadFeatures() {
+      invoke<SettingsType>("get_settings").then((s) => {
+        setFeatures({ morning: s.feature_morning, tonight: s.feature_tonight, voice: s.feature_voice });
+      }).catch(() => {});
+    }
+    loadFeatures();
+    window.addEventListener("antfarm-settings-saved", loadFeatures);
+    return () => window.removeEventListener("antfarm-settings-saved", loadFeatures);
+  }, []);
 
   useEffect(() => {
     function refresh() {
@@ -69,7 +82,12 @@ export function Sidebar() {
 
       {/* Nav */}
       <nav className="flex-1 px-2 py-3 space-y-0.5">
-        {NAV.map(({ to, label, icon: Icon, end }) => (
+        {NAV.filter(({ to }) => {
+          if (to === "/morning") return features.morning;
+          if (to === "/tonight") return features.tonight;
+          if (to === "/voice")   return features.voice;
+          return true;
+        }).map(({ to, label, icon: Icon, end }) => (
           <NavLink
             key={to}
             to={to}

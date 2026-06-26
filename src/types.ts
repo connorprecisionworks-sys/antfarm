@@ -66,6 +66,10 @@ export interface Settings {
   sound_enabled: boolean;
   sound_code_enabled: boolean;
   sound_cowork_enabled: boolean;
+  feature_morning: boolean;
+  feature_tonight: boolean;
+  feature_voice: boolean;
+  feature_builder_write: boolean;
 }
 
 export interface TokenTotals {
