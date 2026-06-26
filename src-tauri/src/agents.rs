@@ -13,7 +13,7 @@ use chrono::{Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -175,6 +175,39 @@ fn save_agent_session_id(agent_id: &str, sid: &str) {
 
 fn clear_agent_session_id(agent_id: &str) {
     let _ = std::fs::remove_file(agent_sessions_dir().join(format!("{agent_id}.txt")));
+}
+
+// ── Run trace helpers ─────────────────────────────────────────────────────────
+
+fn trace_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let d = PathBuf::from(home).join(".antfarm/traces");
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+/// Append one JSON line to the per-run trace file, flushed immediately so a
+/// killed or timed-out run always has a complete trail up to the last event.
+fn append_trace_line(run_id: &str, entry: serde_json::Value) {
+    let path = trace_dir().join(format!("{run_id}.jsonl"));
+    let mut line = serde_json::to_string(&entry).unwrap_or_default();
+    line.push('\n');
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// Extract a human-readable summary from a tool call's input JSON.
+fn tool_input_summary(input: &serde_json::Value) -> String {
+    for field in &["query", "command", "file_path", "path", "prompt", "url", "pattern"] {
+        if let Some(v) = input.get(field).and_then(|v| v.as_str()) {
+            let s: String = v.chars().take(100).collect();
+            return format!("{field}: {s}");
+        }
+    }
+    let s = serde_json::to_string(input).unwrap_or_default();
+    s.chars().take(120).collect()
 }
 
 // ── Schedule helpers ──────────────────────────────────────────────────────────
@@ -598,6 +631,21 @@ pub fn reset_agent_session(agent_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Load the incremental trace for a run from ~/.antfarm/traces/{run_id}.jsonl.
+/// Returns every JSON line parsed into a Value; the last line is the terminal record.
+#[tauri::command]
+pub fn get_run_trace(run_id: String) -> Vec<serde_json::Value> {
+    if run_id.is_empty() || run_id.contains('/') || run_id.contains("..") {
+        return vec![];
+    }
+    let path = trace_dir().join(format!("{run_id}.jsonl"));
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    content.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
 // ── run_agent ─────────────────────────────────────────────────────────────────
 
 /// Spawn a claude -p agent run. Reads agent.json + prompt.md, injects write-scope
@@ -841,11 +889,18 @@ pub fn run_agent(
             let mut input_tokens:  u32 = 0;
             let mut output_tokens: u32 = 0;
             let mut outputs: Vec<String> = Vec::new();
+            // Trace bookkeeping: elapsed_ms of the last traced event, total event count.
+            let mut last_trace_elapsed_ms: u64 = 0;
+            let mut trace_event_count:     u32 = 0;
 
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() { continue; }
                 *la_reader.lock().unwrap() = std::time::Instant::now();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+
+                // Per-line trace timestamps (shared by all events in this stream line).
+                let trace_elapsed_ms = started.elapsed().as_millis() as u64;
+                let trace_ts         = Local::now().to_rfc3339();
 
                 // Capture session_id from any stream line (appears in init line)
                 if captured_sid.is_none() {
@@ -855,6 +910,18 @@ pub fn run_agent(
                 }
 
                 let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                // Trace the init event so the trail starts from session open.
+                if typ == "system" && v.get("subtype").and_then(|s| s.as_str()) == Some("init") {
+                    let sid_text = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("?");
+                    append_trace_line(&rid, serde_json::json!({
+                        "ts": trace_ts, "elapsed_ms": trace_elapsed_ms,
+                        "kind": "init", "tool_name": null,
+                        "input_summary": format!("session {sid_text} started"),
+                    }));
+                    last_trace_elapsed_ms = trace_elapsed_ms;
+                    trace_event_count    += 1;
+                }
 
                 if typ == "assistant" {
                     let mut chunks = Vec::new();
@@ -888,6 +955,19 @@ pub fn run_agent(
                                     usage_pct:     0.0,
                                     outputs:       vec![],
                                 }).ok();
+                                // Trace each tool call with input summary.
+                                {
+                                    let input   = block.get("input").cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let summary = tool_input_summary(&input);
+                                    append_trace_line(&rid, serde_json::json!({
+                                        "ts": trace_ts, "elapsed_ms": trace_elapsed_ms,
+                                        "kind": "tool_use", "tool_name": name,
+                                        "input_summary": summary,
+                                    }));
+                                    last_trace_elapsed_ms = trace_elapsed_ms;
+                                    trace_event_count    += 1;
+                                }
                                 // Collect output file paths from Write/Edit calls.
                                 if name == "Write" || name == "Edit" {
                                     if let Some(fp) = block.pointer("/input/file_path")
@@ -921,6 +1001,17 @@ pub fn run_agent(
                             usage_pct:     0.0,
                             outputs:       vec![],
                         }).ok();
+                        // Trace non-trivial text blocks (last_text holds the cloned content).
+                        if last_text.len() > 20 {
+                            let summary: String = last_text.chars().take(80).collect();
+                            append_trace_line(&rid, serde_json::json!({
+                                "ts": trace_ts, "elapsed_ms": trace_elapsed_ms,
+                                "kind": "text", "tool_name": null,
+                                "input_summary": summary,
+                            }));
+                            last_trace_elapsed_ms = trace_elapsed_ms;
+                            trace_event_count    += 1;
+                        }
                     }
                 } else if typ == "result" {
                     let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
@@ -950,6 +1041,25 @@ pub fn run_agent(
                                 }
                             }
                         }
+                    }
+
+                    // Trace result before emitting to frontend.
+                    {
+                        let subtype = v.get("subtype").and_then(|s| s.as_str())
+                            .unwrap_or("result");
+                        let cost = v.get("total_cost_usd").and_then(|c| c.as_f64())
+                            .map(|c| format!(" · ${c:.4}")).unwrap_or_default();
+                        let dur  = v.get("duration_ms").and_then(|d| d.as_u64())
+                            .map(|d| format!(" · {:.1}s", d as f64 / 1000.0))
+                            .unwrap_or_default();
+                        append_trace_line(&rid, serde_json::json!({
+                            "ts": trace_ts, "elapsed_ms": trace_elapsed_ms,
+                            "kind": "result", "tool_name": null,
+                            "input_summary": format!("{subtype}{cost}{dur}"),
+                            "result_status": if is_error { "error" } else { "success" },
+                        }));
+                        last_trace_elapsed_ms = trace_elapsed_ms;
+                        trace_event_count    += 1;
                     }
 
                     app2.emit("agent-stream", AgentStreamEvent {
@@ -1009,6 +1119,27 @@ pub fn run_agent(
                 // Previously only abnormal states were logged, so a process that exited
                 // cleanly without a result event left no record in the agent's log.
                 append_agent_log(&vault_clone, &aid, &rid, &task_clone, &msg, is_abnormal);
+
+                // Append terminal record to trace: captures reason, silence duration,
+                // and which step was last so the UI can pinpoint the hang.
+                {
+                    let terminal_elapsed = started.elapsed().as_millis() as u64;
+                    let terminal_ts      = Local::now().to_rfc3339();
+                    let silence_secs     = terminal_elapsed
+                        .saturating_sub(last_trace_elapsed_ms) as f64 / 1000.0;
+                    append_trace_line(&rid, serde_json::json!({
+                        "ts": terminal_ts,
+                        "elapsed_ms": terminal_elapsed,
+                        "kind": "terminal",
+                        "tool_name": null,
+                        "input_summary": "",
+                        "reason": kind,
+                        "last_event_elapsed_ms": last_trace_elapsed_ms,
+                        "silence_secs": silence_secs,
+                        "total_events": trace_event_count,
+                    }));
+                }
+
                 app2.emit("agent-stream", AgentStreamEvent {
                     run_id:        rid,
                     agent_id:      aid,

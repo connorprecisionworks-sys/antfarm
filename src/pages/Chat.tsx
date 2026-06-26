@@ -60,6 +60,20 @@ interface PlanState {
 
 type Filter = "needs-you" | "all";
 
+interface TraceEntry {
+  ts: string;
+  elapsed_ms: number;
+  kind: "init" | "tool_use" | "text" | "result" | "terminal" | "stderr";
+  tool_name: string | null;
+  input_summary: string;
+  result_status?: string | null;
+  // terminal-only fields
+  reason?: string;
+  last_event_elapsed_ms?: number;
+  silence_secs?: number;
+  total_events?: number;
+}
+
 // A parsed delegation task from Jack's ```delegate block
 interface DelegationTask {
   agentId: string;
@@ -261,6 +275,91 @@ function BuilderDoneCard({ agentId, onDismiss }: { agentId: string; onDismiss: (
   );
 }
 
+// ── Trace panel ───────────────────────────────────────────────────────────────
+
+function TracePanel({ entries, runId }: { entries: TraceEntry[]; runId: string }) {
+  const terminalEntry = entries.find(e => e.kind === "terminal");
+  const lastEventMs   = terminalEntry?.last_event_elapsed_ms ?? null;
+  const nonTerminal   = entries.filter(e => e.kind !== "terminal");
+
+  // Find the index of the last event that matches last_event_elapsed_ms (last occurrence).
+  const lastEventIdx = lastEventMs !== null
+    ? nonTerminal.reduce((acc, e, i) => e.elapsed_ms === lastEventMs ? i : acc, -1)
+    : -1;
+
+  function fmtMs(ms: number): string {
+    const s = ms / 1000;
+    if (s < 60) return `+${s.toFixed(1)}s`;
+    const m = Math.floor(s / 60);
+    const rem = (s % 60).toFixed(1);
+    return `+${m}m ${rem}s`;
+  }
+
+  const kindColor: Record<string, string> = {
+    init:     "text-zinc-500",
+    tool_use: "text-blue-400/80",
+    text:     "text-zinc-400",
+    result:   "text-emerald-400/80",
+    stderr:   "text-rose-400/70",
+  };
+
+  return (
+    <div className="mt-2.5 rounded-lg border border-zinc-800/60 bg-zinc-950 p-2.5 font-mono">
+      <div className="text-[9px] text-zinc-600 uppercase tracking-wide mb-1.5 font-sans">
+        Step trace · {runId.slice(-10)}
+      </div>
+      {nonTerminal.length === 0 ? (
+        <div className="text-[10px] text-zinc-600">No events recorded yet.</div>
+      ) : (
+        <div className="space-y-px">
+          {nonTerminal.map((e, i) => {
+            const isLast = i === lastEventIdx;
+            return (
+              <div key={i} className="flex gap-2 items-baseline text-[10px]">
+                <span className="shrink-0 w-[50px] text-right tabular-nums text-zinc-600">
+                  {fmtMs(e.elapsed_ms)}
+                </span>
+                <span className={`shrink-0 w-[70px] truncate ${kindColor[e.kind] ?? "text-zinc-500"}`}>
+                  {e.kind === "tool_use" ? (e.tool_name ?? "tool_use") : e.kind}
+                </span>
+                <span className={`flex-1 truncate ${isLast ? "text-zinc-200" : "text-zinc-500"}`}>
+                  {e.input_summary}
+                </span>
+                {isLast && terminalEntry?.reason === "timeout" && (
+                  <span className="shrink-0 text-amber-500/80 text-[9px] pl-1">
+                    ← last · {terminalEntry.silence_secs?.toFixed(1)}s silence
+                  </span>
+                )}
+                {isLast && terminalEntry?.reason === "stopped" && (
+                  <span className="shrink-0 text-zinc-500 text-[9px] pl-1">← stopped here</span>
+                )}
+              </div>
+            );
+          })}
+          {terminalEntry && (
+            <div className="flex gap-2 items-baseline text-[10px] pt-1.5 mt-1 border-t border-zinc-800/50">
+              <span className="shrink-0 w-[50px]" />
+              <span className={`shrink-0 w-[70px] ${
+                terminalEntry.reason === "timeout" ? "text-amber-400/80" :
+                terminalEntry.reason === "stopped" ? "text-zinc-500" :
+                terminalEntry.reason === "error"   ? "text-red-400/80" :
+                "text-emerald-400/70"
+              }`}>
+                {terminalEntry.reason}
+              </span>
+              <span className="text-zinc-600 truncate">
+                {terminalEntry.reason === "timeout"
+                  ? `${terminalEntry.silence_secs?.toFixed(1)}s silence · ${terminalEntry.total_events} steps total`
+                  : `${terminalEntry.total_events} steps total`}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Stream bubble ─────────────────────────────────────────────────────────────
 
 function StreamBubble({
@@ -283,6 +382,27 @@ function StreamBubble({
   onReject: () => void;
   onDismissBuilder: () => void;
 }) {
+  const [traceOpen,    setTraceOpen]    = useState(false);
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceEntries, setTraceEntries] = useState<TraceEntry[] | null>(null);
+
+  async function toggleTrace() {
+    if (traceOpen) { setTraceOpen(false); return; }
+    setTraceOpen(true);
+    // Always re-fetch for live runs; fetch once for completed runs.
+    if (traceEntries === null || isLive) {
+      setTraceLoading(true);
+      try {
+        const entries = await invoke<TraceEntry[]>("get_run_trace", { runId: entry.runId });
+        setTraceEntries(entries);
+      } catch {
+        setTraceEntries([]);
+      } finally {
+        setTraceLoading(false);
+      }
+    }
+  }
+
   const isLive    = entry.status === "thinking" || entry.status === "streaming";
   const isError   = entry.status === "error";
   const isDone    = entry.status === "done";
@@ -454,6 +574,22 @@ function StreamBubble({
       {/* Builder done card */}
       {isBuilder && isDone && !isError && (
         <BuilderDoneCard agentId={entry.agentId} onDismiss={onDismissBuilder} />
+      )}
+
+      {/* Trace view — available on any run once a runId is assigned */}
+      {entry.runId && (
+        <div className="mt-2.5">
+          <button
+            onClick={toggleTrace}
+            className="flex items-center gap-1 text-[10px] text-zinc-700 hover:text-zinc-500 transition-colors"
+          >
+            <Clock size={9} />
+            {traceLoading ? "loading…" : traceOpen ? "hide trace" : isTimeout ? "view trace ←" : "trace"}
+          </button>
+          {traceOpen && !traceLoading && traceEntries !== null && (
+            <TracePanel entries={traceEntries} runId={entry.runId} />
+          )}
+        </div>
       )}
     </div>
   );
