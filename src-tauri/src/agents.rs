@@ -295,7 +295,7 @@ pub fn start_agent_scheduler(app: AppHandle) {
                 std::thread::spawn(move || {
                     let dispatch  = app2.state::<DispatchState>();
                     let agent_run = app2.state::<AgentRunState>();
-                    let _ = run_agent(app2.clone(), dispatch, agent_run, agent_id, task, None, false);
+                    let _ = run_agent(app2.clone(), dispatch, agent_run, agent_id, task, None, false, None);
                 });
             }
 
@@ -486,6 +486,7 @@ pub fn run_agent(
     task: String,
     parent_run_id: Option<String>,
     resume_session: bool,
+    repo_path: Option<String>,
 ) -> Result<String, String> {
     let vault = vault_root();
 
@@ -527,10 +528,20 @@ pub fn run_agent(
          Do not include it for agents you're not dispatching this turn."
             .to_string()
     } else {
-        "\n\nIf completing this task requires Connor's approval before an irreversible \
+        let mut note = "\n\nIf completing this task requires Connor's approval before an irreversible \
          action (sending email, merging code, posting, spending money), end your \
          response with exactly:\nNEEDS YOU: <one sentence — what you'll do once approved>"
-            .to_string()
+            .to_string();
+        if agent_id == "builder" {
+            note.push_str(
+                "\n\nYou are in read-only advisory mode in chat: read the repo and answer \
+                 Connor's question, do not write files or run commands. Be surgical and \
+                 token-efficient — use Glob/Grep to find the few relevant files and read only \
+                 those, never slurp the whole tree. For real code changes, Connor dispatches \
+                 you to the build harness."
+            );
+        }
+        note
     };
 
     // ── Daily context preamble (orchestrator + clerk) ─────────────────────────
@@ -593,6 +604,16 @@ pub fn run_agent(
             let active_dir = format!("{vault_str}/active");
             let agent_dir  = format!("{vault_str}/agents/{agent_id}");
             cmd.args(["--add-dir", &active_dir, "--add-dir", &agent_dir]);
+        }
+        // Builder in the chat lane is read-only: no writes, no shell.
+        if agent_id == "builder" {
+            cmd.args(["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash"]);
+        }
+        // Optional repo directory (chat lane only; warm resume carries scope via session).
+        if let Some(ref rp) = repo_path {
+            if std::path::Path::new(rp).is_dir() {
+                cmd.args(["--add-dir", rp]);
+            }
         }
     }
 

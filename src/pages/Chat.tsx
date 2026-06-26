@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
-  Clock, FileText, GitMerge, Loader, Mic, Moon, Play, Send, Square, X, Zap,
+  Clock, FileText, FolderOpen, GitMerge, Loader, Mic, Moon, Play, Send, Square, X, Zap,
 } from "lucide-react";
 import {
   type StreamEntry,
@@ -28,6 +28,12 @@ interface Agent {
   status: string;
   connectors: string[];
   schedule: string | null;
+}
+
+interface Project {
+  slug: string;
+  name: string;
+  repos: string[];
 }
 
 interface AgentStreamPayload {
@@ -780,6 +786,9 @@ function renderDraftHighlighted(text: string, agents: Agent[]) {
 export function Chat() {
   const [agents, setAgents]             = useState<Agent[]>([]);
   const [planState, setPlanState]       = useState<PlanState | null>(null);
+  const [repoProjects, setRepoProjects] = useState<Project[]>([]);
+  const [selectedRepoSlug, setSelectedRepoSlug] = useState<string>("");
+  const [selectedRepoPath, setSelectedRepoPath] = useState<string | null>(null);
   const { streamEntries, messages, runningAgents, fannedIds, chattersOpen } =
     useSyncExternalStore(subscribeToChatStore, getSnapshot);
   const [filter, setFilter]             = useState<Filter>("needs-you");
@@ -801,6 +810,9 @@ export function Chat() {
       .catch(() => setAgents([]));
     invoke<PlanState>("get_plan_state")
       .then(setPlanState)
+      .catch(() => {});
+    invoke<Project[]>("list_projects")
+      .then((ps) => setRepoProjects(ps.filter((p) => p.repos.length > 0)))
       .catch(() => {});
 
     // Drain any scheduled runs that fired while Chat was closed.
@@ -828,6 +840,14 @@ export function Chat() {
       setRecipientId(orch?.id ?? agents[0]?.id ?? null);
     }
   }, [agents]);
+
+  // Reset repo picker when switching away from Builder.
+  useEffect(() => {
+    if (recipientId !== "builder") {
+      setSelectedRepoSlug("");
+      setSelectedRepoPath(null);
+    }
+  }, [recipientId]);
 
   // Part B: on remount, fix any entries left "thinking"/"streaming" because the
   // stream finished while Chat was unmounted and the listener was gone.
@@ -916,7 +936,7 @@ export function Chat() {
     ]);
     setRunningAgents((prev) => new Set([...prev, "clerk"]));
     try {
-      const runId = await invoke<string>("run_agent", { agentId: "clerk", task, parentRunId: null, resumeSession: true });
+      const runId = await invoke<string>("run_agent", { agentId: "clerk", task, parentRunId: null, resumeSession: true, repoPath: null });
       setStreamEntries((prev) => prev.map((e) => (e.id === entryId ? { ...e, runId } : e)));
       // Refresh plan state after Clerk finishes (handled via done event)
     } catch (err) {
@@ -1019,6 +1039,7 @@ export function Chat() {
     try {
       const runId = await invoke<string>("run_agent", {
         agentId, task, parentRunId: null, resumeSession: true,
+        repoPath: agentId === "builder" ? selectedRepoPath : null,
       });
       setStreamEntries((prev) =>
         prev.map((e) => (e.id === entryId ? { ...e, runId } : e))
@@ -1067,6 +1088,7 @@ export function Chat() {
         task,
         parentRunId: null,
         resumeSession: false,
+        repoPath: null,
       })
         .then((runId) => {
           setStreamEntries((prev) =>
@@ -1112,6 +1134,7 @@ export function Chat() {
         task:    "APPROVED — please proceed with the action you described.",
         parentRunId: null,
         resumeSession: true,
+        repoPath: null,
       });
       setStreamEntries((prev) =>
         prev.map((e) => (e.id === entryId ? { ...e, runId } : e))
@@ -1322,6 +1345,42 @@ export function Chat() {
                 mention
               </button>
             </div>
+
+            {/* Builder repo picker */}
+            {recipient?.id === "builder" && repoProjects.length > 0 && (
+              <div className="flex items-center gap-2 mb-3">
+                <FolderOpen size={10} className="text-zinc-600 shrink-0" />
+                <select
+                  value={selectedRepoSlug}
+                  onChange={async (e) => {
+                    const slug = e.target.value;
+                    setSelectedRepoSlug(slug);
+                    if (!slug) { setSelectedRepoPath(null); return; }
+                    try {
+                      const paths = await invoke<Array<{ repo: string; path: string }>>(
+                        "get_project_paths", { slug }
+                      );
+                      setSelectedRepoPath(paths[0]?.path ?? null);
+                    } catch {
+                      setSelectedRepoPath(null);
+                    }
+                  }}
+                  className="flex-1 text-xs bg-zinc-900 border border-zinc-700/50 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-zinc-600 transition-colors"
+                >
+                  <option value="">No repo — answer from memory</option>
+                  {repoProjects.map((p) => (
+                    <option key={p.slug} value={p.slug}>
+                      {p.name || p.repos[0]}
+                    </option>
+                  ))}
+                </select>
+                {selectedRepoPath && (
+                  <span className="text-[10px] text-zinc-600 truncate max-w-[120px]" title={selectedRepoPath}>
+                    {selectedRepoPath.split("/").pop()}
+                  </span>
+                )}
+              </div>
+            )}
 
             <div className="relative">
               {/* @mention dropdown */}
