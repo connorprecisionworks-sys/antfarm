@@ -9,7 +9,7 @@
 // READ access: full vault via --add-dir so agents can read active/, agents/*, etc.
 // WRITE scope: constrained by prompt instruction to agents/<id>/ and active/ only.
 
-use chrono::Local;
+use chrono::{Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -17,7 +17,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dispatch::DispatchState;
 
@@ -155,6 +155,146 @@ fn save_agent_session_id(agent_id: &str, sid: &str) {
 
 fn clear_agent_session_id(agent_id: &str) {
     let _ = std::fs::remove_file(agent_sessions_dir().join(format!("{agent_id}.txt")));
+}
+
+// ── Schedule helpers ──────────────────────────────────────────────────────────
+
+/// Matches a 5-field cron expression (`min hr dom mon dow`) against local time.
+/// Supports: `*`, integers, comma lists `a,b`, ranges `a-b`, steps `*/n`.
+fn cron_matches_now(expr: &str) -> bool {
+    let now = Local::now();
+    let fields: Vec<&str> = expr.trim().split_whitespace().collect();
+    if fields.len() != 5 { return false; }
+
+    fn matches(spec: &str, val: u32) -> bool {
+        if spec == "*" { return true; }
+        spec.split(',').any(|part| {
+            if let Ok(n) = part.parse::<u32>() { return n == val; }
+            if let Some((base, step)) = part.split_once('/') {
+                let start: u32 = if base == "*" { 0 } else { base.parse().unwrap_or(0) };
+                let step: u32  = step.parse().unwrap_or(1);
+                return step > 0 && val >= start && (val - start) % step == 0;
+            }
+            if let Some((lo, hi)) = part.split_once('-') {
+                let lo: u32 = lo.parse().unwrap_or(0);
+                let hi: u32 = hi.parse().unwrap_or(0);
+                return val >= lo && val <= hi;
+            }
+            false
+        })
+    }
+
+    matches(fields[0], now.minute())
+        && matches(fields[1], now.hour())
+        && matches(fields[2], now.day())
+        && matches(fields[3], now.month())
+        && matches(fields[4], now.weekday().num_days_from_sunday())
+}
+
+fn schedule_dir() -> PathBuf {
+    let d = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        .join(".antfarm/agent-scheduled");
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+/// True if this agent already ran in the given `YYYY-MM-DD-HHmm` slot.
+fn schedule_is_locked(agent_id: &str, slot: &str) -> bool {
+    schedule_dir().join(format!("{agent_id}-{slot}.lock")).exists()
+}
+
+/// Create the lock file so re-checks within the same minute are no-ops.
+fn schedule_lock(agent_id: &str, slot: &str) {
+    let _ = std::fs::write(schedule_dir().join(format!("{agent_id}-{slot}.lock")), "");
+}
+
+// ── Pending scheduled-run drain (show results in Chat on next open) ───────────
+
+fn pending_runs_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        .join(".antfarm/scheduled-runs-pending.json")
+}
+
+fn push_pending_run(agent_id: &str, agent_name: &str, time: &str) {
+    let path = pending_runs_path();
+    let mut list: Vec<serde_json::Value> = path
+        .exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    list.push(serde_json::json!({ "agentId": agent_id, "agentName": agent_name, "time": time }));
+    let _ = std::fs::write(&path, serde_json::to_string(&list).unwrap_or_default());
+}
+
+/// Return and clear any scheduled runs that completed while the app was closed.
+#[tauri::command]
+pub fn drain_scheduled_runs() -> Vec<serde_json::Value> {
+    let path = pending_runs_path();
+    if !path.exists() { return vec![]; }
+    let entries: Vec<serde_json::Value> =
+        std::fs::read_to_string(&path).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    entries
+}
+
+/// Task text injected when an agent fires on its schedule.
+fn scheduled_task(agent: &Agent) -> String {
+    let date = Local::now().format("%Y-%m-%d").to_string();
+    match agent.id.as_str() {
+        "clerk" => format!(
+            "Scheduled morning run ({date}). \
+             Reconcile today's plan: read or create active/state/plan-{date}.json, \
+             carry forward unfinished items from yesterday, \
+             write today's recap to active/daily/{date}.md. \
+             Surface anything that needs Connor's attention in your response."
+        ),
+        _ => format!(
+            "Scheduled run ({date}). Check your queue and complete any pending work."
+        ),
+    }
+}
+
+/// Spawn a background thread that wakes at the top of each minute, checks every
+/// agent's `schedule` cron field, and fires `run_agent` for any match.
+/// Idempotent: a lock file per agent+minute slot prevents double-runs.
+pub fn start_agent_scheduler(app: AppHandle) {
+    std::thread::spawn(move || {
+        // Align to the start of the next minute so checks land on :00.
+        let secs = Local::now().second();
+        if secs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs((60 - secs) as u64));
+        }
+        loop {
+            let slot     = Local::now().format("%Y-%m-%d-%H%M").to_string();
+            let time_str = Local::now().format("%H:%M").to_string();
+
+            for agent in list_agents() {
+                let sched = match &agent.schedule {
+                    Some(s) if !s.trim().is_empty() => s.clone(),
+                    _ => continue,
+                };
+                if !cron_matches_now(&sched)              { continue; }
+                if schedule_is_locked(&agent.id, &slot)   { continue; }
+
+                schedule_lock(&agent.id, &slot);
+                push_pending_run(&agent.id, &agent.name, &time_str);
+
+                let task      = scheduled_task(&agent);
+                let agent_id  = agent.id.clone();
+                let app2      = app.clone();
+                std::thread::spawn(move || {
+                    let dispatch  = app2.state::<DispatchState>();
+                    let agent_run = app2.state::<AgentRunState>();
+                    let _ = run_agent(app2.clone(), dispatch, agent_run, agent_id, task, None, false);
+                });
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
 }
 
 // ── Networked permission helpers ──────────────────────────────────────────────

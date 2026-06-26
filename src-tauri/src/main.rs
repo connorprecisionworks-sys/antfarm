@@ -2387,6 +2387,8 @@ fn main() {
             harness::reconcile_orphans();
             // Start the read-only mobile status server on 127.0.0.1:8787 (non-blocking).
             mobile::start(app.handle().clone());
+            // Register per-agent cron schedules; fires in a background thread.
+            agents::start_agent_scheduler(app.handle().clone());
             // Resolve claude at startup; login shell picks up NVM/Homebrew/custom PATH.
             let path = dispatch::resolve_claude_path();
             *dispatch_claude.lock().unwrap() = path;
@@ -2478,6 +2480,7 @@ fn main() {
             agents::get_agent,
             agents::run_agent,
             agents::reset_agent_session,
+            agents::drain_scheduled_runs,
             agents::scaffold_networked_settings,
             daily::get_plan_state,
             daily::get_daily_context,

@@ -798,6 +798,23 @@ export function Chat() {
     invoke<PlanState>("get_plan_state")
       .then(setPlanState)
       .catch(() => {});
+
+    // Drain any scheduled runs that fired while Chat was closed.
+    invoke<Array<{ agentId: string; agentName: string; time: string }>>(
+      "drain_scheduled_runs"
+    ).then((runs) => {
+      if (runs.length === 0) return;
+      const injected: StreamEntry[] = runs.map((r) => ({
+        id:        `sched-${r.agentId}-${r.time.replace(":", "")}`,
+        runId:     "",
+        agentId:   r.agentId,
+        agentName: r.agentName,
+        text:      `Scheduled run at ${r.time} — plan reconciled, daily recap written.`,
+        status:    "done" as const,
+        time:      r.time,
+      }));
+      setStreamEntries((prev) => [...injected, ...prev]);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
