@@ -1,11 +1,22 @@
-import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
   Clock, FileText, GitMerge, Loader, Mic, Moon, Play, Send, Square, X, Zap,
 } from "lucide-react";
+import {
+  type StreamEntry,
+  type Msg,
+  getSnapshot,
+  subscribe as subscribeToChatStore,
+  setStreamEntries,
+  setMessages,
+  setRunningAgents,
+  setFannedIds,
+  setChattersOpen,
+  setDismissedBuilders,
+} from "../lib/chatStore";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -42,36 +53,6 @@ interface PlanState {
 }
 
 type Filter = "needs-you" | "all";
-
-// Placeholder (seeded) messages
-interface Msg {
-  id: string;
-  from: string;
-  fromRole: "orchestrator" | "subagent" | "chatter";
-  tier: "needs-you" | "fyi" | "chatter";
-  content: string;
-  action?: string;
-  time: string;
-  collapsed: boolean;
-}
-
-// Live stream entry from a real agent run
-interface StreamEntry {
-  id: string;          // stable local id
-  runId: string;       // "" until backend returns it
-  agentId: string;
-  agentName: string;
-  text: string;
-  status: "thinking" | "streaming" | "done" | "error" | "timeout" | "stopped";
-  time: string;
-  parentId?: string;   // local id of the orchestrator entry that spawned this
-  userMsg?: string;    // the message Connor sent that triggered this run
-  inputTokens?: number;
-  outputTokens?: number;
-  usagePct?: number;
-  activity?: string;   // last tool-use label ("searching the web", "writing files", …)
-  outputs?: string[];  // absolute paths of files written this run
-}
 
 // A parsed delegation task from Jack's ```delegate block
 interface DelegationTask {
@@ -224,8 +205,7 @@ function NeedsYouAction({
 
 // ── Builder done card ─────────────────────────────────────────────────────────
 
-function BuilderDoneCard({ onDismiss }: { onDismiss: () => void }) {
-  const navigate = useNavigate();
+function BuilderDoneCard({ agentId, onDismiss }: { agentId: string; onDismiss: () => void }) {
   return (
     <div className="mt-3 border border-zinc-700/50 rounded-lg bg-zinc-800/30 px-3 py-2.5">
       <div className="flex items-center gap-2 mb-2">
@@ -234,7 +214,7 @@ function BuilderDoneCard({ onDismiss }: { onDismiss: () => void }) {
       </div>
       <div className="flex gap-2">
         <button
-          onClick={() => navigate("/memory")}
+          onClick={() => invoke("open_agent_log", { agentId }).catch((err) => console.error("open_agent_log failed", err))}
           className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-zinc-700/60 text-zinc-300 hover:bg-zinc-700 border border-zinc-600/50 transition-colors"
         >
           <FileText size={11} />
@@ -435,7 +415,7 @@ function StreamBubble({
 
       {/* Builder done card */}
       {isBuilder && isDone && !isError && (
-        <BuilderDoneCard onDismiss={onDismissBuilder} />
+        <BuilderDoneCard agentId={entry.agentId} onDismiss={onDismissBuilder} />
       )}
     </div>
   );
@@ -785,14 +765,8 @@ function renderDraftHighlighted(text: string, agents: Agent[]) {
 export function Chat() {
   const [agents, setAgents]             = useState<Agent[]>([]);
   const [planState, setPlanState]       = useState<PlanState | null>(null);
-  const [messages, setMessages]         = useState<Msg[]>([]);
-  const [streamEntries, setStreamEntries] = useState<StreamEntry[]>([]);
-  const [runningAgents, setRunningAgents] = useState<Set<string>>(new Set());
-  /** Set of parent entry IDs whose delegation has been fanned out. */
-  const [fannedIds, setFannedIds]       = useState<Set<string>>(new Set());
-  /** Set of parent entry IDs whose chatter group is expanded. */
-  const [chattersOpen, setChattersOpen] = useState<Set<string>>(new Set());
-  const [, setDismissedBuilders] = useState<Set<string>>(new Set());
+  const { streamEntries, messages, runningAgents, fannedIds, chattersOpen } =
+    useSyncExternalStore(subscribeToChatStore, getSnapshot);
   const [filter, setFilter]             = useState<Filter>("needs-you");
   const [draft, setDraft]               = useState("");
   const [overnight, setOvernight]       = useState(false);
@@ -839,6 +813,32 @@ export function Chat() {
       setRecipientId(orch?.id ?? agents[0]?.id ?? null);
     }
   }, [agents]);
+
+  // Part B: on remount, fix any entries left "thinking"/"streaming" because the
+  // stream finished while Chat was unmounted and the listener was gone.
+  useEffect(() => {
+    const stale = getSnapshot().streamEntries.filter(
+      (e) => e.status === "thinking" || e.status === "streaming"
+    );
+    if (stale.length === 0) return;
+    const staleAgentIds = new Set(stale.map((e) => e.agentId));
+    setStreamEntries((prev) =>
+      prev.map((e) =>
+        e.status === "thinking" || e.status === "streaming"
+          ? {
+              ...e,
+              status: "stopped" as const,
+              text: e.text || "Run continued in the background — reopen the agent or resend to refresh.",
+            }
+          : e
+      )
+    );
+    setRunningAgents((prev) => {
+      const s = new Set(prev);
+      staleAgentIds.forEach((id) => s.delete(id));
+      return s;
+    });
+  }, []);
 
   // ── agent-stream event listener ──────────────────────────────────────────────
   useEffect(() => {

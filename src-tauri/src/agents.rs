@@ -875,6 +875,19 @@ pub fn open_path(path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub fn open_agent_log(agent_id: String) -> Result<(), String> {
+    if agent_id.is_empty() || agent_id.contains('/') || agent_id.contains("..") {
+        return Err("invalid agent_id".into());
+    }
+    let path = vault_root().join("agents").join(&agent_id).join("log.md");
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ── Networked settings scaffold ───────────────────────────────────────────────
 
 /// Write ~/.claude/settings.networked.json and mirror to the vault.
