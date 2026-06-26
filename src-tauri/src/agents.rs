@@ -13,7 +13,7 @@ use chrono::{Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use crate::dispatch::DispatchState;
 
 const COMPACT_THRESHOLD_PCT: f32 = 50.0;
 const MODEL_CONTEXT_WINDOW: u32  = 200_000;
-const SILENCE_SECS: u64 = 120;
+const SILENCE_SECS: u64 = 300;
 const WALL_SECS: u64    = 1800;
 
 // ── Path ──────────────────────────────────────────────────────────────────────
@@ -208,6 +208,29 @@ fn tool_input_summary(input: &serde_json::Value) -> String {
     }
     let s = serde_json::to_string(input).unwrap_or_default();
     s.chars().take(120).collect()
+}
+
+// ── Byte-level activity wrapper ───────────────────────────────────────────────
+//
+// Wraps any Read source and bumps last_activity on every non-empty read(), so the
+// silence watchdog sees liveness from raw byte activity — not only after a complete
+// JSON line has been assembled. While stream-json emits whole lines, the model may
+// take well over 120s to produce its next event; this ensures any partial output
+// (e.g. a large tool_result arriving in chunks) also resets the timer.
+
+struct ActivityReader<R: Read> {
+    inner:    R,
+    activity: Arc<Mutex<std::time::Instant>>,
+}
+
+impl<R: Read> Read for ActivityReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            *self.activity.lock().unwrap() = std::time::Instant::now();
+        }
+        Ok(n)
+    }
 }
 
 // ── Schedule helpers ──────────────────────────────────────────────────────────
@@ -882,7 +905,9 @@ pub fn run_agent(
         }
 
         std::thread::spawn(move || {
-            let reader      = BufReader::new(stdout);
+            // ActivityReader resets the silence timer on any raw bytes, so partial
+            // output mid-line (or any chunk) counts as liveness — not just complete events.
+            let reader      = BufReader::new(ActivityReader { inner: stdout, activity: la_reader });
             let mut last_text   = String::new();
             let mut result_text = String::new();
             let mut captured_sid: Option<String> = None;
@@ -895,7 +920,6 @@ pub fn run_agent(
 
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() { continue; }
-                *la_reader.lock().unwrap() = std::time::Instant::now();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
 
                 // Per-line trace timestamps (shared by all events in this stream line).
@@ -1100,7 +1124,7 @@ pub fn run_agent(
                 let (kind, msg): (&str, String) = match reason {
                     Some("timeout") => (
                         "timeout",
-                        "Timed out after 120s of silence (or 30m wall limit).".to_string(),
+                        "Timed out after 300s of silence (or 30m wall limit).".to_string(),
                     ),
                     Some("stopped") => (
                         "stopped",
