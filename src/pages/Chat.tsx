@@ -64,6 +64,7 @@ type Filter = "needs-you" | "all";
 interface DelegationTask {
   agentId: string;
   task: string;
+  after?: string; // agentId this task must wait for before firing
 }
 
 
@@ -75,6 +76,7 @@ const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder"]);
 function parseDelegations(text: string): DelegationTask[] | null {
   const match = text.match(/```delegate\n([\s\S]*?)```/);
   if (!match) return null;
+  const afterRe = /\(after:\s*([a-z]+)\)\s*$/i;
   const tasks = match[1]
     .split("\n")
     .map((line) => line.trim())
@@ -83,9 +85,19 @@ function parseDelegations(text: string): DelegationTask[] | null {
       const idx = line.indexOf(":");
       if (idx === -1) return null;
       const agentId = line.slice(0, idx).trim().toLowerCase();
-      const task    = line.slice(idx + 1).trim();
-      if (!agentId || !task || !KNOWN_AGENT_IDS.has(agentId)) return null;
-      return { agentId, task } as DelegationTask;
+      let rawTask   = line.slice(idx + 1).trim();
+      if (!agentId || !rawTask || !KNOWN_AGENT_IDS.has(agentId)) return null;
+
+      // Extract and strip the (after: <id>) marker if present
+      let after: string | undefined;
+      const afterMatch = rawTask.match(afterRe);
+      if (afterMatch) {
+        rawTask = rawTask.replace(afterRe, "").trim();
+        const dep = afterMatch[1].toLowerCase();
+        if (KNOWN_AGENT_IDS.has(dep)) after = dep;
+      }
+
+      return { agentId, task: rawTask, after } as DelegationTask;
     })
     .filter(Boolean) as DelegationTask[];
   return tasks.length > 0 ? tasks : null;
@@ -154,7 +166,12 @@ function DelegationCard({
             <span className="text-zinc-500 shrink-0 font-medium w-14 truncate">
               {agentName(t.agentId)}
             </span>
-            <span className="text-zinc-400 leading-relaxed">{t.task}</span>
+            <span className="text-zinc-400 leading-relaxed">
+              {t.task}
+              {t.after && (
+                <span className="ml-1.5 text-zinc-600">· after {agentName(t.after)}</span>
+              )}
+            </span>
           </div>
         ))}
       </div>
@@ -869,6 +886,19 @@ export function Chat() {
   const audioChunksRef      = useRef<Blob[]>([]);
   const bottomRef           = useRef<HTMLDivElement>(null);
   const didInitRecipient    = useRef(false);
+  // Stable ref to agents list — lets the stream listener resolve names without stale closure.
+  const agentsRef = useRef<Agent[]>([]);
+  // Pending dependent tasks waiting for their `after` agent to finish.
+  const pendingDepsRef = useRef<Array<{
+    childId: string;
+    agentId: string;
+    baseTask: string;
+    after: string;
+    parentEntryId: string;
+  }>>([]);
+
+  // Keep agentsRef in sync so the stream listener can resolve names without a stale closure.
+  useEffect(() => { agentsRef.current = agents; }, [agents]);
 
   // ── Load agents + plan state ─────────────────────────────────────────────────
   useEffect(() => {
@@ -978,6 +1008,53 @@ export function Chat() {
         // Clerk may have written a new plan — refresh plan state.
         if (agentId === "clerk" && kind === "done") {
           invoke<PlanState>("get_plan_state").then(setPlanState).catch(() => {});
+        }
+
+        // Fire any pending dependent tasks that were waiting for this agent.
+        const ready = pendingDepsRef.current.filter((d) => d.after === agentId);
+        if (ready.length > 0) {
+          pendingDepsRef.current = pendingDepsRef.current.filter((d) => d.after !== agentId);
+          const resolvedName = (id: string) =>
+            agentsRef.current.find((a) => a.id === id)?.name ?? id;
+
+          for (const dep of ready) {
+            const upstreamNote =
+              kind === "done"
+                ? `\n\nContext from ${resolvedName(dep.after)} (just completed):\n${text}`
+                : `\n\n[Note: ${resolvedName(dep.after)} did not finish cleanly (${kind}). Proceed with what you know.]`;
+            const depTask = `${dep.baseTask}${upstreamNote}`;
+
+            invoke<string>("run_agent", {
+              agentId: dep.agentId,
+              task: depTask,
+              parentRunId: null,
+              resumeSession: false,
+              repoPath: null,
+            })
+              .then((runId) => {
+                setStreamEntries((prev) =>
+                  prev.map((e) =>
+                    e.id === dep.childId
+                      ? { ...e, runId, status: "streaming" as const, activity: undefined }
+                      : e
+                  )
+                );
+              })
+              .catch((err) => {
+                setStreamEntries((prev) =>
+                  prev.map((e) =>
+                    e.id === dep.childId
+                      ? { ...e, text: `Failed: ${err}`, status: "error" as const, activity: undefined }
+                      : e
+                  )
+                );
+                setRunningAgents((prev) => {
+                  const s = new Set(prev);
+                  s.delete(dep.agentId);
+                  return s;
+                });
+              });
+          }
         }
       }
     }).then((fn) => {
@@ -1128,31 +1205,47 @@ export function Chat() {
   // ── Fan-out handler ───────────────────────────────────────────────────────────
   async function handleFanout(parentEntryId: string, tasks: DelegationTask[]) {
     setFannedIds((prev) => new Set([...prev, parentEntryId]));
-    // Open the chatter group immediately
     setChattersOpen((prev) => new Set([...prev, parentEntryId]));
 
-    // Create thinking placeholders for all subagents
+    const agentName = (id: string) =>
+      agents.find((a) => a.id === id)?.name ?? id;
+
+    // Create placeholders for ALL tasks upfront
     const childDefs = tasks.map((t) => ({
-      id: `child-${t.agentId}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      id:        `child-${t.agentId}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       runId:     "",
       agentId:   t.agentId,
-      agentName: agents.find((a) => a.id === t.agentId)?.name ?? t.agentId,
+      agentName: agentName(t.agentId),
       text:      "",
       status:    "thinking" as const,
+      activity:  t.after ? `waiting for ${agentName(t.after)}` : undefined,
       time:      nowTime(),
       parentId:  parentEntryId,
-      task:      t.task,
     }));
 
     setStreamEntries((prev) => [...prev, ...childDefs]);
     setRunningAgents((prev) => new Set([...prev, ...tasks.map((t) => t.agentId)]));
 
-    // Fire all run_agents (concurrent, no await chain)
-    for (const child of childDefs) {
-      const task = tasks.find((t) => t.agentId === child.agentId)?.task ?? "";
+    // For each task: fire immediately if independent, queue if it has a dep.
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i];
+      const child = childDefs[i];
+
+      if (t.after) {
+        // Queue — will be fired in the stream listener when `after` completes.
+        pendingDepsRef.current.push({
+          childId:       child.id,
+          agentId:       t.agentId,
+          baseTask:      t.task,
+          after:         t.after,
+          parentEntryId,
+        });
+        continue;
+      }
+
       invoke<string>("run_agent", {
-        agentId: child.agentId,
-        task,
+        agentId: t.agentId,
+        task: t.task,
         parentRunId: null,
         resumeSession: false,
         repoPath: null,
@@ -1172,7 +1265,7 @@ export function Chat() {
           );
           setRunningAgents((prev) => {
             const s = new Set(prev);
-            s.delete(child.agentId);
+            s.delete(t.agentId);
             return s;
           });
         });
