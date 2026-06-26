@@ -4,8 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
-  FileText, GitMerge, Loader, Mic, Moon, Play, Send, X, Zap,
+  Clock, FileText, GitMerge, Loader, Mic, Moon, Play, Send, Square, X, Zap,
 } from "lucide-react";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -22,12 +23,13 @@ interface Agent {
 interface AgentStreamPayload {
   runId: string;
   agentId: string;
-  kind: string;   // "start" | "text" | "done" | "error"
+  kind: string;   // "start" | "text" | "activity" | "done" | "error" | "timeout" | "stopped"
   text: string;
   parentRunId: string | null;
   inputTokens?: number;
   outputTokens?: number;
   usagePct?: number;
+  outputs?: string[];
 }
 
 interface PlanState {
@@ -61,13 +63,15 @@ interface StreamEntry {
   agentId: string;
   agentName: string;
   text: string;
-  status: "thinking" | "streaming" | "done" | "error";
+  status: "thinking" | "streaming" | "done" | "error" | "timeout" | "stopped";
   time: string;
   parentId?: string;   // local id of the orchestrator entry that spawned this
   userMsg?: string;    // the message Connor sent that triggered this run
   inputTokens?: number;
   outputTokens?: number;
   usagePct?: number;
+  activity?: string;   // last tool-use label ("searching the web", "writing files", …)
+  outputs?: string[];  // absolute paths of files written this run
 }
 
 // A parsed delegation task from Jack's ```delegate block
@@ -321,9 +325,11 @@ function StreamBubble({
   onReject: () => void;
   onDismissBuilder: () => void;
 }) {
-  const isLive   = entry.status === "thinking" || entry.status === "streaming";
-  const isError  = entry.status === "error";
-  const isDone   = entry.status === "done";
+  const isLive    = entry.status === "thinking" || entry.status === "streaming";
+  const isError   = entry.status === "error";
+  const isDone    = entry.status === "done";
+  const isTimeout = entry.status === "timeout";
+  const isStopped = entry.status === "stopped";
 
   const delegations = isDone ? parseDelegations(entry.text) : null;
   const needsYou    = isDone ? parseNeedsYou(entry.text)    : null;
@@ -338,6 +344,10 @@ function StreamBubble({
       className={`border rounded-xl p-4 transition-colors ${
         isError
           ? "border-red-800/50 border-l-[3px] border-l-red-500/60 bg-zinc-900/70"
+          : isTimeout
+          ? "border-amber-800/40 border-l-[3px] border-l-amber-500/50 bg-zinc-900/70"
+          : isStopped
+          ? "border-zinc-800/40 border-l-[3px] border-l-zinc-600/40 bg-zinc-900/50"
           : isLive
           ? "border-zinc-700/60 border-l-[3px] border-l-blue-500/60 bg-zinc-900/70"
           : isChild
@@ -351,16 +361,40 @@ function StreamBubble({
           <Loader size={12} className="text-blue-400 shrink-0 animate-spin" />
         ) : isError ? (
           <Zap size={12} className="text-red-400 shrink-0" />
+        ) : isTimeout ? (
+          <Clock size={12} className="text-amber-400 shrink-0" />
+        ) : isStopped ? (
+          <Square size={12} className="text-zinc-500 shrink-0" />
         ) : (
           <Bot size={12} className="text-zinc-500 shrink-0" />
         )}
         <span className="text-xs font-medium text-zinc-200">{entry.agentName}</span>
         {isLive && (
           <span className="text-[10px] text-blue-400/70 bg-blue-500/10 px-1.5 py-0.5 rounded-full">
-            {!entry.text ? "thinking…" : "responding…"}
+            {entry.activity ?? (entry.text ? "responding…" : "thinking…")}
+          </span>
+        )}
+        {isTimeout && (
+          <span className="text-[10px] text-amber-400/70 bg-amber-500/10 px-1.5 py-0.5 rounded-full">
+            Timed out
+          </span>
+        )}
+        {isStopped && (
+          <span className="text-[10px] text-zinc-500 bg-zinc-800/60 px-1.5 py-0.5 rounded-full">
+            Stopped
           </span>
         )}
         <span className="ml-auto text-[11px] text-zinc-500">{entry.time}</span>
+        {isLive && (
+          <button
+            disabled={entry.runId === ""}
+            onClick={() => invoke("stop_agent", { runId: entry.runId })}
+            className="p-1 rounded text-zinc-600 hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            title="Stop this run"
+          >
+            <Square size={11} />
+          </button>
+        )}
       </div>
 
       {/* Body */}
@@ -371,12 +405,37 @@ function StreamBubble({
           <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce [animation-delay:300ms]" />
         </div>
       ) : (
-        <p className={`text-sm leading-relaxed whitespace-pre-wrap ${isError ? "text-red-300" : "text-zinc-100"}`}>
+        <p className={`text-sm leading-relaxed whitespace-pre-wrap ${
+          isError   ? "text-red-300"      :
+          isTimeout ? "text-amber-300/70" :
+          isStopped ? "text-zinc-500"     :
+          "text-zinc-100"
+        }`}>
           {displayText}
           {isLive && displayText && (
             <span className="inline-block w-0.5 h-4 bg-blue-400 ml-0.5 align-text-bottom animate-pulse" />
           )}
         </p>
+      )}
+
+      {/* Output file chips */}
+      {(entry.outputs?.length ?? 0) > 0 && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {entry.outputs!.map((path) => {
+            const basename = path.split("/").pop() ?? path;
+            return (
+              <button
+                key={path}
+                onClick={() => shellOpen(path)}
+                className="flex items-center gap-1 text-[10px] text-zinc-500 bg-zinc-800/60 hover:bg-zinc-700/60 border border-zinc-700/40 hover:border-zinc-600/50 px-2 py-0.5 rounded-full transition-colors"
+                title={path}
+              >
+                <FileText size={9} className="shrink-0" />
+                {basename}
+              </button>
+            );
+          })}
+        </div>
       )}
 
       {/* Delegation card */}
@@ -829,7 +888,7 @@ export function Chat() {
     let unlisten: (() => void) | null = null;
 
     listen<AgentStreamPayload>("agent-stream", (event) => {
-      const { runId, agentId, kind, text, inputTokens = 0, outputTokens = 0, usagePct = 0 } = event.payload;
+      const { runId, agentId, kind, text, inputTokens = 0, outputTokens = 0, usagePct = 0, outputs = [] } = event.payload;
       if (kind === "start") return;
 
       setStreamEntries((prev) =>
@@ -841,14 +900,17 @@ export function Chat() {
               e.agentId === agentId &&
               (e.status === "thinking" || e.status === "streaming"));
           if (!hit) return e;
-          if (kind === "text")  return { ...e, text, status: "streaming" };
-          if (kind === "done")  return { ...e, text: text || e.text, status: "done", inputTokens, outputTokens, usagePct };
-          if (kind === "error") return { ...e, text: text || e.text, status: "error" };
+          if (kind === "text")     return { ...e, text, status: "streaming" as const };
+          if (kind === "activity") return { ...e, activity: text, status: "streaming" as const };
+          if (kind === "done")     return { ...e, text: text || e.text, status: "done"    as const, inputTokens, outputTokens, usagePct, outputs };
+          if (kind === "error")    return { ...e, text: text || e.text, status: "error"   as const, outputs };
+          if (kind === "timeout")  return { ...e, text: text || e.text, status: "timeout" as const };
+          if (kind === "stopped")  return { ...e, text: text || e.text, status: "stopped" as const };
           return e;
         })
       );
 
-      if (kind === "done" || kind === "error") {
+      if (kind === "done" || kind === "error" || kind === "timeout" || kind === "stopped") {
         setRunningAgents((prev) => {
           const s = new Set(prev);
           s.delete(agentId);
