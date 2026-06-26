@@ -779,6 +779,22 @@ pub fn run_agent(
 
                     append_agent_log(&vault_clone, &aid, &rid, &task_clone, &result_text, is_error);
 
+                    // Auto-render active/reports/*.md outputs → PDF.
+                    // Wrapped in catch so a failed render never breaks the run.
+                    if !is_error {
+                        let report_paths: Vec<String> = outputs.iter()
+                            .filter(|p| crate::pdf::is_active_report(p))
+                            .cloned()
+                            .collect();
+                        for md_path in report_paths {
+                            if let Ok(pdf_path) = crate::pdf::render_pdf_from_md(&md_path) {
+                                if !outputs.contains(&pdf_path) {
+                                    outputs.push(pdf_path);
+                                }
+                            }
+                        }
+                    }
+
                     app2.emit("agent-stream", AgentStreamEvent {
                         run_id:        rid.clone(),
                         agent_id:      aid.clone(),

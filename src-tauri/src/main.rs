@@ -8,6 +8,7 @@ mod harness;
 mod memory;
 mod mobile;
 mod morning;
+mod pdf;
 mod planning;
 mod pty;
 
@@ -2489,6 +2490,7 @@ fn main() {
             daily::get_daily_context,
             daily::write_daily_recap,
             daily::write_plan,
+            pdf::render_report_pdf,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

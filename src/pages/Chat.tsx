@@ -358,16 +358,31 @@ function StreamBubble({
         <div className="mt-2.5 flex flex-wrap gap-1.5">
           {entry.outputs!.map((path) => {
             const basename = path.split("/").pop() ?? path;
+            const isMd = path.endsWith(".md");
             return (
-              <button
-                key={path}
-                onClick={() => invoke("open_path", { path }).catch((err) => console.error("open_path failed", err))}
-                className="flex items-center gap-1 text-[10px] text-zinc-500 bg-zinc-800/60 hover:bg-zinc-700/60 border border-zinc-700/40 hover:border-zinc-600/50 px-2 py-0.5 rounded-full transition-colors"
-                title={path}
-              >
-                <FileText size={9} className="shrink-0" />
-                {basename}
-              </button>
+              <span key={path} className="flex items-center gap-1">
+                <button
+                  onClick={() => invoke("open_path", { path }).catch((err) => console.error("open_path failed", err))}
+                  className="flex items-center gap-1 text-[10px] text-zinc-500 bg-zinc-800/60 hover:bg-zinc-700/60 border border-zinc-700/40 hover:border-zinc-600/50 px-2 py-0.5 rounded-full transition-colors"
+                  title={path}
+                >
+                  <FileText size={9} className="shrink-0" />
+                  {basename}
+                </button>
+                {isMd && (
+                  <button
+                    onClick={() =>
+                      invoke<string>("render_report_pdf", { mdPath: path })
+                        .then((pdf) => invoke("open_path", { path: pdf }))
+                        .catch((err) => console.error("render_report_pdf failed", err))
+                    }
+                    className="text-[10px] text-blue-400/70 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 px-2 py-0.5 rounded-full transition-colors"
+                    title="Export as branded PDF"
+                  >
+                    Export PDF
+                  </button>
+                )}
+              </span>
             );
           })}
         </div>
