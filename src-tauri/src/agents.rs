@@ -421,6 +421,48 @@ fn connector_prompt_section(connectors: &[String]) -> String {
     parts.join("\n\n")
 }
 
+// ── Crew roster ───────────────────────────────────────────────────────────────
+
+/// Build a compact, factual crew roster from agent.json files.
+/// Injected only into the orchestrator's cold-start prompt so Jack stops
+/// inventing crew status from stale memory.
+fn crew_roster() -> String {
+    let agents = list_agents();
+    if agents.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "\n\n## Your crew right now (capabilities + status, injected by app — trust this over memory)"
+    );
+
+    for agent in &agents {
+        let capability = if !agent.connectors.is_empty() {
+            let parts: Vec<String> = agent.connectors.iter().map(|c| match c.as_str() {
+                "web"      => "web research (WebSearch + WebFetch)".to_string(),
+                "gmail"    => "email / Gmail (read, triage, draft; sending gated)".to_string(),
+                "calendar" => "calendar (read)".to_string(),
+                other      => other.to_string(),
+            }).collect();
+            parts.join(" + ")
+        } else {
+            match agent.profile.as_str() {
+                "offline-code" => "offline code (build harness)".to_string(),
+                "networked"    => "vault read/write only".to_string(),
+                other          => other.to_string(),
+            }
+        };
+
+        let you = if agent.role == "orchestrator" { " (you)" } else { "" };
+        out.push_str(&format!(
+            "\n- {} ({}) — {}; status {}{you}.",
+            agent.name, agent.id, capability, agent.status
+        ));
+    }
+
+    out
+}
+
 // ── Registry commands ─────────────────────────────────────────────────────────
 
 /// All agents: orchestrator first, then alphabetically by name.
@@ -553,6 +595,13 @@ pub fn run_agent(
         String::new()
     };
 
+    // ── Crew roster (orchestrator only — factual ground truth so Jack never fabricates) ──
+    let crew_section = if agent.role == "orchestrator" {
+        crew_roster()
+    } else {
+        String::new()
+    };
+
     // ── Networked profile: connector tool allowlist + prompt guidance ─────────
     let is_networked = agent.profile == "networked";
     let connector_prompt = if is_networked {
@@ -565,10 +614,10 @@ pub fn run_agent(
     let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
     let full_prompt = match base_prompt {
         Some(sys) => format!(
-            "{sys}{write_scope}{daily_preamble}{connector_prompt}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
+            "{sys}{write_scope}{daily_preamble}{crew_section}{connector_prompt}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
         ),
         None => format!(
-            "Current date and time: {now}{write_scope}{daily_preamble}{connector_prompt}{role_note}\n\nUser: {task}"
+            "Current date and time: {now}{write_scope}{daily_preamble}{crew_section}{connector_prompt}{role_note}\n\nUser: {task}"
         ),
     };
 
