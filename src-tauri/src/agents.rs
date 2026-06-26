@@ -754,13 +754,14 @@ pub fn run_agent(
     let deny = build_deny_list(&agent_id, &agent.profile, &agent.connectors);
     if !deny.is_empty() { cmd.args(["--disallowedTools", &deny]); }
 
-    // Networked agents: allowed list + settings file (applied every turn).
+    // Networked agents: allowed list only. Do NOT load settings.networked.json via
+    // --settings — its explicit permissions.allow list creates a secondary permission
+    // gate that overrides --permission-mode dontAsk and causes headless Write calls
+    // to hang silently (stdin is /dev/null; the gate waits for input that never arrives).
+    // Security is fully covered by --disallowedTools above, which is authoritative.
     if is_networked {
         let allowed = networked_allowed_tools(&agent.connectors);
         if !allowed.is_empty() { cmd.args(["--allowedTools", &allowed]); }
-        let settings_path = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".claude").join("settings.networked.json");
-        if settings_path.exists() { cmd.arg("--settings").arg(&settings_path); }
     }
 
     let mut child = cmd
@@ -1004,9 +1005,10 @@ pub fn run_agent(
                         },
                     ),
                 };
-                if is_abnormal {
-                    append_agent_log(&vault_clone, &aid, &rid, &task_clone, &msg, true);
-                }
+                // Log every terminal state (timeout, stopped, or clean-exit-no-result).
+                // Previously only abnormal states were logged, so a process that exited
+                // cleanly without a result event left no record in the agent's log.
+                append_agent_log(&vault_clone, &aid, &rid, &task_clone, &msg, is_abnormal);
                 app2.emit("agent-stream", AgentStreamEvent {
                     run_id:        rid,
                     agent_id:      aid,
