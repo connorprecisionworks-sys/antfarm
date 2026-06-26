@@ -23,6 +23,8 @@ use crate::dispatch::DispatchState;
 
 const COMPACT_THRESHOLD_PCT: f32 = 50.0;
 const MODEL_CONTEXT_WINDOW: u32  = 200_000;
+const SILENCE_SECS: u64 = 120;
+const WALL_SECS: u64    = 1800;
 
 // ── Path ──────────────────────────────────────────────────────────────────────
 
@@ -36,12 +38,14 @@ fn vault_root() -> PathBuf {
 
 pub struct AgentRunState {
     pub children: Arc<Mutex<HashMap<String, Child>>>,
+    pub reasons:  Arc<Mutex<HashMap<String, &'static str>>>,
 }
 
 impl Default for AgentRunState {
     fn default() -> Self {
         Self {
             children: Arc::new(Mutex::new(HashMap::new())),
+            reasons:  Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -626,16 +630,47 @@ pub fn run_agent(
         usage_pct:     0.0,
     }).ok();
 
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+    let started       = std::time::Instant::now();
+
     // ── stdout reader thread ──────────────────────────────────────────────────
     {
-        let app2         = app.clone();
-        let rid          = run_id.clone();
-        let aid          = agent_id.clone();
-        let task_clone   = task.clone();
-        let vault_clone  = vault.clone();
-        let children_arc = agent_run.children.clone();
+        let app2            = app.clone();
+        let rid             = run_id.clone();
+        let aid             = agent_id.clone();
+        let task_clone      = task.clone();
+        let vault_clone     = vault.clone();
+        let children_arc    = agent_run.children.clone();
+        let reasons_arc     = agent_run.reasons.clone();
+        let la_reader       = last_activity.clone();
         let is_resuming_clone     = is_resuming;
         let resume_session_clone  = resume_session;
+
+        // Watchdog: kills the child if silent > SILENCE_SECS or wall time > WALL_SECS.
+        // Does NOT emit events — the reader's safety-net branch emits the terminal event.
+        {
+            let children_wd = agent_run.children.clone();
+            let reasons_wd  = agent_run.reasons.clone();
+            let la_wd       = last_activity.clone();
+            let rid_wd      = run_id.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if children_wd.lock().unwrap().get(&rid_wd).is_none() { break; }
+                    let idle    = la_wd.lock().unwrap().elapsed();
+                    let elapsed = started.elapsed();
+                    if idle    > std::time::Duration::from_secs(SILENCE_SECS)
+                        || elapsed > std::time::Duration::from_secs(WALL_SECS)
+                    {
+                        reasons_wd.lock().unwrap().insert(rid_wd.clone(), "timeout");
+                        if let Some(child) = children_wd.lock().unwrap().get_mut(&rid_wd) {
+                            let _ = child.kill();
+                        }
+                        break;
+                    }
+                }
+            });
+        }
 
         std::thread::spawn(move || {
             let reader      = BufReader::new(stdout);
@@ -647,6 +682,7 @@ pub fn run_agent(
 
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() { continue; }
+                *la_reader.lock().unwrap() = std::time::Instant::now();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
 
                 // Capture session_id from any stream line (appears in init line)
@@ -725,17 +761,37 @@ pub fn run_agent(
             // Reap child.
             children_arc.lock().unwrap().remove(&rid).and_then(|mut c| c.wait().ok());
 
-            // Safety net: emit done if we never got a `result` event.
+            // Safety net: emit terminal event if we never got a `result` event.
+            // Reads the reason flag set by the watchdog or stop_agent so there is
+            // exactly one terminal event per run.
             if result_text.is_empty() {
-                let msg = if last_text.is_empty() {
-                    "Agent run ended without output.".into()
-                } else {
-                    last_text
+                let reason      = reasons_arc.lock().unwrap().remove(&rid);
+                let is_abnormal = reason.is_some();
+                let (kind, msg): (&str, String) = match reason {
+                    Some("timeout") => (
+                        "timeout",
+                        "Timed out after 120s of silence (or 30m wall limit).".to_string(),
+                    ),
+                    Some("stopped") => (
+                        "stopped",
+                        "Stopped by Connor.".to_string(),
+                    ),
+                    _ => (
+                        "done",
+                        if last_text.is_empty() {
+                            "Agent run ended without output.".to_string()
+                        } else {
+                            last_text
+                        },
+                    ),
                 };
+                if is_abnormal {
+                    append_agent_log(&vault_clone, &aid, &rid, &task_clone, &msg, true);
+                }
                 app2.emit("agent-stream", AgentStreamEvent {
                     run_id:        rid,
                     agent_id:      aid,
-                    kind:          "done".into(),
+                    kind:          kind.into(),
                     text:          msg,
                     parent_run_id: prid,
                     input_tokens:  0,
@@ -747,6 +803,17 @@ pub fn run_agent(
     }
 
     Ok(run_id)
+}
+
+// ── stop_agent ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn stop_agent(agent_run: State<'_, AgentRunState>, run_id: String) -> Result<(), String> {
+    agent_run.reasons.lock().unwrap().insert(run_id.clone(), "stopped");
+    if let Some(child) = agent_run.children.lock().unwrap().get_mut(&run_id) {
+        let _ = child.kill();
+    }
+    Ok(())
 }
 
 // ── Networked settings scaffold ───────────────────────────────────────────────
