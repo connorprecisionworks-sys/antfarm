@@ -356,7 +356,9 @@ if printf '%s' "$CMD_NORM" | grep -qiE '(^|[;&|(` ])prisma +(migrate|db +push)( 
 fi
 
 # rm -rf and common destructive variants: -rf, -fr, -Rf, -rfv, --recursive --force, etc.
-if printf '%s' "$CMD_NORM" | grep -qE 'rm +-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|rm +-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|rm +.*--recursive.*--force|rm +.*--force.*--recursive'; then
+# Anchored to a command token boundary so paths/filenames containing "rm" (e.g. antfarm, rm-cache)
+# never false-positive. The token separator class [;&|(` ] matches the same separators used above.
+if printf '%s' "$CMD_NORM" | grep -qE '(^|[;&|(` ])rm +-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|(^|[;&|(` ])rm +-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|(^|[;&|(` ])rm +.*--recursive.*--force|(^|[;&|(` ])rm +.*--force.*--recursive'; then
   block "'rm -rf' or equivalent destructive deletion is not permitted — surface for Connor's approval via NEEDS YOU"
 fi
 
