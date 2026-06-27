@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dispatch::DispatchState;
@@ -806,26 +806,23 @@ pub fn get_run_trace(run_id: String) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// ── run_agent ─────────────────────────────────────────────────────────────────
+// ── spawn_agent_run ───────────────────────────────────────────────────────────
 
-/// Spawn a claude -p agent run. Reads agent.json + prompt.md, injects write-scope
-/// and (for subagents) NEEDS YOU instructions, streams "agent-stream" events,
-/// appends to log.md on completion.
-///
-/// `parent_run_id` — set by the orchestrator fan-out so the frontend can group
-/// subagent chatter under the parent turn.
-#[tauri::command]
-pub fn run_agent(
+/// Core spawn helper. Returns (run_id, result_rx) where result_rx resolves to
+/// the run's final text once it terminates. The Tauri command wrapper drops the
+/// receiver (fire-and-forget); the pod controller keeps it to await the result.
+pub fn spawn_agent_run(
     app: AppHandle,
-    dispatch: State<'_, DispatchState>,
-    agent_run: State<'_, AgentRunState>,
+    claude_path: String,
+    agent_run_children: Arc<Mutex<HashMap<String, Child>>>,
+    agent_run_reasons: Arc<Mutex<HashMap<String, &'static str>>>,
     agent_id: String,
     task: String,
     parent_run_id: Option<String>,
     resume_session: bool,
     repo_path: Option<String>,
     builder_write: Option<bool>,
-) -> Result<String, String> {
+) -> Result<(String, mpsc::Receiver<String>), String> {
     let vault = vault_root();
 
     // ── Load agent definition ──────────────────────────────────────────────────
@@ -944,7 +941,7 @@ pub fn run_agent(
     let is_resuming  = existing_sid.is_some();
 
     // ── Spawn child ───────────────────────────────────────────────────────────
-    let claude    = dispatch.claude_path.lock().unwrap().clone();
+    let claude    = claude_path;
     let vault_str = vault.to_string_lossy().into_owned();
 
     // Write-mode Builder uses bypassPermissions so the Bash hook is the sole Bash gate.
@@ -1030,7 +1027,7 @@ pub fn run_agent(
 
     let run_id = new_agent_run_id(&agent_id);
     let stdout = child.stdout.take().ok_or("no stdout handle")?;
-    agent_run.children.lock().unwrap().insert(run_id.clone(), child);
+    agent_run_children.lock().unwrap().insert(run_id.clone(), child);
 
     let prid = parent_run_id.clone();
 
@@ -1051,14 +1048,15 @@ pub fn run_agent(
     let started       = std::time::Instant::now();
 
     // ── stdout reader thread ──────────────────────────────────────────────────
+    let (result_tx, result_rx) = mpsc::sync_channel::<String>(1);
     {
         let app2            = app.clone();
         let rid             = run_id.clone();
         let aid             = agent_id.clone();
         let task_clone      = task.clone();
         let vault_clone     = vault.clone();
-        let children_arc    = agent_run.children.clone();
-        let reasons_arc     = agent_run.reasons.clone();
+        let children_arc    = agent_run_children.clone();
+        let reasons_arc     = agent_run_reasons.clone();
         let la_reader       = last_activity.clone();
         let is_resuming_clone     = is_resuming;
         let resume_session_clone  = resume_session;
@@ -1066,8 +1064,8 @@ pub fn run_agent(
         // Watchdog: kills the child if silent > SILENCE_SECS or wall time > WALL_SECS.
         // Does NOT emit events — the reader's safety-net branch emits the terminal event.
         {
-            let children_wd = agent_run.children.clone();
-            let reasons_wd  = agent_run.reasons.clone();
+            let children_wd = agent_run_children.clone();
+            let reasons_wd  = agent_run_reasons.clone();
             let la_wd       = last_activity.clone();
             let rid_wd      = run_id.clone();
             std::thread::spawn(move || {
@@ -1095,6 +1093,7 @@ pub fn run_agent(
             let reader      = BufReader::new(ActivityReader { inner: stdout, activity: la_reader });
             let mut last_text   = String::new();
             let mut result_text = String::new();
+            let mut final_text  = String::new();
             let mut captured_sid: Option<String> = None;
             let mut input_tokens:  u32 = 0;
             let mut output_tokens: u32 = 0;
@@ -1227,6 +1226,7 @@ pub fn run_agent(
                     result_text = v.get("result").and_then(|r| r.as_str())
                         .unwrap_or(&last_text)
                         .to_string();
+                    final_text = result_text.clone();
 
                     input_tokens  = v.pointer("/usage/input_tokens")
                         .and_then(|t| t.as_u64()).unwrap_or(0) as u32;
@@ -1349,6 +1349,7 @@ pub fn run_agent(
                     }));
                 }
 
+                final_text = msg.clone();
                 app2.emit("agent-stream", AgentStreamEvent {
                     run_id:        rid,
                     agent_id:      aid,
@@ -1361,9 +1362,40 @@ pub fn run_agent(
                     outputs:       vec![],
                 }).ok();
             }
+            let _ = result_tx.send(final_text);
         });
     }
 
+    Ok((run_id, result_rx))
+}
+
+// ── run_agent (Tauri command — fire-and-forget wrapper) ───────────────────────
+
+#[tauri::command]
+pub fn run_agent(
+    app: AppHandle,
+    dispatch: State<'_, DispatchState>,
+    agent_run: State<'_, AgentRunState>,
+    agent_id: String,
+    task: String,
+    parent_run_id: Option<String>,
+    resume_session: bool,
+    repo_path: Option<String>,
+    builder_write: Option<bool>,
+) -> Result<String, String> {
+    let claude = dispatch.claude_path.lock().unwrap().clone();
+    let (run_id, _rx) = spawn_agent_run(
+        app,
+        claude,
+        agent_run.children.clone(),
+        agent_run.reasons.clone(),
+        agent_id,
+        task,
+        parent_run_id,
+        resume_session,
+        repo_path,
+        builder_write,
+    )?;
     Ok(run_id)
 }
 
