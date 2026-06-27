@@ -38,6 +38,11 @@ pub struct PodStreamEvent {
     pub commit_msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Reviewer's verdict text — populated on ready_to_push so the card shows
+    /// the actual review text, not just "ready." A fallback-PASS (no verdict
+    /// emitted) is visible because this field will be empty or absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer_note: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -58,6 +63,7 @@ fn emit_pod(
     text: &str,
     commit_msg: Option<String>,
     diff: Option<String>,
+    reviewer_note: Option<String>,
 ) {
     let _ = app.emit(
         "pod-stream",
@@ -68,6 +74,7 @@ fn emit_pod(
             text: text.to_string(),
             commit_msg,
             diff,
+            reviewer_note,
         },
     );
 }
@@ -104,6 +111,12 @@ fn parse_review(text: &str) -> Result<(), String> {
 }
 
 fn git_diff_head(repo_path: &str) -> String {
+    // Mark untracked files as intent-to-add so they appear in git diff HEAD.
+    // Failure is silently ignored — e.g. already-staged files are fine.
+    let _ = std::process::Command::new("git")
+        .args(["add", "-N", "."])
+        .current_dir(repo_path)
+        .status();
     std::process::Command::new("git")
         .args(["diff", "HEAD"])
         .current_dir(repo_path)
@@ -129,7 +142,7 @@ fn pod_loop(
     eprintln!("[pod] {pod_id} started — repo={repo_path}");
 
     // ── PLAN ─────────────────────────────────────────────────────────────────
-    emit_pod(&app, &pod_id, "planning", "start", "Planning the change…", None, None);
+    emit_pod(&app, &pod_id, "planning", "start", "Planning the change…", None, None, None);
 
     let plan = match spawn_agent_run(
         app.clone(),
@@ -152,7 +165,7 @@ fn pod_loop(
             emit_pod(
                 &app, &pod_id, "planning", "needs_you",
                 &format!("Planner failed to start: {e}"),
-                None, None,
+                None, None, None,
             );
             return;
         }
@@ -169,7 +182,7 @@ fn pod_loop(
             let msg = format!(
                 "After {MAX_ROUNDS} rounds the build is still not passing. Last issue:\n\n{fix_notes}"
             );
-            emit_pod(&app, &pod_id, "needs_you", "needs_you", &msg, None, None);
+            emit_pod(&app, &pod_id, "needs_you", "needs_you", &msg, None, None, None);
             eprintln!("[pod] {pod_id} capped at {MAX_ROUNDS} rounds — escalating");
             return;
         }
@@ -178,7 +191,7 @@ fn pod_loop(
         emit_pod(
             &app, &pod_id, "building", "step",
             if round == 0 { "Writing the code…" } else { "Fixing and rebuilding…" },
-            None, None,
+            None, None, None,
         );
 
         let build_task = if round == 0 {
@@ -210,7 +223,7 @@ fn pod_loop(
                 emit_pod(
                     &app, &pod_id, "building", "needs_you",
                     &format!("Builder failed to start: {e}"),
-                    None, None,
+                    None, None, None,
                 );
                 return;
             }
@@ -219,7 +232,7 @@ fn pod_loop(
         // NEEDS YOU check (migration / destructive op)
         if let Some(pos) = build_text.find("NEEDS YOU:") {
             let msg = build_text[pos..].lines().next().unwrap_or("NEEDS YOU").to_string();
-            emit_pod(&app, &pod_id, "building", "needs_you", &msg, None, None);
+            emit_pod(&app, &pod_id, "building", "needs_you", &msg, None, None, None);
             eprintln!("[pod] {pod_id} builder surfaced NEEDS YOU — stopping");
             return;
         }
@@ -228,7 +241,7 @@ fn pod_loop(
             .unwrap_or_else(|| "chore: automated change".to_string());
 
         // GATE ────────────────────────────────────────────────────────────────
-        emit_pod(&app, &pod_id, "verifying", "step", "Checking it builds…", None, None);
+        emit_pod(&app, &pod_id, "verifying", "step", "Checking it builds…", None, None, None);
 
         let gate = match crate::forge::run_verification_gate(repo_path.clone()) {
             Ok(g) => g,
@@ -246,14 +259,14 @@ fn pod_loop(
             emit_pod(
                 &app, &pod_id, "verifying", "step",
                 &format!("Build check failed — round {} of {MAX_ROUNDS}.", round + 1),
-                None, None,
+                None, None, None,
             );
             round += 1;
             continue;
         }
 
         // REVIEW ──────────────────────────────────────────────────────────────
-        emit_pod(&app, &pod_id, "reviewing", "step", "Reviewing the logic…", None, None);
+        emit_pod(&app, &pod_id, "reviewing", "step", "Reviewing the logic…", None, None, None);
 
         let diff = git_diff_head(&repo_path);
         let review_task = format!(
@@ -282,7 +295,7 @@ fn pod_loop(
                 emit_pod(
                     &app, &pod_id, "reviewing", "needs_you",
                     &format!("Reviewer failed to start: {e}"),
-                    None, None,
+                    None, None, None,
                 );
                 return;
             }
@@ -301,6 +314,7 @@ fn pod_loop(
                     "Done and safe — ready for you to publish.",
                     Some(last_commit_msg),
                     Some(final_diff),
+                    Some(review_text.clone()),
                 );
                 return;
             }
@@ -309,7 +323,7 @@ fn pod_loop(
                 emit_pod(
                     &app, &pod_id, "reviewing", "step",
                     &format!("Review found issues — round {} of {MAX_ROUNDS}.", round + 1),
-                    None, None,
+                    None, None, None,
                 );
                 eprintln!("[pod] {pod_id} review FAIL round={round}: {notes:.80?}");
                 round += 1;
