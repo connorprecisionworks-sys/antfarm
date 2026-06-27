@@ -1147,30 +1147,67 @@ export function Chat() {
     }
   }, [recipientId]);
 
-  // Part B: on remount, fix any entries left "thinking"/"streaming" because the
-  // stream finished while Chat was unmounted and the listener was gone.
+  // Part B: on remount, reconcile entries stuck in thinking/streaming.
+  // Ask the backend which run IDs are still alive; only mark the orphaned
+  // ones as stopped.  Still-alive runs keep their status so the re-attached
+  // stream listener receives completion events with no "stopped" flash.
   useEffect(() => {
     const stale = getSnapshot().streamEntries.filter(
       (e) => e.status === "thinking" || e.status === "streaming"
     );
     if (stale.length === 0) return;
-    const staleAgentIds = new Set(stale.map((e) => e.agentId));
-    setStreamEntries((prev) =>
-      prev.map((e) =>
-        e.status === "thinking" || e.status === "streaming"
-          ? {
-              ...e,
-              status: "stopped" as const,
-              text: e.text || "Run continued in the background — reopen the agent or resend to refresh.",
-            }
-          : e
-      )
-    );
-    setRunningAgents((prev) => {
-      const s = new Set(prev);
-      staleAgentIds.forEach((id) => s.delete(id));
-      return s;
-    });
+
+    invoke<string[]>("get_active_run_ids")
+      .then((activeIds) => {
+        const active = new Set(activeIds);
+        // Entries whose backend process is gone — we missed the completion event.
+        const finished = stale.filter((e) => !e.runId || !active.has(e.runId));
+        if (finished.length === 0) return; // all stale entries are still running
+
+        const finishedIds      = new Set(finished.map((e) => e.id));
+        const finishedAgentIds = new Set(finished.map((e) => e.agentId));
+        // Agents that still have at least one live entry must NOT be removed from runningAgents.
+        const stillLiveAgents  = new Set(
+          stale.filter((e) => !finishedIds.has(e.id)).map((e) => e.agentId)
+        );
+
+        setStreamEntries((prev) =>
+          prev.map((e) =>
+            // Guard on current status: if the listener already received the done event
+            // during the invoke round-trip, the entry is already "done" — leave it alone.
+            finishedIds.has(e.id) && (e.status === "thinking" || e.status === "streaming")
+              ? {
+                  ...e,
+                  status: "stopped" as const,
+                  text: e.text || "Run completed while Chat was closed — view log for full output.",
+                }
+              : e
+          )
+        );
+        setRunningAgents((prev) => {
+          const s = new Set(prev);
+          for (const id of finishedAgentIds) {
+            if (!stillLiveAgents.has(id)) s.delete(id);
+          }
+          return s;
+        });
+      })
+      .catch(() => {
+        // Fallback: old behaviour — mark all stale as stopped.
+        const staleAgentIds = new Set(stale.map((e) => e.agentId));
+        setStreamEntries((prev) =>
+          prev.map((e) =>
+            e.status === "thinking" || e.status === "streaming"
+              ? { ...e, status: "stopped" as const, text: e.text || "Run completed while Chat was closed." }
+              : e
+          )
+        );
+        setRunningAgents((prev) => {
+          const s = new Set(prev);
+          staleAgentIds.forEach((id) => s.delete(id));
+          return s;
+        });
+      });
   }, []);
 
   // ── agent-stream event listener ──────────────────────────────────────────────

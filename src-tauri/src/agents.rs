@@ -1356,6 +1356,15 @@ pub fn run_agent(
     Ok(run_id)
 }
 
+// ── get_active_run_ids ────────────────────────────────────────────────────────
+
+/// Returns the run IDs of child processes that are still running.
+/// Chat uses this on remount to avoid marking still-alive runs as "stopped".
+#[tauri::command]
+pub fn get_active_run_ids(agent_run: State<'_, AgentRunState>) -> Vec<String> {
+    agent_run.children.lock().unwrap().keys().cloned().collect()
+}
+
 // ── stop_agent ────────────────────────────────────────────────────────────────
 
 #[tauri::command]

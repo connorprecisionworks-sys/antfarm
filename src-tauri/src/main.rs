@@ -2532,6 +2532,7 @@ fn main() {
             agents::get_agent,
             agents::run_agent,
             agents::stop_agent,
+            agents::get_active_run_ids,
             agents::open_path,
             agents::open_agent_log,
             agents::reset_agent_session,
