@@ -944,6 +944,13 @@ pub fn run_agent(
     let claude    = dispatch.claude_path.lock().unwrap().clone();
     let vault_str = vault.to_string_lossy().into_owned();
 
+    // Write-mode Builder uses bypassPermissions so the Bash hook is the sole Bash gate.
+    // With dontAsk, hook exit-0 falls through to the permission layer which denies Bash
+    // (no explicit allow exists). bypassPermissions skips that layer entirely.
+    // --disallowedTools remains authoritative regardless: those tools are removed from
+    // the model's tool schema before any permission check and cannot be called at all.
+    let perm_mode = if builder_write.unwrap_or(false) { "bypassPermissions" } else { "dontAsk" };
+
     let mut cmd = Command::new(&claude);
     if let Some(ref sid) = existing_sid {
         // Warm resume: only user task (+ current time). No --add-dir needed.
@@ -952,14 +959,14 @@ pub fn run_agent(
         cmd.args(["--resume", sid, "-p", &msg,
                   "--output-format", "stream-json",
                   "--verbose",
-                  "--permission-mode", "dontAsk",
+                  "--permission-mode", perm_mode,
                   "--model", &agent.model]);
     } else {
         // Cold start: full system prompt + --add-dir (scope depends on agent role).
         cmd.args(["-p", &full_prompt,
                   "--output-format", "stream-json",
                   "--verbose",
-                  "--permission-mode", "dontAsk",
+                  "--permission-mode", perm_mode,
                   "--model", &agent.model]);
         // Orchestrator + Clerk reason from the full brain; all others use scoped dirs.
         if agent.role == "orchestrator" || agent_id == "clerk" {
