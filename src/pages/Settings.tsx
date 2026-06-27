@@ -198,21 +198,18 @@ export function Settings() {
               { key: "feature_voice"         as const, label: "Voice (mic / STT)", desc: "Shows mic buttons in Chat and Morning. Does not initialize the mic unless turned on." },
               { key: "feature_builder_write" as const, label: "Builder write mode", desc: "Grants Builder Write, Edit, and Bash access. Required for coding tasks. STOP-before-push enforced." },
             ] as const).map(({ key, label, desc }) => (
-              <label key={key} className="flex items-start gap-3 cursor-pointer">
-                <div className="relative mt-0.5">
+              <label key={key} className="flex items-start gap-3 cursor-pointer select-none">
+                <div className="relative mt-0.5 shrink-0">
                   <input
                     type="checkbox"
                     checked={settings[key]}
                     onChange={(e) => setSettings((s) => ({ ...s, [key]: e.target.checked }))}
                     className="sr-only"
                   />
-                  <div
-                    onClick={() => setSettings((s) => ({ ...s, [key]: !s[key] }))}
-                    className={[
-                      "w-8 h-4 rounded-full transition-colors cursor-pointer",
-                      settings[key] ? "bg-indigo-600" : "bg-zinc-700",
-                    ].join(" ")}
-                  >
+                  <div className={[
+                    "relative w-8 h-4 rounded-full transition-colors",
+                    settings[key] ? "bg-indigo-600" : "bg-zinc-700",
+                  ].join(" ")}>
                     <div className={[
                       "absolute top-0.5 w-3 h-3 rounded-full bg-white shadow-sm transition-transform",
                       settings[key] ? "translate-x-4" : "translate-x-0.5",
