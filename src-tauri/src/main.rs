@@ -4,6 +4,7 @@ mod agents;
 mod chat;
 mod daily;
 mod dispatch;
+mod forge;
 mod harness;
 mod memory;
 mod mobile;
@@ -2549,6 +2550,7 @@ fn main() {
             agents::reset_agent_session,
             agents::get_run_trace,
             agents::drain_scheduled_runs,
+            forge::run_verification_gate,
             daily::get_plan_state,
             daily::get_daily_context,
             daily::write_daily_recap,
