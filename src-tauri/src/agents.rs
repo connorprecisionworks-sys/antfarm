@@ -28,7 +28,7 @@ const WALL_SECS: u64    = 1800;
 
 // ── Path ──────────────────────────────────────────────────────────────────────
 
-fn vault_root() -> PathBuf {
+pub fn vault_root() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
         .join("Desktop")
         .join("antfarm-memory")
@@ -980,6 +980,13 @@ pub fn run_agent(
         if let Some(ref rp) = repo_path {
             if std::path::Path::new(rp).is_dir() {
                 cmd.args(["--add-dir", rp]);
+                // Persist so builder_commit_push can resolve the path even when
+                // selectedRepoPath is null on the frontend (warm-resume scenario).
+                if builder_write.unwrap_or(false) {
+                    let dir = vault.join("agents").join("builder");
+                    let _ = fs::create_dir_all(&dir);
+                    let _ = fs::write(dir.join("last_repo_path.txt"), rp);
+                }
             }
         }
     }

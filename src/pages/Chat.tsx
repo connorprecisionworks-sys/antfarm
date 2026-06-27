@@ -250,14 +250,25 @@ function BuilderDoneCard({ entry, onDismiss }: { entry: StreamEntry; onDismiss: 
 
   const commitMatch = entry.builderWrite ? entry.text.match(/---COMMIT:\s*([\s\S]+?)---/) : null;
   const commitMsg   = commitMatch ? commitMatch[1].trim() : null;
-  const isWriteMode = !!(entry.builderWrite && entry.repoPath && commitMsg);
+  // repoPath is not required for detection — the COMMIT marker alone is sufficient evidence.
+  // On warm resume the frontend entry may have repoPath=undefined even though the backend
+  // ran correctly; we resolve it lazily from the persisted last_repo_path.txt at commit time.
+  const isWriteMode = !!(entry.builderWrite && commitMsg);
 
   async function handleApprovePush() {
-    if (!entry.repoPath || !commitMsg) return;
+    if (!commitMsg) return;
+    let repoPath = entry.repoPath;
+    if (!repoPath) {
+      try { repoPath = (await invoke<string | null>("get_builder_last_repo_path")) ?? undefined; } catch { /* ignore */ }
+    }
+    if (!repoPath) {
+      setPushError("Repo path not found — re-select the repo in the picker.");
+      return;
+    }
     setPushing(true);
     setPushError(null);
     try {
-      await invoke<string>("builder_commit_push", { repoPath: entry.repoPath, commitMessage: commitMsg });
+      await invoke<string>("builder_commit_push", { repoPath, commitMessage: commitMsg });
       setPushed(true);
     } catch (e) {
       setPushError(String(e));

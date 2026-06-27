@@ -512,6 +512,16 @@ fn builder_commit_push(repo_path: String, commit_message: String) -> Result<Stri
     Ok(format!("Committed and pushed: {first_line}"))
 }
 
+#[tauri::command]
+fn get_builder_last_repo_path() -> Option<String> {
+    let vault = crate::agents::vault_root();
+    let path = vault.join("agents").join("builder").join("last_repo_path.txt");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 // ── Usage rollup ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -2462,6 +2472,7 @@ fn main() {
             get_settings,
             save_settings,
             builder_commit_push,
+            get_builder_last_repo_path,
             usage_rollup,
             list_sessions,
             active_session_count,
