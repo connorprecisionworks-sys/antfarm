@@ -173,7 +173,7 @@ fn save_agent_session_id(agent_id: &str, sid: &str) {
     let _ = std::fs::write(agent_sessions_dir().join(format!("{agent_id}.txt")), sid);
 }
 
-fn clear_agent_session_id(agent_id: &str) {
+pub fn clear_agent_session_id(agent_id: &str) {
     let _ = std::fs::remove_file(agent_sessions_dir().join(format!("{agent_id}.txt")));
 }
 
