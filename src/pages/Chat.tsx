@@ -248,7 +248,7 @@ function BuilderDoneCard({ entry, onDismiss }: { entry: StreamEntry; onDismiss: 
   const [pushed, setPushed]     = useState(false);
   const [pushError, setPushError] = useState<string | null>(null);
 
-  const commitMatch = entry.builderWrite ? entry.text.match(/---COMMIT:\s*(.+?)---/) : null;
+  const commitMatch = entry.builderWrite ? entry.text.match(/---COMMIT:\s*([\s\S]+?)---/) : null;
   const commitMsg   = commitMatch ? commitMatch[1].trim() : null;
   const isWriteMode = !!(entry.builderWrite && entry.repoPath && commitMsg);
 
@@ -312,7 +312,7 @@ function BuilderDoneCard({ entry, onDismiss }: { entry: StreamEntry; onDismiss: 
   return (
     <div className="mt-3 border border-zinc-700/50 rounded-lg bg-zinc-800/30 px-3 py-2.5">
       <div className="flex items-center gap-2 mb-2">
-        <GitMerge size={11} className="text-emerald-400" />
+        <FileText size={11} className="text-zinc-500" />
         <span className="text-xs font-medium text-zinc-300">Builder finished</span>
       </div>
       <div className="flex gap-2">
@@ -322,13 +322,6 @@ function BuilderDoneCard({ entry, onDismiss }: { entry: StreamEntry; onDismiss: 
         >
           <FileText size={11} />
           View log
-        </button>
-        <button
-          title="Worktree merge coming in Phase 4"
-          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg text-zinc-600 border border-zinc-700/30 cursor-not-allowed"
-        >
-          <GitMerge size={11} />
-          Merge
         </button>
         <button
           onClick={onDismiss}

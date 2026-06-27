@@ -890,11 +890,11 @@ pub fn run_agent(
                 );
             } else {
                 note.push_str(
-                    "\n\nYou are in read-only advisory mode in chat: read the repo and answer \
-                     Connor's question, do not write files or run commands. Be surgical and \
-                     token-efficient — use Glob/Grep to find the few relevant files and read only \
-                     those, never slurp the whole tree. For real code changes, Connor dispatches \
-                     you to the build harness."
+                    "\n\nYou are in advisory mode: read the repo and answer Connor's question. \
+                     Do not write files or run commands. Be surgical and token-efficient — \
+                     use Glob/Grep to find the few relevant files and read only those, never \
+                     slurp the whole tree. Connor can enable write mode in Settings to grant \
+                     you file-editing access."
                 );
             }
         }
