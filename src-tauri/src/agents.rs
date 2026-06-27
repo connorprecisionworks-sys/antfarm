@@ -625,7 +625,7 @@ fn networked_allowed_tools(connectors: &[String]) -> String {
 ///   • builder write mode:         NotebookEdit + all 44 GWS tools (Write/Edit/Bash granted)
 ///   • networked agents:           Bash + (44 GWS universe minus this agent's granted GWS tools)
 ///   • start_google_auth always denied for everyone
-fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String], builder_write: bool) -> String {
+pub(crate) fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String], builder_write: bool) -> String {
     let mut deny: Vec<String> = Vec::new();
 
     if profile == "networked" {
@@ -644,6 +644,9 @@ fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String], builder
             // Advisory mode: deny all write and execution tools
             deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
         }
+    } else if profile == "offline-code" {
+        // offline-code agents (planner, reviewer) are always read-only
+        deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
     }
 
     // GWS deny: universe minus granted for this agent
@@ -994,6 +997,7 @@ pub fn run_agent(
     // Unified deny list — applied on every turn (cold + resume) for all agents.
     // Exactly one --disallowedTools call. Builder and networked both covered here.
     let deny = build_deny_list(&agent_id, &agent.profile, &agent.connectors, builder_write.unwrap_or(false));
+    eprintln!("[antfarm] spawn {agent_id} profile={} deny_count={} deny={}", agent.profile, deny.split(',').count(), deny);
     if !deny.is_empty() { cmd.args(["--disallowedTools", &deny]); }
 
     // Builder write mode: inject Bash command safety hook via --settings.
@@ -1405,5 +1409,57 @@ pub fn open_agent_log(agent_id: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_connectors() -> Vec<String> { vec![] }
+
+    fn deny_set(agent_id: &str, profile: &str) -> std::collections::HashSet<String> {
+        build_deny_list(agent_id, profile, &no_connectors(), false)
+            .split(',')
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
+
+    #[test]
+    fn offline_code_planner_is_read_only() {
+        let deny = deny_set("planner", "offline-code");
+        for tool in WRITE_TOOLS {
+            assert!(deny.contains(*tool), "planner deny list missing {tool}: {deny:?}");
+        }
+    }
+
+    #[test]
+    fn offline_code_reviewer_is_read_only() {
+        let deny = deny_set("reviewer", "offline-code");
+        for tool in WRITE_TOOLS {
+            assert!(deny.contains(*tool), "reviewer deny list missing {tool}: {deny:?}");
+        }
+    }
+
+    #[test]
+    fn builder_advisory_is_read_only() {
+        let deny = deny_set("builder", "offline-code");
+        for tool in WRITE_TOOLS {
+            assert!(deny.contains(*tool), "builder advisory deny list missing {tool}: {deny:?}");
+        }
+    }
+
+    #[test]
+    fn builder_write_mode_grants_bash_and_rw() {
+        let deny: std::collections::HashSet<String> = build_deny_list("builder", "offline-code", &no_connectors(), true)
+            .split(',')
+            .map(|s| s.to_string())
+            .collect();
+        assert!(!deny.contains("Write"),  "write mode must not deny Write");
+        assert!(!deny.contains("Edit"),   "write mode must not deny Edit");
+        assert!(!deny.contains("Bash"),   "write mode must not deny Bash");
+        assert!(deny.contains("NotebookEdit"), "write mode must still deny NotebookEdit");
+    }
 }
 

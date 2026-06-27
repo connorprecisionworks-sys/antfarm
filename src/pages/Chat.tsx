@@ -85,7 +85,7 @@ interface DelegationTask {
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
-const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder"]);
+const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder", "planner", "reviewer"]);
 
 /** Extract ```delegate\n...\n``` block from agent text. Returns null if absent. */
 function parseDelegations(text: string): DelegationTask[] | null {
