@@ -284,6 +284,119 @@ fn schedule_lock(agent_id: &str, slot: &str) {
     let _ = std::fs::write(schedule_dir().join(format!("{agent_id}-{slot}.lock")), "");
 }
 
+// ── Builder Bash hook ─────────────────────────────────────────────────────────
+//
+// A PreToolUse hook blocks dangerous Bash commands before the agent can run them.
+// The hook script and its settings file are written fresh on each write-mode run
+// so the blocklist stays in sync with this source.
+//
+// SAFETY: the settings file contains ONLY "hooks" — no "permissions.allow" list.
+// The permissions.allow gate causes stdin hangs under --permission-mode dontAsk
+// (see comment near --allowedTools below). Hooks are subprocess-based and never
+// wait on stdin.
+//
+// builder_commit_push() is completely unaffected: it calls std::process::Command
+// directly from Rust, not through the agent's Bash tool.
+
+const BUILDER_BASH_GUARD: &str = r#"#!/bin/bash
+# Builder Bash guard — PreToolUse hook (managed by antfarm; do not hand-edit).
+# Blocks dangerous Bash commands in write-mode Builder runs.
+# Exit 0 = allow; Exit 2 = block (stdout is returned to the model as the reason).
+
+INPUT=$(cat)
+
+# Extract the command string from the tool call JSON.
+# Claude Code PreToolUse sends: {"tool_name":"Bash","tool_input":{"command":"..."}, ...}
+CMD=$(printf '%s' "$INPUT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    cmd = (d.get('tool_input') or {}).get('command') or d.get('command') or ''
+    print(cmd)
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+# Normalize newlines to spaces so multi-line commands are matched on one line.
+CMD_NORM=$(printf '%s' "$CMD" | tr '\n' ' ')
+
+block() {
+  printf '%s\n' "BLOCKED by Builder safety gate: $1. Migrations and commits/pushes require Connor's approval via the Approve & push button in the UI — do not retry with Bash. End your response with: NEEDS YOU: <one sentence describing what you need Connor to approve and why>."
+  exit 2
+}
+
+# git push (any form: push, push origin main, push -u, push --force, etc.)
+if printf '%s' "$CMD_NORM" | grep -qE '(^|[;&|(` ])git +push( |$|-)'; then
+  block "'git push' is not permitted for the Builder agent — pushes go through the Approve and push button only"
+fi
+
+# git commit (any form)
+if printf '%s' "$CMD_NORM" | grep -qE '(^|[;&|(` ])git +commit( |$|--)'; then
+  block "'git commit' is not permitted for the Builder agent — commits go through the Approve and push button only"
+fi
+
+# git reset --hard (destructive)
+if printf '%s' "$CMD_NORM" | grep -qE '(^|[;&|(` ])git +reset +.*--hard'; then
+  block "'git reset --hard' is a destructive operation — surface for Connor's approval via NEEDS YOU"
+fi
+
+# git --force / --force-with-lease on any command (push is already caught above)
+if printf '%s' "$CMD_NORM" | grep -qE '(^|[;&|(` ])git +[^ ]+ .*(--force-with-lease|--force)( |$)'; then
+  block "force git operations are not permitted — surface for Connor's approval via NEEDS YOU"
+fi
+
+# supabase db push / supabase migration / supabase db reset
+if printf '%s' "$CMD_NORM" | grep -qiE '(^|[;&|(` ])supabase +(db +push|migration|db +reset)( |$)'; then
+  block "'supabase db push / migration / db reset' is a database migration — migrations require Connor's explicit approval"
+fi
+
+# prisma migrate / prisma db push
+if printf '%s' "$CMD_NORM" | grep -qiE '(^|[;&|(` ])prisma +(migrate|db +push)( |$)'; then
+  block "'prisma migrate / db push' is a database migration — migrations require Connor's explicit approval"
+fi
+
+# rm -rf and common destructive variants: -rf, -fr, -Rf, -rfv, --recursive --force, etc.
+if printf '%s' "$CMD_NORM" | grep -qE 'rm +-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|rm +-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|rm +.*--recursive.*--force|rm +.*--force.*--recursive'; then
+  block "'rm -rf' or equivalent destructive deletion is not permitted — surface for Connor's approval via NEEDS YOU"
+fi
+
+exit 0
+"#;
+
+/// Write the Builder Bash guard hook script and its settings JSON to ~/.antfarm/.
+/// Called at the start of every write-mode Builder run so the blocklist stays current.
+/// Returns the path to the settings JSON (passed to claude via --settings).
+fn ensure_builder_hooks() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let hooks_dir = PathBuf::from(&home).join(".antfarm/hooks");
+    fs::create_dir_all(&hooks_dir).map_err(|e| e.to_string())?;
+
+    let guard_path = hooks_dir.join("builder-bash-guard.sh");
+    fs::write(&guard_path, BUILDER_BASH_GUARD).map_err(|e| e.to_string())?;
+
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&guard_path).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&guard_path, perms).map_err(|e| e.to_string())?;
+
+    let guard_path_str = guard_path.to_string_lossy().into_owned();
+    let settings_path  = PathBuf::from(&home).join(".antfarm/builder-write-settings.json");
+    let settings_json  = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": guard_path_str}]
+                }
+            ]
+        }
+    });
+    fs::write(&settings_path, serde_json::to_string_pretty(&settings_json).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+
+    Ok(settings_path.to_string_lossy().into_owned())
+}
+
 // ── Pending scheduled-run drain (show results in Chat on next open) ───────────
 
 fn pending_runs_path() -> PathBuf {
@@ -866,6 +979,16 @@ pub fn run_agent(
     // Exactly one --disallowedTools call. Builder and networked both covered here.
     let deny = build_deny_list(&agent_id, &agent.profile, &agent.connectors, builder_write.unwrap_or(false));
     if !deny.is_empty() { cmd.args(["--disallowedTools", &deny]); }
+
+    // Builder write mode: inject Bash command safety hook via --settings.
+    // The settings file contains ONLY "hooks" — no "permissions.allow" list —
+    // so it does not trigger the stdin-hang bug (see comment below).
+    if builder_write.unwrap_or(false) {
+        match ensure_builder_hooks() {
+            Ok(hook_settings) => { cmd.args(["--settings", &hook_settings]); }
+            Err(e) => eprintln!("[antfarm] warn: could not write builder hooks: {e}"),
+        }
+    }
 
     // Networked agents: allowed list only. Do NOT load settings.networked.json via
     // --settings — its explicit permissions.allow list creates a secondary permission
