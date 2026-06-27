@@ -2436,8 +2436,6 @@ fn main() {
         .setup(move |app| {
             // Mark any step/run left "running" from a prior crash as interrupted.
             harness::reconcile_orphans();
-            // Keep ~/.claude/settings.networked.json in sync with the compiled GWS constants.
-            let _ = agents::scaffold_networked_settings();
             // Start the read-only mobile status server on 127.0.0.1:8787 (non-blocking).
             mobile::start(app.handle().clone());
             // Register per-agent cron schedules; fires in a background thread.
@@ -2539,7 +2537,6 @@ fn main() {
             agents::reset_agent_session,
             agents::get_run_trace,
             agents::drain_scheduled_runs,
-            agents::scaffold_networked_settings,
             daily::get_plan_state,
             daily::get_daily_context,
             daily::write_daily_recap,
