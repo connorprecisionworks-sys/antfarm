@@ -1033,7 +1033,7 @@ pub fn spawn_agent_run(
         "\n\nDelegation protocol: when you want to dispatch work to a subagent, end \
          your message with a fenced delegate block (and ONLY when you're actually \
          dispatching — omit it when you're just answering). Valid agent ids: \
-         scout, scribe, clerk, builder. One line per agent, id then colon then task.\n\
+         scout, scribe, clerk, builder, pulitzer. One line per agent, id then colon then task.\n\
          \n\
          ```delegate\n\
          scout: research the specific topic\n\
@@ -1107,7 +1107,8 @@ pub fn spawn_agent_run(
     };
 
     // ── Build full -p prompt ──────────────────────────────────────────────────
-    let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
+    let now_dt = Local::now();
+    let now = format!("{} (unix: {})", now_dt.format("%Y-%m-%d %H:%M %Z"), now_dt.timestamp());
     let full_prompt = match base_prompt {
         Some(sys) => format!(
             "{sys}{write_scope}{daily_preamble}{crew_section}{connector_prompt}{role_note}\n\n---\n\nCurrent date and time: {now}\n\nUser: {task}"
@@ -1136,7 +1137,8 @@ pub fn spawn_agent_run(
     if let Some(ref sid) = existing_sid {
         // Warm resume: user task + current time. Re-add repo dir so Builder still
         // has filesystem access to the target repo on rounds 1+ of the pod loop.
-        let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
+        let now_dt = Local::now();
+        let now = format!("{} (unix: {})", now_dt.format("%Y-%m-%d %H:%M %Z"), now_dt.timestamp());
         let msg  = format!("Current date and time: {now}\n\nUser: {task}");
         cmd.args(["--resume", sid, "-p", &msg,
                   "--output-format", "stream-json",

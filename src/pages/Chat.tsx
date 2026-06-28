@@ -117,7 +117,7 @@ interface PodStreamPayload {
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
-const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder", "planner", "reviewer", "forge"]);
+const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder", "planner", "reviewer", "forge", "pulitzer"]);
 
 /** Extract ```delegate\n...\n``` block from agent text. Returns null if absent. */
 function parseDelegations(text: string): DelegationTask[] | null {
