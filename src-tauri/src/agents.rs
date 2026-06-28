@@ -34,6 +34,18 @@ pub fn vault_root() -> PathBuf {
         .join("antfarm-memory")
 }
 
+/// Expand a leading `~` to $HOME so callers can accept `~/Desktop/…` paths.
+pub fn expand_tilde(path: &str) -> String {
+    let home = || std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    if path == "~" {
+        home()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("{}/{rest}", home())
+    } else {
+        path.to_string()
+    }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 pub struct AgentRunState {
@@ -839,11 +851,17 @@ pub fn spawn_agent_run(
     // ── Write-scope constraint (injected for all agents) ──────────────────────
     // --add-dir gives full READ access to the vault; writes are soft-constrained
     // via prompt so agents don't touch other agents' directories or the brain index.
-    let write_scope = format!(
-        "\n\nVault write scope: you may only create or modify files under \
-         `agents/{}/` and `active/`. Do not write to any other vault paths.",
-        agent_id
-    );
+    // Suppressed for write-mode Builder with a repo_path: the builder's own REPO SCOPE
+    // instruction already scopes writes to the repo, and this vault text contradicts it.
+    let write_scope = if builder_write.unwrap_or(false) && repo_path.is_some() {
+        String::new()
+    } else {
+        format!(
+            "\n\nVault write scope: you may only create or modify files under \
+             `agents/{}/` and `active/`. Do not write to any other vault paths.",
+            agent_id
+        )
+    };
 
     // ── Role-specific tail instructions ──────────────────────────────────────
     // Orchestrator: delegation block protocol so the app can wire real subagent runs.
@@ -953,7 +971,8 @@ pub fn spawn_agent_run(
 
     let mut cmd = Command::new(&claude);
     if let Some(ref sid) = existing_sid {
-        // Warm resume: only user task (+ current time). No --add-dir needed.
+        // Warm resume: user task + current time. Re-add repo dir so Builder still
+        // has filesystem access to the target repo on rounds 1+ of the pod loop.
         let now = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
         let msg  = format!("Current date and time: {now}\n\nUser: {task}");
         cmd.args(["--resume", sid, "-p", &msg,
@@ -961,6 +980,11 @@ pub fn spawn_agent_run(
                   "--verbose",
                   "--permission-mode", perm_mode,
                   "--model", &agent.model]);
+        if let Some(ref rp) = repo_path {
+            if std::path::Path::new(rp).is_dir() {
+                cmd.args(["--add-dir", rp]);
+            }
+        }
     } else {
         // Cold start: full system prompt + --add-dir (scope depends on agent role).
         cmd.args(["-p", &full_prompt,
@@ -1017,8 +1041,16 @@ pub fn spawn_agent_run(
         if !allowed.is_empty() { cmd.args(["--allowedTools", &allowed]); }
     }
 
+    // Use repo_path as cwd when provided so Builder's relative Bash commands land in
+    // the target repo, not the vault.  Agents with no repo_path keep the vault as cwd.
+    let cwd: std::path::PathBuf = repo_path
+        .as_deref()
+        .filter(|rp| std::path::Path::new(rp).is_dir())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| vault.clone());
+
     let mut child = cmd
-        .current_dir(&vault)
+        .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())

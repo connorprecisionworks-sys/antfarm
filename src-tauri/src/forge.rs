@@ -47,9 +47,10 @@ pub fn detect_build_command(root: &Path) -> Result<(String, Vec<String>, PathBuf
 /// tool, so the hook guard never touches it.
 #[tauri::command]
 pub fn run_verification_gate(repo_path: String) -> Result<GateResult, String> {
-    let root = Path::new(&repo_path);
+    let expanded = crate::agents::expand_tilde(&repo_path);
+    let root = Path::new(&expanded);
     if !root.is_dir() {
-        return Err(format!("not a directory: {repo_path}"));
+        return Err(format!("not a directory: {expanded}"));
     }
 
     let (prog, args, cwd) = detect_build_command(root)?;

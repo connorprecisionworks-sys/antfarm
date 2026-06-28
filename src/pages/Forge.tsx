@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  Check, ChevronDown, ChevronRight, GitMerge, Loader, Play,
+  Check, ChevronDown, ChevronRight, GitMerge, Loader, Play, RotateCcw, FileText,
 } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -382,6 +382,18 @@ export function Forge() {
                         {r.activity}
                       </span>
                     )}
+                    {r.status !== "idle" && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          invoke("open_agent_log", { agentId: role }).catch(() => {});
+                        }}
+                        title="View vault log"
+                        className="ml-auto text-zinc-600 hover:text-zinc-400 transition-colors"
+                      >
+                        <FileText size={10} />
+                      </button>
+                    )}
                   </button>
                 );
               })}
@@ -421,7 +433,7 @@ export function Forge() {
                 setReadyState(null);
                 setPodId(null);
                 setPodStep("");
-                setRoles(emptyRoles());
+                // roles intentionally kept — user can still read the trace
               }}
             />
           )}
@@ -438,13 +450,28 @@ export function Forge() {
                   setNeedsYou(null);
                   setPodId(null);
                   setPodStep("");
-                  setRoles(emptyRoles());
+                  // roles intentionally kept — user can still read the trace
                 }}
                 className="mt-2.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
               >
                 Dismiss
               </button>
             </div>
+          )}
+
+          {/* New run button — shown after pod finishes (running=false, no active cards) */}
+          {!running && !readyState && !needsYou && (
+            <button
+              onClick={() => {
+                setRoles(emptyRoles());
+                setPodId(null);
+                setPodStep("");
+              }}
+              className="flex items-center gap-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              <RotateCcw size={11} />
+              New run
+            </button>
           )}
         </div>
       )}

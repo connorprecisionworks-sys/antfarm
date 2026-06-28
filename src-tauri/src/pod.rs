@@ -348,6 +348,7 @@ pub fn run_pod(
     let children = agent_run.children.clone();
     let reasons = agent_run.reasons.clone();
     let pid = pod_id.clone();
+    let repo_path = crate::agents::expand_tilde(&repo_path);
 
     std::thread::spawn(move || {
         pod_loop(app, claude_path, children, reasons, pid, repo_path, task);
