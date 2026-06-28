@@ -1,9 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  Check, ChevronDown, ChevronRight, GitMerge, Loader, Play, RotateCcw, FileText,
+  Check, ChevronDown, ChevronRight, FolderOpen, GitMerge, Loader, Play, RotateCcw, FileText,
 } from "lucide-react";
+
+// ── Recent repos ──────────────────────────────────────────────────────────────
+
+const RECENTS_KEY = "forge:recentRepos";
+const MAX_RECENTS = 5;
+
+function loadRecents(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(RECENTS_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveRecent(path: string) {
+  const prev = loadRecents().filter((p) => p !== path);
+  localStorage.setItem(RECENTS_KEY, JSON.stringify([path, ...prev].slice(0, MAX_RECENTS)));
+}
+
+const FALLBACK_REPO = "/Users/connordore/Desktop/antfarm-write-test";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -184,7 +205,7 @@ function PodDoneCard({
 // ── Forge page ────────────────────────────────────────────────────────────────
 
 export function Forge() {
-  const [repoPath, setRepoPath]   = useState("");
+  const [repoPath, setRepoPath]   = useState(() => loadRecents()[0] ?? FALLBACK_REPO);
   const [task, setTask]           = useState("");
   const [podId, setPodId]         = useState<string | null>(null);
   const [podStep, setPodStep]     = useState("");
@@ -194,15 +215,33 @@ export function Forge() {
   const [needsYou, setNeedsYou]   = useState<string | null>(null);
   const [running, setRunning]     = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [recents, setRecents]     = useState<string[]>(() => loadRecents());
+  const [showRecents, setShowRecents] = useState(false);
   const textAreaRef = useRef<HTMLPreElement>(null);
 
-  // Resolve home dir once for the default repo path.
+  // Close recents dropdown on outside click.
   useEffect(() => {
-    import("@tauri-apps/api/path")
-      .then((m) => m.homeDir())
-      .then((h) => setRepoPath(`${h}/Desktop/antfarm-write-test`))
-      .catch(() => setRepoPath("/Users/connordore/Desktop/antfarm-write-test"));
-  }, []);
+    if (!showRecents) return;
+    function close(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (!target.closest("[data-recents-anchor]")) setShowRecents(false);
+    }
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [showRecents]);
+
+  async function handleChooseRepo() {
+    const selected = await openDialog({ directory: true, multiple: false, title: "Choose repo folder" });
+    if (typeof selected === "string" && selected) {
+      setRepoPath(selected);
+      setShowRecents(false);
+    }
+  }
+
+  function pickRecent(path: string) {
+    setRepoPath(path);
+    setShowRecents(false);
+  }
 
   // Subscribe to pod-stream + agent-stream events for the active pod.
   useEffect(() => {
@@ -267,6 +306,9 @@ export function Forge() {
 
   async function handleRun() {
     if (!task.trim() || !repoPath.trim() || running) return;
+    const path = repoPath.trim();
+    saveRecent(path);
+    setRecents(loadRecents());
     setLaunchError(null);
     setReadyState(null);
     setNeedsYou(null);
@@ -275,7 +317,7 @@ export function Forge() {
     setActiveRole("planner");
     setRunning(true);
     try {
-      const id = await invoke<string>("run_pod", { repoPath: repoPath.trim(), task: task.trim() });
+      const id = await invoke<string>("run_pod", { repoPath: path, task: task.trim() });
       setPodId(id);
     } catch (e) {
       setLaunchError(String(e));
@@ -299,14 +341,57 @@ export function Forge() {
       {/* Launch form */}
       <div className="space-y-3 border border-zinc-800/60 rounded-lg p-4">
         <div>
-          <label className="block text-[11px] text-zinc-500 mb-1">Repo path</label>
-          <input
-            value={repoPath}
-            onChange={(e) => setRepoPath(e.target.value)}
-            disabled={running}
-            placeholder="/path/to/repo"
-            className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded-md px-3 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-500 disabled:opacity-50 transition-colors"
-          />
+          <label className="block text-[11px] text-zinc-500 mb-1">Repo</label>
+          <div className="flex gap-1.5 items-stretch">
+            {/* Editable path field */}
+            <input
+              value={repoPath}
+              onChange={(e) => { setRepoPath(e.target.value); setShowRecents(false); }}
+              disabled={running}
+              placeholder="/path/to/repo"
+              className="flex-1 min-w-0 bg-zinc-900/60 border border-zinc-700/50 rounded-md px-3 py-1.5 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-500 disabled:opacity-50 transition-colors font-mono"
+            />
+            {/* Recent repos dropdown toggle */}
+            {recents.length > 0 && (
+              <div className="relative" data-recents-anchor>
+                <button
+                  onClick={() => setShowRecents((v) => !v)}
+                  disabled={running}
+                  title="Recent repos"
+                  className="h-full px-2 bg-zinc-800/60 border border-zinc-700/50 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 disabled:opacity-50 transition-colors flex items-center"
+                >
+                  <ChevronDown size={13} />
+                </button>
+                {showRecents && (
+                  <div className="absolute top-full mt-1 right-0 z-20 w-72 bg-zinc-900 border border-zinc-700/60 rounded-lg shadow-xl py-1 overflow-hidden">
+                    {recents.map((p) => (
+                      <button
+                        key={p}
+                        onClick={() => pickRecent(p)}
+                        className={`w-full text-left px-3 py-1.5 text-[11px] font-mono truncate transition-colors ${
+                          p === repoPath
+                            ? "text-zinc-100 bg-zinc-800"
+                            : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
+                        }`}
+                      >
+                        {p}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Native folder picker */}
+            <button
+              onClick={handleChooseRepo}
+              disabled={running}
+              title="Choose repo folder"
+              className="px-2.5 bg-zinc-800/60 border border-zinc-700/50 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 disabled:opacity-50 transition-colors flex items-center gap-1.5 text-xs whitespace-nowrap"
+            >
+              <FolderOpen size={13} />
+              Browse
+            </button>
+          </div>
         </div>
         <div>
           <label className="block text-[11px] text-zinc-500 mb-1">Task</label>
