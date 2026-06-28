@@ -1645,6 +1645,16 @@ pub fn open_agent_log(agent_id: String) -> Result<(), String> {
 
 // ── Image upload ──────────────────────────────────────────────────────────────
 
+fn image_mime(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png"  => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif"  => Some("image/gif"),
+        _ => None,
+    }
+}
+
 fn is_allowed_image_ext(filename: &str) -> bool {
     matches!(
         filename.rsplit('.').next().map(|s| s.to_lowercase()).as_deref(),
@@ -1683,6 +1693,57 @@ pub fn save_upload(filename: String, data_base64: String) -> Result<String, Stri
     let dest = dir.join(format!("{ts}-{safe}"));
     std::fs::write(&dest, &data).map_err(|e| e.to_string())?;
     Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Copy a file that the OS dropped onto the window directly into the vault.
+/// Avoids the browser → base64 → Rust round-trip used by the file-picker path.
+#[tauri::command]
+pub fn save_upload_from_path(src_path: String) -> Result<String, String> {
+    let src = std::path::Path::new(&src_path);
+    let filename = src
+        .file_name()
+        .ok_or_else(|| "invalid path".to_string())?
+        .to_string_lossy()
+        .to_string();
+    if !is_allowed_image_ext(&filename) {
+        return Err("Only png, jpg, jpeg, webp, and gif images are accepted".into());
+    }
+    let data = std::fs::read(src).map_err(|e| e.to_string())?;
+    if data.len() > 10 * 1024 * 1024 {
+        return Err(format!(
+            "Image too large ({:.1} MB); max is 10 MB",
+            data.len() as f64 / 1_048_576.0,
+        ));
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let safe = sanitize_filename(&filename);
+    let dir = vault_root().join("active").join("uploads");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(format!("{ts}-{safe}"));
+    std::fs::write(&dest, &data).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Read a local image file and return it as a `data:<mime>;base64,…` URL
+/// so the webview can display a thumbnail for natively-dropped files.
+#[tauri::command]
+pub fn read_file_as_data_url(path: String) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let p = std::path::Path::new(&path);
+    let ext = p
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .rsplit('.')
+        .next()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let mime = image_mime(&ext).ok_or_else(|| "unsupported image format".to_string())?;
+    let data = std::fs::read(p).map_err(|e| e.to_string())?;
+    Ok(format!("data:{};base64,{}", mime, STANDARD.encode(&data)))
 }
 
 #[cfg(test)]

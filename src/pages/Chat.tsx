@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
   Clock, FileText, FolderOpen, GitMerge, Loader, Mic, Moon, Paperclip, Play, Send, Square, X, Zap,
@@ -1108,8 +1109,9 @@ function PlanBanner({
 
 interface AttachedImage {
   key: string;
-  file: File;
-  previewUrl: string;
+  file?: File;        // picker / paste — upload on send
+  vaultPath?: string; // native Tauri drop — already in vault
+  previewUrl: string; // blob URL (picker) or data URL (native drop)
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -1245,11 +1247,47 @@ export function Chat() {
   const forgePodsRef = useRef<Map<string, ForgePodState>>(new Map());
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Keep agentsRef in sync so the stream listener can resolve names without a stale closure.
   useEffect(() => { agentsRef.current = agents; }, [agents]);
   useEffect(() => { forgePodsRef.current = forgePods; }, [forgePods]);
+
+  // Tauri native drag-drop — HTML5 ondrop never fires for OS file drops in Tauri.
+  useEffect(() => {
+    const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif"]);
+    let unlisten: (() => void) | null = null;
+    getCurrentWebview().onDragDropEvent(async (event) => {
+      const p = event.payload;
+      if (p.type === "drop") {
+        setIsDragOver(false);
+        const imagePaths = p.paths.filter(
+          (fp) => IMAGE_EXTS.has(fp.split(".").pop()?.toLowerCase() ?? "")
+        );
+        if (imagePaths.length === 0) return;
+        const results: AttachedImage[] = [];
+        for (const fp of imagePaths) {
+          try {
+            const [previewUrl, vaultPath] = await Promise.all([
+              invoke<string>("read_file_as_data_url", { path: fp }),
+              invoke<string>("save_upload_from_path", { srcPath: fp }),
+            ]);
+            results.push({ key: `drop-${Date.now()}-${Math.random()}`, vaultPath, previewUrl });
+          } catch (e) {
+            setImageError(`Failed to attach: ${e}`);
+          }
+        }
+        if (results.length > 0) setAttachedImages((prev) => [...prev, ...results]);
+      } else if (p.type === "over") {
+        setIsDragOver(true);
+      } else {
+        setIsDragOver(false);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Load agents + plan state + settings ─────────────────────────────────────
   useEffect(() => {
@@ -1674,8 +1712,15 @@ export function Chat() {
       const paths: string[] = [];
       for (const img of capturedImages) {
         try {
-          const b64 = await fileToBase64(img.file);
-          const savedPath = await invoke<string>("save_upload", { filename: img.file.name, dataBase64: b64 });
+          let savedPath: string;
+          if (img.vaultPath) {
+            savedPath = img.vaultPath; // native drop — already copied to vault
+          } else if (img.file) {
+            const b64 = await fileToBase64(img.file);
+            savedPath = await invoke<string>("save_upload", { filename: img.file.name, dataBase64: b64 });
+          } else {
+            continue;
+          }
           paths.push(savedPath);
         } catch (e) {
           setImageError(`Upload failed: ${e}`);
@@ -2181,15 +2226,7 @@ export function Chat() {
             )}
             {imageError && <p className="text-[10px] text-red-400 mb-2">{imageError}</p>}
 
-            <div
-              className="relative"
-              onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
-              onDrop={(e) => {
-                e.preventDefault();
-                const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
-                addImagesFromFileList(files);
-              }}
-            >
+            <div className={`relative transition-shadow${isDragOver ? " ring-2 ring-inset ring-zinc-500/60 rounded-xl" : ""}`}>
               {/* @mention dropdown */}
               {mentionQuery !== null && (
                 <MentionDropdown

@@ -2553,6 +2553,8 @@ fn main() {
             agents::get_run_trace,
             agents::drain_scheduled_runs,
             agents::save_upload,
+            agents::save_upload_from_path,
+            agents::read_file_as_data_url,
             forge::run_verification_gate,
             pod::run_pod,
             daily::get_plan_state,
