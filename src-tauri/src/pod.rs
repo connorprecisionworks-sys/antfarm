@@ -135,6 +135,7 @@ fn pod_loop(
     pod_id: String,
     repo_path: String,
     task: String,
+    context: Option<String>,
 ) {
     // Clear any stale builder session so this pod starts fresh.
     clear_agent_session_id("builder");
@@ -144,13 +145,20 @@ fn pod_loop(
     // ── PLAN ─────────────────────────────────────────────────────────────────
     emit_pod(&app, &pod_id, "planning", "start", "Planning the change…", None, None, None);
 
+    // Prepend conversation context so the planner understands follow-ups.
+    let planner_task = if let Some(ctx) = &context {
+        format!("{ctx}\n\nCurrent request: {task}")
+    } else {
+        task.clone()
+    };
+
     let plan = match spawn_agent_run(
         app.clone(),
         claude_path.clone(),
         children.clone(),
         reasons.clone(),
         "planner".to_string(),
-        task.clone(),
+        planner_task,
         Some(pod_id.clone()),
         false,
         Some(repo_path.clone()),
@@ -341,6 +349,7 @@ pub fn run_pod(
     agent_run: State<'_, AgentRunState>,
     repo_path: String,
     task: String,
+    context: Option<String>,
     _opts: Option<PodOptions>,
 ) -> Result<String, String> {
     let pod_id = new_pod_id();
@@ -351,7 +360,7 @@ pub fn run_pod(
     let repo_path = crate::agents::expand_tilde(&repo_path);
 
     std::thread::spawn(move || {
-        pod_loop(app, claude_path, children, reasons, pid, repo_path, task);
+        pod_loop(app, claude_path, children, reasons, pid, repo_path, task, context);
     });
 
     Ok(pod_id)
