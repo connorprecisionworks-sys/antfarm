@@ -18,6 +18,16 @@ import {
   setDismissedBuilders,
 } from "../lib/chatStore";
 import { Settings as SettingsType } from "../types";
+import {
+  type PodRoleKey,
+  type PodRoleState,
+  type PodTerminal,
+  POD_STEP_ROLE,
+  emptyPodRoles,
+  PodRoleTabs,
+  PodDoneCard,
+  PodNeedsYouCard,
+} from "../components/ForgePodPanel";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -79,13 +89,35 @@ interface TraceEntry {
 interface DelegationTask {
   agentId: string;
   task: string;
-  after?: string; // agentId this task must wait for before firing
+  after?: string;   // agentId this task must wait for before firing
+  repoName?: string; // forge only: raw repo name/path to resolve at fanout time
+}
+
+// Inline forge pod state (not persisted to chatStore — local to Chat component)
+interface ForgePodState {
+  podId: string;
+  repoPath: string;
+  roles: Record<PodRoleKey, PodRoleState>;
+  podStep: string;
+  running: boolean;
+  terminal: PodTerminal | null;
+  pushed: boolean;
+}
+
+interface PodStreamPayload {
+  podId: string;
+  step: string;
+  kind: string;
+  text: string;
+  commitMsg?: string;
+  diff?: string;
+  reviewerNote?: string;
 }
 
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
-const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder", "planner", "reviewer"]);
+const KNOWN_AGENT_IDS = new Set(["scout", "scribe", "clerk", "builder", "planner", "reviewer", "forge"]);
 
 /** Extract ```delegate\n...\n``` block from agent text. Returns null if absent. */
 function parseDelegations(text: string): DelegationTask[] | null {
@@ -112,7 +144,17 @@ function parseDelegations(text: string): DelegationTask[] | null {
         if (KNOWN_AGENT_IDS.has(dep)) after = dep;
       }
 
-      return { agentId, task: rawTask, after } as DelegationTask;
+      // For forge tasks: extract trailing "repo: <name>" from the task string.
+      let repoName: string | undefined;
+      if (agentId === "forge") {
+        const repoIdx = rawTask.toLowerCase().lastIndexOf(" repo:");
+        if (repoIdx !== -1) {
+          repoName = rawTask.slice(repoIdx + " repo:".length).trim();
+          rawTask  = rawTask.slice(0, repoIdx).trim();
+        }
+      }
+
+      return { agentId, task: rawTask, after, repoName } as DelegationTask;
     })
     .filter(Boolean) as DelegationTask[];
   return tasks.length > 0 ? tasks : null;
@@ -165,6 +207,7 @@ function DelegationCard({
   fanned: boolean;
 }) {
   function agentName(id: string) {
+    if (id === "forge") return "Forge";
     return agents.find((a) => a.id === id)?.name ?? id;
   }
   return (
@@ -183,6 +226,9 @@ function DelegationCard({
             </span>
             <span className="text-zinc-400 leading-relaxed">
               {t.task}
+              {t.repoName && (
+                <span className="ml-1.5 text-zinc-600 font-mono">· {t.repoName}</span>
+              )}
               {t.after && (
                 <span className="ml-1.5 text-zinc-600">· after {agentName(t.after)}</span>
               )}
@@ -801,6 +847,64 @@ function TabbedDelegation({
   );
 }
 
+// ── InlineForgePod ────────────────────────────────────────────────────────────
+
+function InlineForgePod({
+  pod,
+  onPush,
+}: {
+  pod: { podId: string; repoPath: string; roles: Record<PodRoleKey, PodRoleState>; podStep: string; running: boolean; terminal: PodTerminal | null; pushed: boolean };
+  onPush: () => void;
+}) {
+  const [activeRole, setActiveRole] = useState<PodRoleKey>("planner");
+  const textRef = useRef<HTMLPreElement>(null);
+  const repoBase = pod.repoPath.split("/").pop() ?? pod.repoPath;
+
+  // Auto-advance tab to the active step's role.
+  useEffect(() => {
+    const stepRole = POD_STEP_ROLE[pod.podStep] as PodRoleKey | undefined;
+    if (stepRole) setActiveRole(stepRole);
+  }, [pod.podStep]);
+
+  // Auto-scroll text area.
+  useEffect(() => {
+    if (textRef.current) textRef.current.scrollTop = textRef.current.scrollHeight;
+  }, [pod.roles[activeRole].text]);
+
+  return (
+    <div className="ml-5 border-l-2 border-blue-800/40 pl-3 space-y-2">
+      <div className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+        <Bot size={11} className="shrink-0" />
+        <span className="text-zinc-400 font-medium">Forge</span>
+        <span className="text-zinc-600">·</span>
+        <code className="text-zinc-500">{repoBase}</code>
+        {pod.running && <Loader size={9} className="animate-spin text-blue-400 ml-1 shrink-0" />}
+      </div>
+      <PodRoleTabs
+        roles={pod.roles}
+        activeRole={activeRole}
+        onSetRole={setActiveRole}
+        textRef={textRef}
+        podStep={pod.podStep}
+        running={pod.running}
+      />
+      {pod.terminal?.kind === "ready_to_push" && (
+        <PodDoneCard
+          repoPath={pod.repoPath}
+          commitMsg={pod.terminal.commitMsg}
+          diff={pod.terminal.diff}
+          reviewerNote={pod.terminal.reviewerNote}
+          pushed={pod.pushed}
+          onPush={onPush}
+        />
+      )}
+      {pod.terminal?.kind === "needs_you" && (
+        <PodNeedsYouCard text={pod.terminal.text} />
+      )}
+    </div>
+  );
+}
+
 // ── Seeded message components ─────────────────────────────────────────────────
 
 function NeedsYouMsg({ msg, onDismiss }: { msg: Msg; onDismiss: (id: string) => void }) {
@@ -1103,9 +1207,14 @@ export function Chat() {
     after: string;
     parentEntryId: string;
   }>>([]);
+  // Inline forge pod state (not in chatStore — local, not persisted).
+  const [forgePods, setForgePods] = useState<Map<string, ForgePodState>>(new Map());
+  // Stable ref so event listeners can read forgePods without stale closures.
+  const forgePodsRef = useRef<Map<string, ForgePodState>>(new Map());
 
   // Keep agentsRef in sync so the stream listener can resolve names without a stale closure.
   useEffect(() => { agentsRef.current = agents; }, [agents]);
+  useEffect(() => { forgePodsRef.current = forgePods; }, [forgePods]);
 
   // ── Load agents + plan state + settings ─────────────────────────────────────
   useEffect(() => {
@@ -1221,12 +1330,90 @@ export function Chat() {
       });
   }, []);
 
+  // ── pod-stream listener (inline forge pods delegated from Jack) ──────────────
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    listen<PodStreamPayload>("pod-stream", (event) => {
+      const p = event.payload;
+      // Find which entry this pod belongs to via forgePodsRef.
+      let matchedEntryId: string | null = null;
+      for (const [entryId, pod] of forgePodsRef.current.entries()) {
+        if (pod.podId === p.podId) { matchedEntryId = entryId; break; }
+      }
+      if (!matchedEntryId) return;
+      const entryId = matchedEntryId;
+
+      setForgePods((prev) => {
+        const pod = prev.get(entryId);
+        if (!pod) return prev;
+        const next = new Map(prev);
+        if (p.kind === "ready_to_push") {
+          next.set(entryId, {
+            ...pod,
+            podStep: p.step,
+            running: false,
+            terminal: { kind: "ready_to_push", commitMsg: p.commitMsg ?? "", diff: p.diff ?? "", reviewerNote: p.reviewerNote },
+          });
+        } else if (p.kind === "needs_you") {
+          next.set(entryId, { ...pod, running: false, terminal: { kind: "needs_you", text: p.text } });
+        } else {
+          next.set(entryId, { ...pod, podStep: p.step });
+        }
+        return next;
+      });
+
+      // Flip stream entry to "done" when terminal fires so the entry stops looking live.
+      if (p.kind === "ready_to_push" || p.kind === "needs_you") {
+        setStreamEntries((prev) =>
+          prev.map((e) => e.id === entryId ? { ...e, status: "done" as const } : e)
+        );
+      }
+    }).then((fn) => { unlisten = fn; });
+
+    return () => { unlisten?.(); };
+  }, []);
+
   // ── agent-stream event listener ──────────────────────────────────────────────
   useEffect(() => {
     let unlisten: (() => void) | null = null;
 
     listen<AgentStreamPayload>("agent-stream", (event) => {
       const { runId, agentId, kind, text, inputTokens = 0, outputTokens = 0, usagePct = 0, outputs = [] } = event.payload;
+
+      // Intercept events belonging to inline forge pod sub-agents (planner/builder/reviewer
+      // whose parentRunId matches a forge pod ID). Handle separately; don't let them
+      // accidentally update regular stream entries.
+      const parentRunId = event.payload.parentRunId;
+      const forgePodRole = parentRunId
+        ? [...forgePodsRef.current.entries()].find(([, pod]) => pod.podId === parentRunId)
+        : null;
+
+      if (forgePodRole) {
+        const [entryId] = forgePodRole;
+        const role = agentId as PodRoleKey;
+        if (["planner", "builder", "reviewer"].includes(role)) {
+          setForgePods((prev) => {
+            const pod = prev.get(entryId);
+            if (!pod) return prev;
+            const next = new Map(prev);
+            const r = pod.roles[role];
+            let newRoles = pod.roles;
+            switch (kind) {
+              case "start":    newRoles = { ...pod.roles, [role]: { status: "running" as const, activity: "", text: "" } }; break;
+              case "text":     newRoles = { ...pod.roles, [role]: { ...r, text: r.text + text, status: "running" as const } }; break;
+              case "activity": newRoles = { ...pod.roles, [role]: { ...r, activity: text } }; break;
+              case "done":     newRoles = { ...pod.roles, [role]: { ...r, status: "done" as const, activity: "" } }; break;
+              case "error": case "timeout": case "stopped":
+                               newRoles = { ...pod.roles, [role]: { ...r, status: "error" as const, activity: "" } }; break;
+            }
+            next.set(entryId, { ...pod, roles: newRoles });
+            return next;
+          });
+        }
+        return; // don't fall through to the regular stream-entry updater
+      }
+
       if (kind === "start") return;
 
       setStreamEntries((prev) =>
@@ -1458,35 +1645,113 @@ export function Chat() {
     }
   }
 
+  // ── Forge repo resolution ─────────────────────────────────────────────────────
+  function resolveForgeRepo(repoName: string): string | null {
+    if (!repoName) return null;
+    if (repoName.startsWith("/")) return repoName; // already absolute
+
+    const lower = repoName.toLowerCase();
+    const normalize = (s: string) => s.replace(/[.-]/g, "").toLowerCase();
+    const normLower = normalize(lower);
+
+    // 1. Match against known projects (name, slug, repo basenames)
+    for (const p of repoProjects) {
+      if (normalize(p.name) === normLower || normalize(p.slug) === normLower) {
+        return p.repos[0] ?? null;
+      }
+      for (const repo of p.repos) {
+        const base = repo.split("/").pop() ?? "";
+        if (normalize(base) === normLower || repo.toLowerCase().includes(lower)) return repo;
+      }
+    }
+
+    // 2. Match against Forge recents (localStorage)
+    const recents: string[] = (() => {
+      try { return JSON.parse(localStorage.getItem("forge:recentRepos") ?? "[]"); }
+      catch { return []; }
+    })();
+    for (const r of recents) {
+      const base = r.split("/").pop() ?? "";
+      if (normalize(base) === normLower || r.toLowerCase().includes(lower)) return r;
+    }
+
+    return null;
+  }
+
   // ── Fan-out handler ───────────────────────────────────────────────────────────
   async function handleFanout(parentEntryId: string, tasks: DelegationTask[]) {
     setFannedIds((prev) => new Set([...prev, parentEntryId]));
     setChattersOpen((prev) => new Set([...prev, parentEntryId]));
 
-    const agentName = (id: string) =>
-      agents.find((a) => a.id === id)?.name ?? id;
+    const resolvedAgentName = (id: string) =>
+      id === "forge" ? "Forge" : agents.find((a) => a.id === id)?.name ?? id;
 
-    // Create placeholders for ALL tasks upfront
+    // Create placeholders for ALL tasks upfront (forge + regular).
     const childDefs = tasks.map((t) => ({
       id:        `child-${t.agentId}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       runId:     "",
       agentId:   t.agentId,
-      agentName: agentName(t.agentId),
+      agentName: resolvedAgentName(t.agentId),
       text:      "",
       status:    "thinking" as const,
-      activity:  t.after ? `waiting for ${agentName(t.after)}` : undefined,
+      activity:  t.after ? `waiting for ${resolvedAgentName(t.after)}` : undefined,
       time:      nowTime(),
       parentId:  parentEntryId,
     }));
 
     setStreamEntries((prev) => [...prev, ...childDefs]);
-    setRunningAgents((prev) => new Set([...prev, ...tasks.map((t) => t.agentId)]));
+    // Don't add "forge" to runningAgents — it's not a regular agent.
+    const regularAgentIds = tasks.filter((t) => t.agentId !== "forge").map((t) => t.agentId);
+    setRunningAgents((prev) => new Set([...prev, ...regularAgentIds]));
 
     // For each task: fire immediately if independent, queue if it has a dep.
     for (let i = 0; i < tasks.length; i++) {
       const t = tasks[i];
       const child = childDefs[i];
 
+      // ── Forge delegation ────────────────────────────────────────────────────
+      if (t.agentId === "forge") {
+        const repoPath = t.repoName ? resolveForgeRepo(t.repoName) : null;
+        if (!repoPath) {
+          setStreamEntries((prev) =>
+            prev.map((e) =>
+              e.id === child.id
+                ? { ...e, text: `Could not resolve repo "${t.repoName ?? "(none)"}". Please specify a full path.`, status: "error" as const }
+                : e
+            )
+          );
+          continue;
+        }
+
+        invoke<string>("run_pod", { repoPath, task: t.task, context: null })
+          .then((podId) => {
+            setForgePods((prev) => {
+              const next = new Map(prev);
+              next.set(child.id, {
+                podId,
+                repoPath,
+                roles: emptyPodRoles(),
+                podStep: "planning",
+                running: true,
+                terminal: null,
+                pushed: false,
+              });
+              return next;
+            });
+          })
+          .catch((err) => {
+            setStreamEntries((prev) =>
+              prev.map((e) =>
+                e.id === child.id
+                  ? { ...e, text: `Forge pod failed to start: ${err}`, status: "error" as const }
+                  : e
+              )
+            );
+          });
+        continue;
+      }
+
+      // ── Regular agent delegation ─────────────────────────────────────────────
       if (t.after) {
         // Queue — will be fired in the stream listener when `after` completes.
         pendingDepsRef.current.push({
@@ -1680,6 +1945,8 @@ export function Chat() {
                 {/* Live stream entries */}
                 {rootEntries.map((entry) => {
                   const kids = childrenOf(entry.id);
+                  const regularKids = kids.filter((k) => k.agentId !== "forge");
+                  const forgePodKids = kids.filter((k) => k.agentId === "forge");
                   return (
                     <div key={entry.id} className="space-y-2">
                       {entry.userMsg && (
@@ -1698,9 +1965,9 @@ export function Chat() {
                           setDismissedBuilders((prev) => new Set([...prev, entry.id]))
                         }
                       />
-                      {kids.length > 0 && (
+                      {regularKids.length > 0 && (
                         <TabbedDelegation
-                          children={kids}
+                          children={regularKids}
                           collapsed={!chattersOpen.has(entry.id)}
                           onToggle={() =>
                             setChattersOpen((prev) => {
@@ -1718,6 +1985,24 @@ export function Chat() {
                           }
                         />
                       )}
+                      {forgePodKids.map((kid) => {
+                        const pod = forgePods.get(kid.id);
+                        if (!pod) return null;
+                        return (
+                          <InlineForgePod
+                            key={kid.id}
+                            pod={pod}
+                            onPush={() =>
+                              setForgePods((prev) => {
+                                const next = new Map(prev);
+                                const p = next.get(kid.id);
+                                if (p) next.set(kid.id, { ...p, pushed: true });
+                                return next;
+                              })
+                            }
+                          />
+                        );
+                      })}
                     </div>
                   );
                 })}

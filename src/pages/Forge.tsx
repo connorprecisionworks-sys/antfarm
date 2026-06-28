@@ -2,10 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import {
-  AlertTriangle, Check, ChevronDown, ChevronRight,
-  FileText, FolderOpen, GitMerge, Loader, Send, Zap,
-} from "lucide-react";
+import { ChevronDown, FolderOpen, Loader, Send, Zap } from "lucide-react";
 import {
   type RoleKey,
   type RoleState,
@@ -16,6 +13,14 @@ import {
   appendTurn,
   markPushed,
 } from "../lib/forgeThreadStore";
+import {
+  type PodRoleKey,
+  POD_STEP_ROLE,
+  emptyPodRoles,
+  PodRoleTabs,
+  PodDoneCard,
+  PodNeedsYouCard,
+} from "../components/ForgePodPanel";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -37,8 +42,6 @@ interface AgentStreamPayload {
   parentRunId?: string;
 }
 
-// In-memory state for the currently running (or just-finished) pod turn.
-// Persisted to forgeThreadStore only when a terminal event fires.
 interface ActiveTurn {
   id: string;
   userMessage: string;
@@ -56,34 +59,7 @@ interface ActiveTurn {
 
 const RECENTS_KEY = "forge:recentRepos";
 const MAX_RECENTS = 5;
-const ROLES: RoleKey[] = ["planner", "builder", "reviewer"];
-const ROLE_LABELS: Record<RoleKey, string> = {
-  planner: "Planner",
-  builder: "Builder",
-  reviewer: "Reviewer",
-};
-const STEP_ROLE: Partial<Record<string, RoleKey>> = {
-  planning:  "planner",
-  building:  "builder",
-  reviewing: "reviewer",
-};
-const STEP_LABEL: Record<string, string> = {
-  planning:      "Planning the change…",
-  building:      "Writing the code…",
-  verifying:     "Checking it builds…",
-  reviewing:     "Reviewing the logic…",
-  ready_to_push: "Done and safe — ready to publish.",
-  needs_you:     "Needs your attention.",
-};
 const FALLBACK_REPO = "/Users/connordore/Desktop/antfarm-write-test";
-
-function emptyRoles(): Record<RoleKey, RoleState> {
-  return {
-    planner:  { status: "idle", activity: "", text: "" },
-    builder:  { status: "idle", activity: "", text: "" },
-    reviewer: { status: "idle", activity: "", text: "" },
-  };
-}
 
 function newTurnId(): string {
   return `turn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -124,234 +100,7 @@ function buildContext(turns: ForgeTurn[], hasCumulativeDiff: boolean): string | 
   return ctx;
 }
 
-// ── PodRoleTabs ───────────────────────────────────────────────────────────────
-
-function PodRoleTabs({
-  roles,
-  activeRole,
-  onSetRole,
-  textRef,
-  podStep,
-  running,
-}: {
-  roles: Record<RoleKey, RoleState>;
-  activeRole: RoleKey;
-  onSetRole: (r: RoleKey) => void;
-  textRef?: React.RefObject<HTMLPreElement>;
-  podStep?: string;
-  running?: boolean;
-}) {
-  const stepLabel = STEP_LABEL[podStep ?? ""] ?? "";
-
-  return (
-    <div className="space-y-1.5">
-      {stepLabel && (
-        <div className="flex items-center gap-2 text-[11px] text-zinc-500">
-          {running && <Loader size={10} className="animate-spin text-blue-400 shrink-0" />}
-          <span>{stepLabel}</span>
-        </div>
-      )}
-
-      <div className="border border-zinc-800/50 rounded-lg overflow-hidden">
-        {/* Tab bar */}
-        <div className="flex border-b border-zinc-800/60 bg-zinc-900/40">
-          {ROLES.map((role) => {
-            const r       = roles[role];
-            const isActive = role === activeRole;
-            const isLive   = r.status === "running";
-            return (
-              <button
-                key={role}
-                onClick={() => onSetRole(role)}
-                className={`flex items-center gap-1.5 px-3 py-2 text-[11px] border-r border-zinc-800/60 last:border-r-0 transition-colors ${
-                  isActive
-                    ? "bg-zinc-800/60 text-zinc-100"
-                    : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30"
-                }`}
-              >
-                <span
-                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                    isLive
-                      ? "bg-blue-400 animate-pulse"
-                      : r.status === "done"
-                      ? "bg-emerald-400"
-                      : r.status === "error"
-                      ? "bg-red-400"
-                      : "bg-zinc-600"
-                  }`}
-                />
-                {ROLE_LABELS[role]}
-                {isLive && r.activity && (
-                  <span className="text-[10px] text-blue-400/60 truncate max-w-24">
-                    {r.activity}
-                  </span>
-                )}
-                {r.status !== "idle" && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      invoke("open_agent_log", { agentId: role }).catch(() => {});
-                    }}
-                    title="View vault log"
-                    className="ml-auto text-zinc-600 hover:text-zinc-400 transition-colors"
-                  >
-                    <FileText size={10} />
-                  </button>
-                )}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Tab content */}
-        <div className="p-3">
-          {roles[activeRole].status === "idle" ? (
-            <p className="text-[11px] text-zinc-600 min-h-8 flex items-center">
-              {podStep === "verifying" && activeRole === "builder"
-                ? "Build gate running…"
-                : "Waiting…"}
-            </p>
-          ) : (
-            <pre
-              ref={textRef}
-              className="text-[11px] font-mono text-zinc-300 whitespace-pre-wrap break-words overflow-auto max-h-56 min-h-8 leading-relaxed"
-            >
-              {roles[activeRole].text || (
-                <span className="text-zinc-600">
-                  {roles[activeRole].status === "running" ? "Starting…" : "No output."}
-                </span>
-              )}
-            </pre>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── TurnDoneCard ──────────────────────────────────────────────────────────────
-
-function TurnDoneCard({
-  repoPath,
-  commitMsg,
-  diff,
-  reviewerNote,
-  pushed,
-  hasCumulativeDiff,
-  onPush,
-}: {
-  repoPath: string;
-  commitMsg: string;
-  diff: string;
-  reviewerNote?: string;
-  pushed: boolean;
-  hasCumulativeDiff: boolean;
-  onPush: () => void;
-}) {
-  const [pushing, setPushing]     = useState(false);
-  const [pushError, setPushError] = useState<string | null>(null);
-  const [showDiff, setShowDiff]   = useState(false);
-
-  async function handlePush() {
-    if (pushed || pushing) return;
-    setPushing(true);
-    setPushError(null);
-    try {
-      await invoke("builder_commit_push", { repoPath, commitMessage: commitMsg });
-      onPush();
-    } catch (e) {
-      setPushError(String(e));
-    } finally {
-      setPushing(false);
-    }
-  }
-
-  const verdictSummary = reviewerNote
-    ? reviewerNote
-        .replace(/---REVIEW: PASS---[\s\S]*$/, "")
-        .replace(/---REVIEW: FAIL:[\s\S]*$/, "")
-        .trim()
-        .slice(0, 500) || reviewerNote.slice(0, 500)
-    : undefined;
-
-  return (
-    <div className="mt-2 border border-emerald-700/40 rounded-lg bg-emerald-950/20 px-4 py-3">
-      <div className="flex items-center gap-2 mb-2.5">
-        <GitMerge size={12} className="text-emerald-400" />
-        <span className="text-xs font-medium text-zinc-200">Build green — ready to push</span>
-      </div>
-
-      {hasCumulativeDiff && (
-        <div className="mb-2.5 flex items-start gap-1.5 text-[11px] text-amber-400/80 bg-amber-950/20 border border-amber-700/30 rounded px-2 py-1.5">
-          <AlertTriangle size={11} className="shrink-0 mt-0.5" />
-          <span>Cumulative diff — includes uncommitted changes from a prior turn.</span>
-        </div>
-      )}
-
-      <p className="text-[11px] font-mono text-zinc-300 bg-zinc-900/60 rounded px-2 py-1.5 mb-2.5 break-all">
-        {commitMsg}
-      </p>
-
-      {verdictSummary ? (
-        <div className="mb-3 border-l-2 border-emerald-700/40 pl-2.5">
-          <p className="text-[10px] text-emerald-400 font-medium mb-0.5">Reviewer verdict</p>
-          <p className="text-[11px] text-zinc-300 whitespace-pre-wrap leading-relaxed">
-            {verdictSummary}{verdictSummary.length >= 500 ? "…" : ""}
-          </p>
-        </div>
-      ) : (
-        <p className="text-[10px] text-zinc-600 mb-2.5 italic">
-          Reviewer did not emit a verdict (treated as pass).
-        </p>
-      )}
-
-      {diff && (
-        <div className="mb-3">
-          <button
-            onClick={() => setShowDiff((v) => !v)}
-            className="flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors mb-1"
-          >
-            {showDiff ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-            {showDiff ? "Hide diff" : "Show diff"}
-          </button>
-          {showDiff && (
-            <pre className="text-[10px] font-mono text-zinc-400 bg-zinc-900/70 rounded p-2 overflow-auto max-h-60 whitespace-pre break-all">
-              {diff}
-            </pre>
-          )}
-        </div>
-      )}
-
-      {pushError && <p className="text-[11px] text-red-400 mb-2 break-all">{pushError}</p>}
-
-      {pushed ? (
-        <span className="flex items-center gap-1 text-xs text-emerald-400">
-          <Check size={11} /> Committed and pushed
-        </span>
-      ) : (
-        <button
-          onClick={handlePush}
-          disabled={pushing}
-          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-emerald-700/60 hover:bg-emerald-700 disabled:opacity-50 text-emerald-100 border border-emerald-600/50 transition-colors"
-        >
-          <GitMerge size={11} />
-          {pushing ? "Pushing…" : "Approve & push"}
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ── TurnNeedsYouCard ──────────────────────────────────────────────────────────
-
-function TurnNeedsYouCard({ text }: { text: string }) {
-  return (
-    <div className="mt-2 border border-amber-700/40 rounded-lg bg-amber-950/20 px-4 py-3">
-      <p className="text-xs font-medium text-amber-300 mb-1.5">Needs your attention</p>
-      <p className="text-[11px] text-zinc-300 whitespace-pre-wrap leading-relaxed">{text}</p>
-    </div>
-  );
-}
+// (PodRoleTabs, PodDoneCard, PodNeedsYouCard are imported from ForgePodPanel)
 
 // ── UserBubble ────────────────────────────────────────────────────────────────
 
@@ -387,7 +136,7 @@ function CompletedTurnView({
         onSetRole={setActiveRole}
       />
       {turn.terminal?.kind === "ready_to_push" && (
-        <TurnDoneCard
+        <PodDoneCard
           repoPath={repoPath}
           commitMsg={turn.terminal.commitMsg}
           diff={turn.terminal.diff}
@@ -398,7 +147,7 @@ function CompletedTurnView({
         />
       )}
       {turn.terminal?.kind === "needs_you" && (
-        <TurnNeedsYouCard text={turn.terminal.text} />
+        <PodNeedsYouCard text={turn.terminal.text} />
       )}
     </div>
   );
@@ -420,7 +169,7 @@ function ActiveTurnView({
   // Auto-advance tab while the pod is running, respect user's choice when done.
   useEffect(() => {
     if (!turn.running) return;
-    const suggested = STEP_ROLE[turn.podStep];
+    const suggested = POD_STEP_ROLE[turn.podStep];
     if (suggested) setActiveRole(suggested);
   }, [turn.podStep, turn.running]);
 
@@ -436,7 +185,7 @@ function ActiveTurnView({
         running={turn.running}
       />
       {turn.terminal?.kind === "ready_to_push" && (
-        <TurnDoneCard
+        <PodDoneCard
           repoPath={turn.repoPath}
           commitMsg={turn.terminal.commitMsg}
           diff={turn.terminal.diff}
@@ -447,7 +196,7 @@ function ActiveTurnView({
         />
       )}
       {turn.terminal?.kind === "needs_you" && (
-        <TurnNeedsYouCard text={turn.terminal.text} />
+        <PodNeedsYouCard text={turn.terminal.text} />
       )}
     </div>
   );
@@ -506,7 +255,7 @@ export function Forge() {
 
       setActiveTurn((prev) => {
         if (!prev || prev.podId !== podId) return prev;
-        const suggestedRole = STEP_ROLE[p.step];
+        const suggestedRole = POD_STEP_ROLE[p.step];
 
         if (p.kind === "ready_to_push") {
           const terminal: ForgeTurnTerminal = {
@@ -538,7 +287,7 @@ export function Forge() {
             userMessage: prev.userMessage,
             podId: prev.podId,
             roleEntries: { ...prev.roles },
-            activeRole: (STEP_ROLE[step] ?? "builder"),
+            activeRole: (POD_STEP_ROLE[step] ?? "builder"),
             terminal,
             pushed: false,
           });
@@ -556,8 +305,8 @@ export function Forge() {
     listen<AgentStreamPayload>("agent-stream", (ev) => {
       const p = ev.payload;
       if (p.parentRunId !== podId) return;
-      const role = p.agentId as RoleKey;
-      if (!ROLES.includes(role)) return;
+      const role = p.agentId as PodRoleKey;
+      if (!["planner", "builder", "reviewer"].includes(role)) return;
 
       setActiveTurn((prev) => {
         if (!prev || prev.podId !== podId) return prev;
@@ -644,7 +393,7 @@ export function Forge() {
       userMessage: message,
       podId: "", // filled in after invoke
       repoPath: path,
-      roles: emptyRoles(),
+      roles: emptyPodRoles(),
       podStep: "planning",
       running: true,
       terminal: null,
@@ -686,11 +435,13 @@ export function Forge() {
     <div className="flex flex-col h-full bg-zinc-950 overflow-hidden">
       {/* ── Header + repo picker ─────────────────────────────────────── */}
       <div className="shrink-0 px-5 pt-4 pb-3 border-b border-zinc-800">
-        <div className="mb-3">
+        <div className="mb-3 flex items-baseline gap-2">
           <h1 className="text-sm font-semibold text-zinc-100 leading-none">Forge</h1>
-          <p className="text-[11px] text-zinc-500 mt-0.5">
-            Planner → Builder → Gate → Reviewer
-          </p>
+          {repoPath && (
+            <span className="text-[11px] text-zinc-500 font-mono truncate max-w-[180px]" title={repoPath}>
+              {repoPath.split("/").filter(Boolean).at(-1) ?? repoPath}
+            </span>
+          )}
         </div>
 
         {/* Repo picker */}

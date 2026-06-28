@@ -19,20 +19,23 @@ import {
   MessageSquare,
 } from "lucide-react";
 
-const NAV = [
+const PRIMARY_NAV = [
   { to: "/morning", label: "Morning",  icon: Sunrise,       end: false },
   { to: "/tonight", label: "Tonight",  icon: Moon,          end: false },
   { to: "/chat",    label: "Chat",     icon: MessageSquare, end: false },
   { to: "/forge",   label: "Forge",    icon: Cpu,           end: false },
   { to: "/voice",   label: "Voice",    icon: Radio,         end: false },
-  { to: "/", label: "Home", icon: Home, end: true },
-  { to: "/projects", label: "Projects", icon: Layers, end: false },
-  { to: "/sessions", label: "Sessions", icon: Activity, end: false },
-  { to: "/memory", label: "Memory", icon: Brain, end: false },
-  { to: "/usage", label: "Usage", icon: BarChart2, end: false },
-  { to: "/wrapped", label: "Wrapped", icon: Gift, end: false },
-  { to: "/workspace", label: "Workspace", icon: PanelLeft, end: false },
-  { to: "/settings", label: "Settings", icon: Settings, end: false },
+];
+
+const SECONDARY_NAV = [
+  { to: "/",          label: "Home",      icon: Home,     end: true  },
+  { to: "/projects",  label: "Projects",  icon: Layers,   end: false },
+  { to: "/sessions",  label: "Sessions",  icon: Activity, end: false },
+  { to: "/memory",    label: "Memory",    icon: Brain,    end: false },
+  { to: "/usage",     label: "Usage",     icon: BarChart2,end: false },
+  { to: "/wrapped",   label: "Wrapped",   icon: Gift,     end: false },
+  { to: "/workspace", label: "Workspace", icon: PanelLeft,end: false },
+  { to: "/settings",  label: "Settings",  icon: Settings, end: false },
 ];
 
 export function Sidebar() {
@@ -83,8 +86,8 @@ export function Sidebar() {
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 px-2 py-3 space-y-0.5">
-        {NAV.filter(({ to }) => {
+      <nav className="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
+        {PRIMARY_NAV.filter(({ to }) => {
           if (to === "/morning") return features.morning;
           if (to === "/tonight") return features.tonight;
           if (to === "/voice")   return features.voice;
@@ -105,13 +108,34 @@ export function Sidebar() {
           >
             <Icon size={16} strokeWidth={1.75} className="shrink-0" />
             <span className="flex-1">{label}</span>
+            {label === "Tonight" && showPlanNudge && (
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+            )}
+          </NavLink>
+        ))}
+
+        <div className="mx-1 my-2 border-t border-zinc-800/70" />
+
+        {SECONDARY_NAV.map(({ to, label, icon: Icon, end }) => (
+          <NavLink
+            key={to}
+            to={to}
+            end={end}
+            className={({ isActive }) =>
+              [
+                "flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors duration-100",
+                isActive
+                  ? "bg-zinc-800 text-zinc-100 font-medium"
+                  : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50",
+              ].join(" ")
+            }
+          >
+            <Icon size={16} strokeWidth={1.75} className="shrink-0" />
+            <span className="flex-1">{label}</span>
             {label === "Sessions" && liveCount > 0 && (
               <span className="text-xs bg-emerald-900/60 text-emerald-400 px-1.5 py-0.5 rounded-full leading-none tabular-nums">
                 {liveCount}
               </span>
-            )}
-            {label === "Tonight" && showPlanNudge && (
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
             )}
           </NavLink>
         ))}
