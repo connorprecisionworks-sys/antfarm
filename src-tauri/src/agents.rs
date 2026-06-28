@@ -608,9 +608,10 @@ fn gws_granted(connectors: &[String]) -> Vec<String> {
 }
 
 /// Comma-separated --allowedTools list for a networked agent.
-/// Bash is intentionally absent — no shell for networked agents.
+/// Bash, Write, Edit, MultiEdit, NotebookEdit are intentionally absent —
+/// networked agents are read-plus-connectors only; no file writes.
 fn networked_allowed_tools(connectors: &[String]) -> String {
-    let mut tools = vec!["Read", "Write", "Edit", "Glob", "Grep"];
+    let mut tools = vec!["Read", "Glob", "Grep"];
     for c in connectors {
         match c.as_str() {
             "web" => {
@@ -635,13 +636,16 @@ fn networked_allowed_tools(connectors: &[String]) -> String {
 /// Composition:
 ///   • builder advisory (default): Write,Edit,MultiEdit,NotebookEdit,Bash + all 44 GWS tools
 ///   • builder write mode:         NotebookEdit + all 44 GWS tools (Write/Edit/Bash granted)
-///   • networked agents:           Bash + (44 GWS universe minus this agent's granted GWS tools)
+///   • networked agents:           Write,Edit,MultiEdit,NotebookEdit,Bash +
+///                                 (44 GWS universe minus this agent's granted GWS tools)
+///   • offline-code non-builder:   Write,Edit,MultiEdit,NotebookEdit,Bash + all GWS
 ///   • start_google_auth always denied for everyone
 pub(crate) fn build_deny_list(agent_id: &str, profile: &str, connectors: &[String], builder_write: bool) -> String {
     let mut deny: Vec<String> = Vec::new();
 
     if profile == "networked" {
-        deny.push("Bash".to_string());
+        // No file writes for life/ops agents — only read + connectors.
+        deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
         if !connectors.iter().any(|c| c == "web") {
             deny.push("WebSearch".to_string());
             deny.push("WebFetch".to_string());
@@ -1524,6 +1528,21 @@ mod tests {
         assert!(!deny.contains("Edit"),   "write mode must not deny Edit");
         assert!(!deny.contains("Bash"),   "write mode must not deny Bash");
         assert!(deny.contains("NotebookEdit"), "write mode must still deny NotebookEdit");
+    }
+
+    #[test]
+    fn networked_agent_cannot_write_files() {
+        // Clerk, Scout, Scribe are profile="networked". They must never be able
+        // to edit application source — only the write-mode Builder/Forge pod can.
+        for agent_id in &["clerk", "scout", "scribe"] {
+            let deny = deny_set(agent_id, "networked");
+            for tool in &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] {
+                assert!(
+                    deny.contains(*tool),
+                    "networked agent '{agent_id}' deny list must include {tool}, got: {deny:?}"
+                );
+            }
+        }
     }
 }
 
