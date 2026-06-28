@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AtSign, Bot, Calendar, Check, ChevronDown, ChevronRight,
-  Clock, FileText, FolderOpen, GitMerge, Loader, Mic, Moon, Play, Send, Square, X, Zap,
+  Clock, FileText, FolderOpen, GitMerge, Loader, Mic, Moon, Paperclip, Play, Send, Square, X, Zap,
 } from "lucide-react";
 import {
   type StreamEntry,
@@ -1104,13 +1104,45 @@ function PlanBanner({
   );
 }
 
+// ── Image upload helpers ──────────────────────────────────────────────────────
+
+interface AttachedImage {
+  key: string;
+  file: File;
+  previewUrl: string;
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve((reader.result as string).split(",")[1] ?? "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
 // ── User message bubble ───────────────────────────────────────────────────────
 
-function UserMsgBubble({ text, time }: { text: string; time: string }) {
+function UserMsgBubble({ text, time, images }: { text: string; time: string; images?: string[] }) {
   return (
     <div className="flex justify-end">
       <div className="max-w-[80%] bg-zinc-800 border border-zinc-700/50 rounded-xl px-4 py-2.5">
-        <p className="text-sm text-zinc-100 leading-relaxed whitespace-pre-wrap">{text}</p>
+        {images && images.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {images.map((url, i) => (
+              <img
+                key={i}
+                src={url}
+                className="h-24 max-w-[200px] object-cover rounded-lg"
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+              />
+            ))}
+          </div>
+        )}
+        {text && <p className="text-sm text-zinc-100 leading-relaxed whitespace-pre-wrap">{text}</p>}
         <p className="text-[10px] text-zinc-600 mt-1 text-right">{time}</p>
       </div>
     </div>
@@ -1211,6 +1243,9 @@ export function Chat() {
   const [forgePods, setForgePods] = useState<Map<string, ForgePodState>>(new Map());
   // Stable ref so event listeners can read forgePods without stale closures.
   const forgePodsRef = useRef<Map<string, ForgePodState>>(new Map());
+  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Keep agentsRef in sync so the stream listener can resolve names without a stale closure.
   useEffect(() => { agentsRef.current = agents; }, [agents]);
@@ -1582,10 +1617,28 @@ export function Chat() {
     setIsListening(true);
   }
 
+  // ── Image attach helpers ─────────────────────────────────────────────────────
+  function addImagesFromFileList(files: File[]) {
+    setImageError(null);
+    const toAdd: AttachedImage[] = [];
+    for (const file of files) {
+      if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+        setImageError(`${file.name}: only png, jpg, webp, gif accepted`);
+        continue;
+      }
+      if (file.size > MAX_IMAGE_BYTES) {
+        setImageError(`${file.name}: too large (max 10 MB)`);
+        continue;
+      }
+      toAdd.push({ key: `${Date.now()}-${Math.random()}`, file, previewUrl: URL.createObjectURL(file) });
+    }
+    if (toAdd.length > 0) setAttachedImages((prev) => [...prev, ...toAdd]);
+  }
+
   // ── Send handler ──────────────────────────────────────────────────────────────
   async function handleSend() {
     const raw = draft.trim();
-    if (!raw || !recipient) return;
+    if ((!raw && attachedImages.length === 0) || !recipient) return;
 
     // Parse leading @mention to override recipient.
     // "@scout research X" → target scout, task = "research X"
@@ -1605,17 +1658,41 @@ export function Chat() {
 
     setDraft("");
     setMentionQuery(null);
+    const capturedImages = attachedImages;
+    setAttachedImages([]);
+    setImageError(null);
 
     const entryId   = `stream-${Date.now()}`;
     const agentId   = targetAgent.id;
     const agentName = targetAgent.name;
+    const blobUrls  = capturedImages.map((img) => img.previewUrl);
 
     const isBuilderWrite = agentId === "builder" && (settings?.feature_builder_write ?? false);
+
+    // Upload attached images and inject their vault paths into the task.
+    if (capturedImages.length > 0) {
+      const paths: string[] = [];
+      for (const img of capturedImages) {
+        try {
+          const b64 = await fileToBase64(img.file);
+          const savedPath = await invoke<string>("save_upload", { filename: img.file.name, dataBase64: b64 });
+          paths.push(savedPath);
+        } catch (e) {
+          setImageError(`Upload failed: ${e}`);
+        }
+      }
+      if (paths.length > 0) {
+        const count = paths.length;
+        const joined = paths.map((p) => `  ${p}`).join("\n");
+        task += `\n\nUser attached ${count} image${count > 1 ? "s" : ""} — use the Read tool to view ${count > 1 ? "them" : "it"}:\n${joined}`;
+      }
+    }
 
     setStreamEntries((prev) => [
       ...prev,
       {
         id: entryId, runId: "", agentId, agentName, text: "", status: "thinking", time: nowTime(), userMsg: raw,
+        userImages: blobUrls.length > 0 ? blobUrls : undefined,
         repoPath: agentId === "builder" ? (selectedRepoPath ?? undefined) : undefined,
         builderWrite: isBuilderWrite || undefined,
       },
@@ -1950,7 +2027,7 @@ export function Chat() {
                   return (
                     <div key={entry.id} className="space-y-2">
                       {entry.userMsg && (
-                        <UserMsgBubble text={entry.userMsg} time={entry.time} />
+                        <UserMsgBubble text={entry.userMsg} time={entry.time} images={entry.userImages} />
                       )}
                       <StreamBubble
                         entry={entry}
@@ -2083,7 +2160,36 @@ export function Chat() {
               </div>
             )}
 
-            <div className="relative">
+            {/* Attached image previews */}
+            {attachedImages.length > 0 && (
+              <div className="flex flex-wrap gap-2 mb-2">
+                {attachedImages.map((img) => (
+                  <div key={img.key} className="relative">
+                    <img src={img.previewUrl} className="h-14 w-14 object-cover rounded-lg border border-zinc-700/50" />
+                    <button
+                      onClick={() => {
+                        URL.revokeObjectURL(img.previewUrl);
+                        setAttachedImages((prev) => prev.filter((i) => i.key !== img.key));
+                      }}
+                      className="absolute -top-1 -right-1 w-4 h-4 bg-zinc-700 rounded-full flex items-center justify-center hover:bg-red-700/80 transition-colors"
+                    >
+                      <X size={8} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {imageError && <p className="text-[10px] text-red-400 mb-2">{imageError}</p>}
+
+            <div
+              className="relative"
+              onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+                addImagesFromFileList(files);
+              }}
+            >
               {/* @mention dropdown */}
               {mentionQuery !== null && (
                 <MentionDropdown
@@ -2146,6 +2252,12 @@ export function Chat() {
                     setMentionQuery(null);
                   }
                 }}
+                onPaste={(e) => {
+                  const items = Array.from(e.clipboardData?.items ?? []).filter((i) => i.type.startsWith("image/"));
+                  if (items.length === 0) return;
+                  e.preventDefault();
+                  addImagesFromFileList(items.map((i) => i.getAsFile()).filter(Boolean) as File[]);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -2174,6 +2286,24 @@ export function Chat() {
             </div>
 
             <div className="flex items-center gap-3 mt-3">
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="text-zinc-600 hover:text-zinc-400 transition-colors"
+                title="Attach image"
+              >
+                <Paperclip size={14} />
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  addImagesFromFileList(Array.from(e.target.files ?? []));
+                  e.target.value = "";
+                }}
+              />
               <button
                 onClick={() => setOvernight((o) => !o)}
                 className={`flex items-center gap-2 text-xs px-3 py-1.5 rounded-full border transition-colors ${
@@ -2216,7 +2346,7 @@ export function Chat() {
 
               <button
                 onClick={handleSend}
-                disabled={!draft.trim() || !recipient || runningAgents.has(recipient?.id ?? "")}
+                disabled={(!draft.trim() && attachedImages.length === 0) || !recipient || runningAgents.has(recipient?.id ?? "")}
                 className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors border border-zinc-700"
               >
                 {recipient && runningAgents.has(recipient.id) ? (

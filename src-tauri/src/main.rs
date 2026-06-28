@@ -2552,6 +2552,7 @@ fn main() {
             agents::reset_agent_session,
             agents::get_run_trace,
             agents::drain_scheduled_runs,
+            agents::save_upload,
             forge::run_verification_gate,
             pod::run_pod,
             daily::get_plan_state,

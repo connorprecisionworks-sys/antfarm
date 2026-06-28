@@ -1643,6 +1643,48 @@ pub fn open_agent_log(agent_id: String) -> Result<(), String> {
     Ok(())
 }
 
+// ── Image upload ──────────────────────────────────────────────────────────────
+
+fn is_allowed_image_ext(filename: &str) -> bool {
+    matches!(
+        filename.rsplit('.').next().map(|s| s.to_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+    )
+}
+
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+#[tauri::command]
+pub fn save_upload(filename: String, data_base64: String) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    if !is_allowed_image_ext(&filename) {
+        return Err("Only png, jpg, jpeg, webp, and gif images are accepted".into());
+    }
+    let data = STANDARD.decode(&data_base64)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if data.len() > 10 * 1024 * 1024 {
+        return Err(format!(
+            "Image too large ({:.1} MB); max is 10 MB",
+            data.len() as f64 / 1_048_576.0,
+        ));
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let safe = sanitize_filename(&filename);
+    let dir = vault_root().join("active").join("uploads");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(format!("{ts}-{safe}"));
+    std::fs::write(&dest, &data).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

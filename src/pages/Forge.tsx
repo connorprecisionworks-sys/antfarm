@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { ChevronDown, FolderOpen, Loader, Send, Zap } from "lucide-react";
+import { ChevronDown, FolderOpen, Loader, Paperclip, Send, X, Zap } from "lucide-react";
 import {
   type RoleKey,
   type RoleState,
@@ -53,6 +53,7 @@ interface ActiveTurn {
   terminal: ForgeTurnTerminal | null;
   pushed: boolean;
   hasCumulativeDiff: boolean;
+  userImages?: string[];
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -102,12 +103,44 @@ function buildContext(turns: ForgeTurn[], hasCumulativeDiff: boolean): string | 
 
 // (PodRoleTabs, PodDoneCard, PodNeedsYouCard are imported from ForgePodPanel)
 
+// ── Image upload helpers ──────────────────────────────────────────────────────
+
+interface AttachedImage {
+  key: string;
+  file: File;
+  previewUrl: string;
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve((reader.result as string).split(",")[1] ?? "");
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
 // ── UserBubble ────────────────────────────────────────────────────────────────
 
-function UserBubble({ message }: { message: string }) {
+function UserBubble({ message, images }: { message: string; images?: string[] }) {
   return (
     <div className="flex justify-end">
       <div className="bg-zinc-800/70 border border-zinc-700/40 rounded-2xl rounded-tr-sm px-3 py-2 text-[13px] text-zinc-200 max-w-[85%] whitespace-pre-wrap leading-relaxed">
+        {images && images.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {images.map((url, i) => (
+              <img
+                key={i}
+                src={url}
+                className="h-24 max-w-[200px] object-cover rounded-lg"
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+              />
+            ))}
+          </div>
+        )}
         {message}
       </div>
     </div>
@@ -129,7 +162,7 @@ function CompletedTurnView({
 
   return (
     <div className="space-y-2">
-      <UserBubble message={turn.userMessage} />
+      <UserBubble message={turn.userMessage} images={turn.userImages} />
       <PodRoleTabs
         roles={turn.roleEntries}
         activeRole={activeRole}
@@ -175,7 +208,7 @@ function ActiveTurnView({
 
   return (
     <div className="space-y-2">
-      <UserBubble message={turn.userMessage} />
+      <UserBubble message={turn.userMessage} images={turn.userImages} />
       <PodRoleTabs
         roles={turn.roles}
         activeRole={activeRole}
@@ -213,6 +246,9 @@ export function Forge() {
   const [draft, setDraft]           = useState("");
   const [activeTurn, setActiveTurn] = useState<ActiveTurn | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const threadRef   = useRef<HTMLDivElement>(null);
   const inputRef    = useRef<HTMLTextAreaElement>(null);
@@ -274,6 +310,7 @@ export function Forge() {
             activeRole: "reviewer",
             terminal,
             pushed: false,
+            userImages: prev.userImages,
           });
           return finished;
         }
@@ -290,6 +327,7 @@ export function Forge() {
             activeRole: (POD_STEP_ROLE[step] ?? "builder"),
             terminal,
             pushed: false,
+            userImages: prev.userImages,
           });
           return finished;
         }
@@ -369,6 +407,23 @@ export function Forge() {
     setShowRecents(false);
   }
 
+  function addImagesFromFileList(files: File[]) {
+    setImageError(null);
+    const toAdd: AttachedImage[] = [];
+    for (const file of files) {
+      if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+        setImageError(`${file.name}: only png, jpg, webp, gif accepted`);
+        continue;
+      }
+      if (file.size > MAX_IMAGE_BYTES) {
+        setImageError(`${file.name}: too large (max 10 MB)`);
+        continue;
+      }
+      toAdd.push({ key: `${Date.now()}-${Math.random()}`, file, previewUrl: URL.createObjectURL(file) });
+    }
+    if (toAdd.length > 0) setAttachedImages((prev) => [...prev, ...toAdd]);
+  }
+
   async function handleSend() {
     const message = draft.trim();
     if (!message || !repoPath.trim() || podRunning) return;
@@ -378,6 +433,9 @@ export function Forge() {
     setRecents(loadRecents());
     setDraft("");
     setLaunchError(null);
+    const capturedImages = attachedImages;
+    setAttachedImages([]);
+    setImageError(null);
 
     // Detect cumulative diff: last completed turn is ready_to_push but not yet pushed.
     const repoTurns = forgeSnapshot.threads[path] ?? [];
@@ -386,6 +444,27 @@ export function Forge() {
       lastTurn?.terminal?.kind === "ready_to_push" && !lastTurn.pushed;
 
     const context = buildContext(repoTurns, hasCumulativeDiff);
+
+    // Upload attached images and append vault paths to the task.
+    let task = message;
+    const blobUrls = capturedImages.map((img) => img.previewUrl);
+    if (capturedImages.length > 0) {
+      const paths: string[] = [];
+      for (const img of capturedImages) {
+        try {
+          const b64 = await fileToBase64(img.file);
+          const savedPath = await invoke<string>("save_upload", { filename: img.file.name, dataBase64: b64 });
+          paths.push(savedPath);
+        } catch (e) {
+          setImageError(`Upload failed: ${e}`);
+        }
+      }
+      if (paths.length > 0) {
+        const count = paths.length;
+        const joined = paths.map((p) => `  ${p}`).join("\n");
+        task += `\n\nUser attached ${count} image${count > 1 ? "s" : ""} — use the Read tool to view ${count > 1 ? "them" : "it"}:\n${joined}`;
+      }
+    }
 
     const turnId: string = newTurnId();
     const newTurn: ActiveTurn = {
@@ -399,13 +478,14 @@ export function Forge() {
       terminal: null,
       pushed: false,
       hasCumulativeDiff,
+      userImages: blobUrls.length > 0 ? blobUrls : undefined,
     };
     setActiveTurn(newTurn);
 
     try {
       const podId = await invoke<string>("run_pod", {
         repoPath: path,
-        task: message,
+        task,
         context: context ?? null,
       });
       setActiveTurn((prev) => (prev?.id === turnId ? { ...prev, podId } : prev));
@@ -534,11 +614,43 @@ export function Forge() {
 
       {/* ── Message input ────────────────────────────────────────────── */}
       <div className="shrink-0 border-t border-zinc-800 px-5 py-3">
-        <div className="flex gap-2 items-end">
+        {attachedImages.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {attachedImages.map((img) => (
+              <div key={img.key} className="relative">
+                <img src={img.previewUrl} className="h-14 w-14 object-cover rounded-lg border border-zinc-700/50" />
+                <button
+                  onClick={() => {
+                    URL.revokeObjectURL(img.previewUrl);
+                    setAttachedImages((prev) => prev.filter((i) => i.key !== img.key));
+                  }}
+                  className="absolute -top-1 -right-1 w-4 h-4 bg-zinc-700 rounded-full flex items-center justify-center hover:bg-red-700/80 transition-colors"
+                >
+                  <X size={8} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {imageError && <p className="text-[10px] text-red-400 mb-2">{imageError}</p>}
+        <div
+          className="flex gap-2 items-end"
+          onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+          onDrop={(e) => {
+            e.preventDefault();
+            addImagesFromFileList(Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/")));
+          }}
+        >
           <textarea
             ref={inputRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            onPaste={(e) => {
+              const items = Array.from(e.clipboardData?.items ?? []).filter((i) => i.type.startsWith("image/"));
+              if (items.length === 0) return;
+              e.preventDefault();
+              addImagesFromFileList(items.map((i) => i.getAsFile()).filter(Boolean) as File[]);
+            }}
             onKeyDown={handleKeyDown}
             disabled={podRunning}
             placeholder={
@@ -549,16 +661,37 @@ export function Forge() {
             rows={2}
             className="flex-1 min-w-0 bg-zinc-900/60 border border-zinc-700/50 rounded-lg px-3 py-2 text-xs text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-500 disabled:opacity-50 resize-none transition-colors"
           />
-          <button
-            onClick={() => void handleSend()}
-            disabled={podRunning || !draft.trim() || !repoPath.trim()}
-            className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors border border-zinc-700 whitespace-nowrap"
-          >
-            {podRunning
-              ? <Loader size={12} className="animate-spin" />
-              : <Send size={12} />}
-            {podRunning ? "Running…" : "Send"}
-          </button>
+          <div className="flex flex-col gap-1.5 items-center">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={podRunning}
+              title="Attach image"
+              className="text-zinc-600 hover:text-zinc-400 disabled:opacity-40 transition-colors"
+            >
+              <Paperclip size={14} />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                addImagesFromFileList(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+            <button
+              onClick={() => void handleSend()}
+              disabled={podRunning || !draft.trim() || !repoPath.trim()}
+              className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors border border-zinc-700 whitespace-nowrap"
+            >
+              {podRunning
+                ? <Loader size={12} className="animate-spin" />
+                : <Send size={12} />}
+              {podRunning ? "Running…" : "Send"}
+            </button>
+          </div>
         </div>
       </div>
     </div>

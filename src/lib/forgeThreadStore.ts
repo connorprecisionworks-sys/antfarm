@@ -32,6 +32,7 @@ export interface ForgeTurn {
   activeRole: RoleKey;
   terminal: ForgeTurnTerminal | null;
   pushed: boolean;
+  userImages?: string[];
 }
 
 export interface ForgeSnapshot {

@@ -11,6 +11,7 @@ export interface StreamEntry {
   time: string;
   parentId?: string;
   userMsg?: string;
+  userImages?: string[];
   inputTokens?: number;
   outputTokens?: number;
   usagePct?: number;
