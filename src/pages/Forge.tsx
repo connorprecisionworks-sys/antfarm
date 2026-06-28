@@ -439,7 +439,7 @@ export function Forge() {
           <h1 className="text-sm font-semibold text-zinc-100 leading-none">Forge</h1>
           {repoPath && (
             <span className="text-[11px] text-zinc-500 font-mono truncate max-w-[180px]" title={repoPath}>
-              {repoPath.split("/").filter(Boolean).at(-1) ?? repoPath}
+              {repoPath.split("/").filter(Boolean).slice(-1)[0] ?? repoPath}
             </span>
           )}
         </div>

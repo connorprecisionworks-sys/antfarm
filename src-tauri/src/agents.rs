@@ -377,6 +377,164 @@ fi
 exit 0
 "#;
 
+// ── Vault write guard ─────────────────────────────────────────────────────────
+//
+// Networked agents (Clerk, Scribe, Pulitzer, Scout, …) are now allowed to call
+// Write/Edit/MultiEdit so they can draft files into the vault (content/drafts/,
+// active/, agents/<id>/, etc.).  The disallowedTools blanket ban is replaced by
+// this PreToolUse hook that checks the resolved absolute target path against
+// vault_root().  Any write whose target is outside the vault is blocked (exit 2).
+// Bash and NotebookEdit remain fully disallowed for networked agents.
+
+const VAULT_WRITE_GUARD: &str = r#"#!/bin/bash
+# Vault write guard — PreToolUse hook for networked agents (managed by antfarm; do not hand-edit).
+# Permits Write/Edit/MultiEdit ONLY when the target path is inside the vault.
+# Exit 0 = allow; Exit 2 = block (stdout is returned to the model as the reason).
+
+VAULT_ROOT="__VAULT_ROOT__"
+
+INPUT=$(cat)
+
+# Extract tool name.
+TOOL=$(printf '%s' "$INPUT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('tool_name', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+case "$TOOL" in
+    Write|Edit|MultiEdit) ;;
+    *) exit 0 ;;
+esac
+
+# Extract all file paths from the tool input (Write/Edit: file_path; MultiEdit: edits[].file_path).
+PATHS=$(printf '%s' "$INPUT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    inp = d.get('tool_input') or {}
+    paths = []
+    fp = inp.get('file_path', '')
+    if fp:
+        paths.append(fp)
+    for e in (inp.get('edits') or inp.get('edit') or []):
+        if isinstance(e, dict):
+            efp = e.get('file_path', '')
+            if efp and efp not in paths:
+                paths.append(efp)
+    print('\n'.join(paths))
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+if [[ -z "$PATHS" ]]; then
+    exit 0
+fi
+
+# Resolve vault root to canonical path once.
+VAULT_REAL=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$VAULT_ROOT" 2>/dev/null || echo "$VAULT_ROOT")
+
+while IFS= read -r FILE_PATH; do
+    [[ -z "$FILE_PATH" ]] && continue
+
+    # Relative paths are resolved against cwd (networked agents run with vault as cwd).
+    if [[ "$FILE_PATH" != /* ]]; then
+        FILE_PATH="$(pwd)/$FILE_PATH"
+    fi
+    RESOLVED=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
+
+    # Allow only exact vault root or paths strictly under it.
+    if [[ "$RESOLVED" != "$VAULT_REAL" && "$RESOLVED" != "$VAULT_REAL/"* ]]; then
+        printf 'BLOCKED by vault write guard: write to "%s" is outside the vault (%s). Networked agents may only write inside the vault. To request code or infrastructure changes, end with: NEEDS YOU: <one sentence>.\n' "$RESOLVED" "$VAULT_ROOT"
+        exit 2
+    fi
+done <<< "$PATHS"
+
+exit 0
+"#;
+
+/// Lexically normalize a path without filesystem access (resolve . and ..).
+fn normalize_path_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => { out.pop(); }
+            Component::CurDir    => {}
+            _                   => out.push(comp),
+        }
+    }
+    out
+}
+
+/// True if `path` (absolute or vault-relative) resolves inside vault_root().
+///
+/// Absolute paths are checked directly.  Relative paths are resolved relative
+/// to vault_root() — matching the cwd networked agents run with.  Path traversal
+/// attacks (`../../antfarm/src`) are caught by the lexical normalization step.
+pub fn path_is_inside_vault(path: &str) -> bool {
+    let vault = vault_root();
+    let target = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        vault.join(path)
+    };
+    // Canonicalize if the path exists; fall back to lexical normalization so
+    // new files (not yet on disk) are checked correctly without an IO error.
+    let target_norm = std::fs::canonicalize(&target)
+        .unwrap_or_else(|_| normalize_path_lexical(&target));
+    let vault_norm = std::fs::canonicalize(&vault).unwrap_or(vault);
+    // PathBuf::starts_with is component-wise: "antfarm-memory-evil" is NOT
+    // a prefix match for "antfarm-memory", so sibling directories are safe.
+    target_norm.starts_with(&vault_norm)
+}
+
+/// Write the vault write guard hook script and its settings JSON to ~/.antfarm/.
+/// Called at the start of every networked agent run so the guard stays current.
+/// Returns the path to the settings JSON (passed to claude via --settings).
+fn ensure_networked_hooks() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let hooks_dir = std::path::PathBuf::from(&home).join(".antfarm/hooks");
+    fs::create_dir_all(&hooks_dir).map_err(|e| e.to_string())?;
+
+    let vault_str = vault_root().to_string_lossy().into_owned();
+    let script = VAULT_WRITE_GUARD.replace("__VAULT_ROOT__", &vault_str);
+
+    let guard_path = hooks_dir.join("vault-write-guard.sh");
+    fs::write(&guard_path, &script).map_err(|e| e.to_string())?;
+
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&guard_path).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&guard_path, perms).map_err(|e| e.to_string())?;
+
+    let guard_path_str = guard_path.to_string_lossy().into_owned();
+    let settings_path = std::path::PathBuf::from(&home).join(".antfarm/networked-write-settings.json");
+    // Three separate matchers — one per tool — because matcher is an exact string.
+    // The guard script also validates tool_name internally for defense in depth.
+    // ONLY "hooks" here, no "permissions.allow" — avoid the stdin-hang bug where an
+    // explicit allow list creates a secondary permission gate that blocks dontAsk mode.
+    let settings_json = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write",     "hooks": [{"type": "command", "command": guard_path_str}]},
+                {"matcher": "Edit",      "hooks": [{"type": "command", "command": guard_path_str}]},
+                {"matcher": "MultiEdit", "hooks": [{"type": "command", "command": guard_path_str}]}
+            ]
+        }
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings_json).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(settings_path.to_string_lossy().into_owned())
+}
+
 /// Write the Builder Bash guard hook script and its settings JSON to ~/.antfarm/.
 /// Called at the start of every write-mode Builder run so the blocklist stays current.
 /// Returns the path to the settings JSON (passed to claude via --settings).
@@ -644,8 +802,9 @@ pub(crate) fn build_deny_list(agent_id: &str, profile: &str, connectors: &[Strin
     let mut deny: Vec<String> = Vec::new();
 
     if profile == "networked" {
-        // No file writes for life/ops agents — only read + connectors.
-        deny.extend(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"].map(String::from));
+        // Bash and NotebookEdit are fully denied. Write/Edit/MultiEdit are allowed
+        // but path-scoped by the vault write guard hook (ensure_networked_hooks).
+        deny.extend(["NotebookEdit", "Bash"].map(String::from));
         if !connectors.iter().any(|c| c == "web") {
             deny.push("WebSearch".to_string());
             deny.push("WebFetch".to_string());
@@ -1035,12 +1194,15 @@ pub fn spawn_agent_run(
         }
     }
 
-    // Networked agents: allowed list only. Do NOT load settings.networked.json via
-    // --settings — its explicit permissions.allow list creates a secondary permission
-    // gate that overrides --permission-mode dontAsk and causes headless Write calls
-    // to hang silently (stdin is /dev/null; the gate waits for input that never arrives).
-    // Security is fully covered by --disallowedTools above, which is authoritative.
+    // Networked agents: vault write guard hook + allowed list.
+    // The hook settings file contains ONLY "hooks" — no "permissions.allow" —
+    // so it does not trigger the stdin-hang bug that a secondary permission gate
+    // would cause with --permission-mode dontAsk and /dev/null stdin.
     if is_networked {
+        match ensure_networked_hooks() {
+            Ok(hook_settings) => { cmd.args(["--settings", &hook_settings]); }
+            Err(e) => eprintln!("[antfarm] warn: could not write networked hooks: {e}"),
+        }
         let allowed = networked_allowed_tools(&agent.connectors);
         if !allowed.is_empty() { cmd.args(["--allowedTools", &allowed]); }
     }
@@ -1531,18 +1693,75 @@ mod tests {
     }
 
     #[test]
-    fn networked_agent_cannot_write_files() {
-        // Clerk, Scout, Scribe are profile="networked". They must never be able
-        // to edit application source — only the write-mode Builder/Forge pod can.
+    fn networked_agent_bash_and_notebook_denied() {
+        // Bash and NotebookEdit are fully denied for all networked agents.
+        // Write/Edit/MultiEdit are allowed but path-guarded by the vault write guard hook.
         for agent_id in &["clerk", "scout", "scribe"] {
             let deny = deny_set(agent_id, "networked");
-            for tool in &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] {
+            for tool in &["NotebookEdit", "Bash"] {
                 assert!(
                     deny.contains(*tool),
                     "networked agent '{agent_id}' deny list must include {tool}, got: {deny:?}"
                 );
             }
+            // Write/Edit/MultiEdit must NOT be denied — the hook enforces the path boundary.
+            for tool in &["Write", "Edit", "MultiEdit"] {
+                assert!(
+                    !deny.contains(*tool),
+                    "networked agent '{agent_id}' deny list must NOT include {tool} (hook-guarded), got: {deny:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn vault_write_guard_allows_vault_paths() {
+        let vault = vault_root().to_string_lossy().into_owned();
+
+        // Absolute path inside vault
+        let inside = format!("{vault}/content/drafts/test.md");
+        assert!(path_is_inside_vault(&inside), "absolute vault path should be allowed: {inside}");
+
+        // Relative path (resolved relative to vault root)
+        assert!(path_is_inside_vault("content/drafts/test.md"), "relative vault path should be allowed");
+
+        // Vault root itself
+        assert!(path_is_inside_vault(&vault), "vault root itself should be allowed");
+
+        // Nested path
+        let nested = format!("{vault}/agents/pulitzer/drafts/post-123/post.json");
+        assert!(path_is_inside_vault(&nested), "nested vault path should be allowed");
+    }
+
+    #[test]
+    fn vault_write_guard_blocks_outside_paths() {
+        // Antfarm source code
+        assert!(
+            !path_is_inside_vault("/Users/connordore/Desktop/antfarm/src/main.rs"),
+            "antfarm src must be blocked"
+        );
+        // System temp
+        assert!(
+            !path_is_inside_vault("/tmp/evil.sh"),
+            "tmp path must be blocked"
+        );
+        // Absolute non-vault desktop path
+        assert!(
+            !path_is_inside_vault("/Users/connordore/Desktop/antfarm/src/anything"),
+            "antfarm/src must be blocked"
+        );
+        // Path traversal attack: resolves to ~/Desktop/antfarm/src/main.rs
+        assert!(
+            !path_is_inside_vault("../../antfarm/src/main.rs"),
+            "traversal attack must be blocked"
+        );
+        // Sibling directory whose name starts with vault name — must not prefix-match
+        let vault = vault_root().to_string_lossy().into_owned();
+        let sibling = format!("{vault}-evil/secret.txt");
+        assert!(
+            !path_is_inside_vault(&sibling),
+            "sibling dir with vault-name prefix must be blocked"
+        );
     }
 }
 
