@@ -158,6 +158,7 @@ function parseDelegations(text: string): DelegationTask[] | null {
       return { agentId, task: rawTask, after, repoName } as DelegationTask;
     })
     .filter(Boolean) as DelegationTask[];
+  console.log("[forge-delegate] parseDelegations result:", tasks);
   return tasks.length > 0 ? tasks : null;
 }
 
@@ -1769,6 +1770,7 @@ export function Chat() {
 
   // ── Forge repo resolution ─────────────────────────────────────────────────────
   function resolveForgeRepo(repoName: string): string | null {
+    console.log("[forge-delegate] resolveForgeRepo input:", repoName);
     if (!repoName) return null;
     if (repoName.startsWith("/")) return repoName; // already absolute
 
@@ -1776,28 +1778,46 @@ export function Chat() {
     const normalize = (s: string) => s.replace(/[.-]/g, "").toLowerCase();
     const normLower = normalize(lower);
 
-    // 1. Match against known projects (name, slug, repo basenames)
-    for (const p of repoProjects) {
-      if (normalize(p.name) === normLower || normalize(p.slug) === normLower) {
-        return p.repos[0] ?? null;
-      }
-      for (const repo of p.repos) {
-        const base = repo.split("/").pop() ?? "";
-        if (normalize(base) === normLower || repo.toLowerCase().includes(lower)) return repo;
-      }
-    }
-
-    // 2. Match against Forge recents (localStorage)
+    // 1. Forge recents first — they carry full absolute paths
     const recents: string[] = (() => {
       try { return JSON.parse(localStorage.getItem("forge:recentRepos") ?? "[]"); }
       catch { return []; }
     })();
+    console.log("[forge-delegate] forge recents:", recents);
     for (const r of recents) {
       const base = r.split("/").pop() ?? "";
-      if (normalize(base) === normLower || r.toLowerCase().includes(lower)) return r;
+      if (normalize(base) === normLower || r.toLowerCase().includes(lower)) {
+        console.log("[forge-delegate] matched via recents:", r);
+        return r;
+      }
     }
 
-    return null;
+    // 2. Registry / tools-built projects — return ~/Desktop/<basename>
+    //    (bare basenames are stored in the registry; expand_tilde in run_pod handles ~)
+    for (const p of repoProjects) {
+      if (normalize(p.name) === normLower || normalize(p.slug) === normLower) {
+        const base = p.repos[0];
+        const resolved = base ? `~/Desktop/${base}` : null;
+        console.log("[forge-delegate] matched via project name/slug, resolved:", resolved);
+        return resolved;
+      }
+      for (const repo of p.repos) {
+        const base = repo.split("/").pop() ?? "";
+        if (normalize(base) === normLower || repo.toLowerCase().includes(lower)) {
+          const resolved = `~/Desktop/${base || repo}`;
+          console.log("[forge-delegate] matched via project repo, resolved:", resolved);
+          return resolved;
+        }
+      }
+    }
+
+    // 3. Last resort: ~/Desktop/<name> with dots replaced by dashes.
+    //    Covers common cases like "connordore.com" → ~/Desktop/connordore-com.
+    //    Rust's expand_tilde handles ~; pod_loop will surface a clean error if the dir is missing.
+    const dashedName = repoName.replace(/\./g, "-");
+    const fallback = `~/Desktop/${dashedName}`;
+    console.log("[forge-delegate] no match found, using fallback:", fallback);
+    return fallback;
   }
 
   // ── Fan-out handler ───────────────────────────────────────────────────────────
@@ -1833,8 +1853,11 @@ export function Chat() {
 
       // ── Forge delegation ────────────────────────────────────────────────────
       if (t.agentId === "forge") {
+        console.log("[forge-delegate] forge task:", { agentId: t.agentId, task: t.task, repoName: t.repoName, childId: child.id });
         const repoPath = t.repoName ? resolveForgeRepo(t.repoName) : null;
+        console.log("[forge-delegate] resolved repoPath:", repoPath);
         if (!repoPath) {
+          console.warn("[forge-delegate] repoPath is null — setting error on child entry");
           setStreamEntries((prev) =>
             prev.map((e) =>
               e.id === child.id
@@ -1845,8 +1868,10 @@ export function Chat() {
           continue;
         }
 
+        console.log("[forge-delegate] calling invoke run_pod with repoPath:", repoPath, "task:", t.task);
         invoke<string>("run_pod", { repoPath, task: t.task, context: null })
           .then((podId) => {
+            console.log("[forge-delegate] run_pod returned podId:", podId, "setting forgePods for childId:", child.id);
             setForgePods((prev) => {
               const next = new Map(prev);
               next.set(child.id, {
@@ -1862,6 +1887,7 @@ export function Chat() {
             });
           })
           .catch((err) => {
+            console.error("[forge-delegate] run_pod invoke failed:", err);
             setStreamEntries((prev) =>
               prev.map((e) =>
                 e.id === child.id
@@ -2109,6 +2135,7 @@ export function Chat() {
                       )}
                       {forgePodKids.map((kid) => {
                         const pod = forgePods.get(kid.id);
+                        console.log("[forge-delegate] render check — kidId:", kid.id, "pod:", pod ? "found" : "NOT in forgePods");
                         if (!pod) return null;
                         return (
                           <InlineForgePod
