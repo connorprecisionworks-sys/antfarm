@@ -1134,13 +1134,17 @@ pub fn spawn_agent_run(
     let perm_mode = if builder_write.unwrap_or(false) { "bypassPermissions" } else { "dontAsk" };
 
     let mut cmd = Command::new(&claude);
+    // Prompt delivered via stdin (not as a -p argv argument) so there is no
+    // ARG_MAX ceiling. -p alone switches claude into non-interactive print mode.
+    let mut stdin_prompt = String::new();
     if let Some(ref sid) = existing_sid {
         // Warm resume: user task + current time. Re-add repo dir so Builder still
         // has filesystem access to the target repo on rounds 1+ of the pod loop.
         let now_dt = Local::now();
         let now = format!("{} (unix: {})", now_dt.format("%Y-%m-%d %H:%M %Z"), now_dt.timestamp());
         let msg  = format!("Current date and time: {now}\n\nUser: {task}");
-        cmd.args(["--resume", sid, "-p", &msg,
+        stdin_prompt = msg;
+        cmd.args(["--resume", sid, "-p",
                   "--output-format", "stream-json",
                   "--verbose",
                   "--permission-mode", perm_mode,
@@ -1152,7 +1156,8 @@ pub fn spawn_agent_run(
         }
     } else {
         // Cold start: full system prompt + --add-dir (scope depends on agent role).
-        cmd.args(["-p", &full_prompt,
+        stdin_prompt = full_prompt;
+        cmd.args(["-p",
                   "--output-format", "stream-json",
                   "--verbose",
                   "--permission-mode", perm_mode,
@@ -1221,9 +1226,18 @@ pub fn spawn_agent_run(
         .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn {claude}: {e}"))?;
+
+    // Write prompt to stdin in a background thread; dropping the handle signals EOF.
+    // This avoids ARG_MAX limits when the prompt contains large diffs or context.
+    if let Some(mut stdin_handle) = child.stdin.take() {
+        let bytes = stdin_prompt.into_bytes();
+        std::thread::spawn(move || {
+            let _ = stdin_handle.write_all(&bytes);
+        });
+    }
 
     let run_id = new_agent_run_id(&agent_id);
     let stdout = child.stdout.take().ok_or("no stdout handle")?;
