@@ -1,0 +1,15 @@
+{
+  "name": "antfarm-engine-queue-poller",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mac-side poller that runs queued antfarm engine jobs from Supabase through the ant-farm CLI and pushes only on approval.",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.0",
+    "dotenv": "^17.4.2"
+  }
+}
