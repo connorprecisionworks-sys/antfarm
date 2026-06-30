@@ -2428,10 +2428,10 @@ fn open_devtools(window: tauri::WebviewWindow) {
 /// Build a real AppHandle without ever spinning the GUI run loop. The pod/spec/
 /// agent cores only use AppHandle to emit fire-and-forget progress events, so a
 /// handle with zero listeners (no windows, .run() never called) works fine.
-fn cli_app_handle() -> tauri::AppHandle {
+fn cli_app_handle(ctx: tauri::Context) -> tauri::AppHandle {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .build(tauri::generate_context!())
+        .build(ctx)
         .expect("failed to build headless antfarm app");
     app.handle().clone()
 }
@@ -2453,7 +2453,8 @@ fn cli_flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
 }
 
-fn run_cli(args: &[String]) {
+fn run_cli(args: &[String], ctx: tauri::Context) {
+    let handle = cli_app_handle(ctx);
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
 
     match cmd {
@@ -2477,7 +2478,6 @@ fn run_cli(args: &[String]) {
                 }
             };
 
-            let handle = cli_app_handle();
             let claude_path = dispatch::resolve_claude_path();
             let children = Arc::new(Mutex::new(HashMap::new()));
             let reasons = Arc::new(Mutex::new(HashMap::new()));
@@ -2526,7 +2526,6 @@ fn run_cli(args: &[String]) {
                 std::process::exit(1);
             }
 
-            let handle = cli_app_handle();
             let claude_path = dispatch::resolve_claude_path();
             let children = Arc::new(Mutex::new(HashMap::new()));
             let reasons = Arc::new(Mutex::new(HashMap::new()));
@@ -2575,7 +2574,6 @@ fn run_cli(args: &[String]) {
                 std::process::exit(1);
             }
 
-            let handle = cli_app_handle();
             let claude_path = dispatch::resolve_claude_path();
             let children = Arc::new(Mutex::new(HashMap::new()));
             let reasons = Arc::new(Mutex::new(HashMap::new()));
@@ -2593,10 +2591,11 @@ fn run_cli(args: &[String]) {
 }
 
 fn main() {
+    let ctx = tauri::generate_context!();
     let cli_args: Vec<String> = std::env::args().collect();
     if let Some(sub) = cli_args.get(1) {
         if matches!(sub.as_str(), "forge" | "spec" | "delegate") {
-            run_cli(&cli_args);
+            run_cli(&cli_args, ctx);
             return;
         }
     }
@@ -2744,6 +2743,6 @@ fn main() {
             daily::write_plan,
             pdf::render_report_pdf,
         ])
-        .run(tauri::generate_context!())
+        .run(ctx)
         .expect("error while running tauri application");
 }
