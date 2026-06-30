@@ -13,6 +13,7 @@ mod morning;
 mod pdf;
 mod planning;
 mod pty;
+mod spec;
 
 use chrono::{Datelike, Local, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
@@ -2422,7 +2423,184 @@ fn open_devtools(window: tauri::WebviewWindow) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+// ── Headless CLI ──────────────────────────────────────────────────────────────
+
+/// Build a real AppHandle without ever spinning the GUI run loop. The pod/spec/
+/// agent cores only use AppHandle to emit fire-and-forget progress events, so a
+/// handle with zero listeners (no windows, .run() never called) works fine.
+fn cli_app_handle() -> tauri::AppHandle {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .build(tauri::generate_context!())
+        .expect("failed to build headless antfarm app");
+    app.handle().clone()
+}
+
+/// Resolve a `--repo` CLI value to an absolute path. Absolute (`/...`) or
+/// home-relative (`~/...`) values are used as-is; a bare name resolves under
+/// `~/Desktop/<name>`.
+fn resolve_cli_repo(value: &str) -> String {
+    let raw = if value.starts_with('/') || value.starts_with('~') {
+        value.to_string()
+    } else {
+        format!("~/Desktop/{value}")
+    };
+    agents::expand_tilde(&raw)
+}
+
+/// Pull the value following a `--flag` out of an args slice, e.g. `--repo foo`.
+fn cli_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+}
+
+fn run_cli(args: &[String]) {
+    let cmd = args.get(1).map(String::as_str).unwrap_or("");
+
+    match cmd {
+        "delegate" => {
+            let agent_id = match args.get(2) {
+                Some(a) => a.clone(),
+                None => {
+                    eprintln!("usage: antfarm delegate <agent> \"<task>\"");
+                    std::process::exit(1);
+                }
+            };
+            if agent_id == "builder" {
+                eprintln!("builder cannot be delegated to directly — use `antfarm forge` instead.");
+                std::process::exit(1);
+            }
+            let task = match args.get(3) {
+                Some(t) => t.clone(),
+                None => {
+                    eprintln!("usage: antfarm delegate <agent> \"<task>\"");
+                    std::process::exit(1);
+                }
+            };
+
+            let handle = cli_app_handle();
+            let claude_path = dispatch::resolve_claude_path();
+            let children = Arc::new(Mutex::new(HashMap::new()));
+            let reasons = Arc::new(Mutex::new(HashMap::new()));
+
+            match agents::spawn_agent_run(
+                handle,
+                claude_path,
+                children,
+                reasons,
+                agent_id,
+                task,
+                None,
+                false,
+                None,
+                None,
+            ) {
+                Ok((_, rx)) => {
+                    let final_text = rx.recv().unwrap_or_default();
+                    println!("{final_text}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("delegate failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "forge" => {
+            let task = match args.get(2) {
+                Some(t) => t.clone(),
+                None => {
+                    eprintln!("usage: antfarm forge \"<task>\" --repo <name|path>");
+                    std::process::exit(1);
+                }
+            };
+            let repo_value = match cli_flag_value(args, "--repo") {
+                Some(r) => r,
+                None => {
+                    eprintln!("usage: antfarm forge \"<task>\" --repo <name|path>");
+                    std::process::exit(1);
+                }
+            };
+            let repo_path = resolve_cli_repo(&repo_value);
+            if !Path::new(&repo_path).is_dir() {
+                eprintln!("repo not found: {repo_path}");
+                std::process::exit(1);
+            }
+
+            let handle = cli_app_handle();
+            let claude_path = dispatch::resolve_claude_path();
+            let children = Arc::new(Mutex::new(HashMap::new()));
+            let reasons = Arc::new(Mutex::new(HashMap::new()));
+            let pod_id = pod::new_pod_id();
+
+            match pod::pod_loop(handle, claude_path, children, reasons, pod_id, repo_path.clone(), task, None) {
+                pod::PodTerminal::ReadyToPush { commit_msg, diff, reviewer_note } => {
+                    match spec::commit_local_impl(&repo_path, &commit_msg) {
+                        Ok(hash) => {
+                            println!("Committed locally: {hash}\n");
+                            println!("Commit message: {commit_msg}\n");
+                            println!("Reviewer note:\n{reviewer_note}\n");
+                            println!("Diff:\n{diff}");
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            eprintln!("commit failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                pod::PodTerminal::NeedsYou { reason } => {
+                    eprintln!("NEEDS YOU: {reason}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "spec" => {
+            let scope = match args.get(2) {
+                Some(s) => s.clone(),
+                None => {
+                    eprintln!("usage: antfarm spec \"<scope>\" --repo <name|path>");
+                    std::process::exit(1);
+                }
+            };
+            let repo_value = match cli_flag_value(args, "--repo") {
+                Some(r) => r,
+                None => {
+                    eprintln!("usage: antfarm spec \"<scope>\" --repo <name|path>");
+                    std::process::exit(1);
+                }
+            };
+            let repo_path = resolve_cli_repo(&repo_value);
+            if !Path::new(&repo_path).is_dir() {
+                eprintln!("repo not found: {repo_path}");
+                std::process::exit(1);
+            }
+
+            let handle = cli_app_handle();
+            let claude_path = dispatch::resolve_claude_path();
+            let children = Arc::new(Mutex::new(HashMap::new()));
+            let reasons = Arc::new(Mutex::new(HashMap::new()));
+            let spec_id = spec::new_spec_id();
+
+            spec::spec_loop(handle, claude_path, children, reasons, spec_id, repo_path, scope);
+            println!("spec run complete.");
+            std::process::exit(0);
+        }
+        _ => {
+            eprintln!("usage: antfarm <forge|spec|delegate> ...");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
+    let cli_args: Vec<String> = std::env::args().collect();
+    if let Some(sub) = cli_args.get(1) {
+        if matches!(sub.as_str(), "forge" | "spec" | "delegate") {
+            run_cli(&cli_args);
+            return;
+        }
+    }
+
     let events_inner = Arc::new(Mutex::new(EventsStateInner {
         sessions: HashMap::new(),
     }));
@@ -2557,6 +2735,9 @@ fn main() {
             agents::read_file_as_data_url,
             forge::run_verification_gate,
             pod::run_pod,
+            spec::commit_local,
+            spec::run_spec,
+            spec::git_push,
             daily::get_plan_state,
             daily::get_daily_context,
             daily::write_daily_recap,

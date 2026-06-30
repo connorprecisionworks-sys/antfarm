@@ -47,7 +47,7 @@ pub struct PodStreamEvent {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn new_pod_id() -> String {
+pub fn new_pod_id() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -125,9 +125,23 @@ fn git_diff_head(repo_path: &str) -> String {
         .unwrap_or_else(|e| format!("(git diff failed: {e})"))
 }
 
+// ── Terminal result ───────────────────────────────────────────────────────────
+
+/// Returned by pod_loop so callers (spec_loop) can act on the outcome.
+pub enum PodTerminal {
+    ReadyToPush {
+        commit_msg: String,
+        diff: String,
+        reviewer_note: String,
+    },
+    NeedsYou {
+        reason: String,
+    },
+}
+
 // ── Pod state machine ─────────────────────────────────────────────────────────
 
-fn pod_loop(
+pub fn pod_loop(
     app: AppHandle,
     claude_path: String,
     children: Arc<Mutex<HashMap<String, Child>>>,
@@ -136,7 +150,7 @@ fn pod_loop(
     repo_path: String,
     task: String,
     context: Option<String>,
-) {
+) -> PodTerminal {
     // Clear any stale builder session so this pod starts fresh.
     clear_agent_session_id("builder");
 
@@ -170,12 +184,9 @@ fn pod_loop(
             extract_plan(&raw)
         }
         Err(e) => {
-            emit_pod(
-                &app, &pod_id, "planning", "needs_you",
-                &format!("Planner failed to start: {e}"),
-                None, None, None,
-            );
-            return;
+            let reason = format!("Planner failed to start: {e}");
+            emit_pod(&app, &pod_id, "planning", "needs_you", &reason, None, None, None);
+            return PodTerminal::NeedsYou { reason };
         }
     };
 
@@ -192,7 +203,7 @@ fn pod_loop(
             );
             emit_pod(&app, &pod_id, "needs_you", "needs_you", &msg, None, None, None);
             eprintln!("[pod] {pod_id} capped at {MAX_ROUNDS} rounds — escalating");
-            return;
+            return PodTerminal::NeedsYou { reason: msg };
         }
 
         // BUILD ───────────────────────────────────────────────────────────────
@@ -228,21 +239,18 @@ fn pod_loop(
                 t
             }
             Err(e) => {
-                emit_pod(
-                    &app, &pod_id, "building", "needs_you",
-                    &format!("Builder failed to start: {e}"),
-                    None, None, None,
-                );
-                return;
+                let reason = format!("Builder failed to start: {e}");
+                emit_pod(&app, &pod_id, "building", "needs_you", &reason, None, None, None);
+                return PodTerminal::NeedsYou { reason };
             }
         };
 
         // NEEDS YOU check (migration / destructive op)
         if let Some(pos) = build_text.find("NEEDS YOU:") {
-            let msg = build_text[pos..].lines().next().unwrap_or("NEEDS YOU").to_string();
-            emit_pod(&app, &pod_id, "building", "needs_you", &msg, None, None, None);
+            let reason = build_text[pos..].lines().next().unwrap_or("NEEDS YOU").to_string();
+            emit_pod(&app, &pod_id, "building", "needs_you", &reason, None, None, None);
             eprintln!("[pod] {pod_id} builder surfaced NEEDS YOU — stopping");
-            return;
+            return PodTerminal::NeedsYou { reason };
         }
 
         last_commit_msg = extract_commit_msg(&build_text)
@@ -300,12 +308,9 @@ fn pod_loop(
                 t
             }
             Err(e) => {
-                emit_pod(
-                    &app, &pod_id, "reviewing", "needs_you",
-                    &format!("Reviewer failed to start: {e}"),
-                    None, None, None,
-                );
-                return;
+                let reason = format!("Reviewer failed to start: {e}");
+                emit_pod(&app, &pod_id, "reviewing", "needs_you", &reason, None, None, None);
+                return PodTerminal::NeedsYou { reason };
             }
         };
 
@@ -320,11 +325,15 @@ fn pod_loop(
                     "ready_to_push",
                     "ready_to_push",
                     "Done and safe — ready for you to publish.",
-                    Some(last_commit_msg),
-                    Some(final_diff),
+                    Some(last_commit_msg.clone()),
+                    Some(final_diff.clone()),
                     Some(review_text.clone()),
                 );
-                return;
+                return PodTerminal::ReadyToPush {
+                    commit_msg: last_commit_msg,
+                    diff: final_diff,
+                    reviewer_note: review_text,
+                };
             }
             Err(notes) => {
                 fix_notes = format!("Reviewer found issues:\n{notes}");
@@ -360,7 +369,7 @@ pub fn run_pod(
     let repo_path = crate::agents::expand_tilde(&repo_path);
 
     std::thread::spawn(move || {
-        pod_loop(app, claude_path, children, reasons, pid, repo_path, task, context);
+        let _ = pod_loop(app, claude_path, children, reasons, pid, repo_path, task, context);
     });
 
     Ok(pod_id)
