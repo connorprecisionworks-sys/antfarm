@@ -1,0 +1,15 @@
+{
+  "name": "antfarm-engine-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP server wrapping the ant-farm CLI so Claude Code and Cowork can trigger the agent crew as native tools.",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0"
+  }
+}
