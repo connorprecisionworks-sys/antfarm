@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Antfarm Console</title>
+<style>
+  :root {
+    --bg: #0b0c0e;
+    --panel: #15171b;
+    --panel-2: #1c1f24;
+    --line: #2a2e35;
+    --text: #f2f4f7;
+    --muted: #9aa3ad;
+    --accent: #ff7a1a;
+    --green: #2ecc71;
+    --amber: #f4b740;
+    --red: #ff5d52;
+    --blue: #4aa3ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased; }
+  body { padding: 16px; max-width: 720px; margin: 0 auto; padding-bottom: 60px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+  h1 { font-size: 19px; letter-spacing: -0.02em; margin: 0; }
+  h1 span { color: var(--accent); }
+  .muted { color: var(--muted); }
+  button { font: inherit; cursor: pointer; border: none; border-radius: 10px; }
+  .btn { background: var(--accent); color: #12130f; font-weight: 650; padding: 11px 16px; }
+  .btn:active { transform: translateY(1px); }
+  .btn-ghost { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 9px 13px; }
+  .btn-approve { background: var(--green); color: #07210f; font-weight: 700; padding: 10px 16px; width: 100%; margin-top: 10px; }
+  input, select, textarea { width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: inherit; outline: none; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 84px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .job { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  .job-top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .badge { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 3px 8px; border-radius: 999px; }
+  .b-queued { background: #2a2e35; color: var(--muted); }
+  .b-running { background: rgba(74,163,255,.16); color: var(--blue); }
+  .b-done { background: rgba(46,204,113,.16); color: var(--green); }
+  .b-needs_you { background: rgba(244,183,64,.16); color: var(--amber); }
+  .b-error { background: rgba(255,93,82,.16); color: var(--red); }
+  .b-approved { background: rgba(255,122,26,.18); color: var(--accent); }
+  .b-pushed { background: rgba(46,204,113,.22); color: var(--green); }
+  .job-meta { font-size: 12px; color: var(--muted); }
+  .job-task { margin: 6px 0; font-size: 15px; line-height: 1.35; }
+  .note { font-size: 13px; color: var(--muted); margin-top: 8px; white-space: pre-wrap; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+  pre { background: #0e0f12; border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+    overflow-x: auto; font-size: 12px; line-height: 1.45; margin-top: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .err { color: var(--red); }
+  .empty { color: var(--muted); text-align: center; padding: 30px 0; }
+  .hide { display: none !important; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); padding: 10px 16px; border-radius: 10px;
+    font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .login-wrap { max-width: 360px; margin: 12vh auto 0; text-align: center; }
+  .pin-dots { display: flex; gap: 10px; justify-content: center; height: 12px; margin: 18px 0 4px; }
+  .pin-dots i { width: 10px; height: 10px; border-radius: 50%; background: var(--line);
+    transition: background .15s, transform .15s; }
+  .pin-dots i.on { background: var(--accent); transform: scale(1.2); }
+  .keypad { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
+    max-width: 260px; margin: 18px auto 0; }
+  .key { aspect-ratio: 1 / 1; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 20px; transition: transform .09s ease, background .25s, box-shadow .25s;
+    color: var(--text); font-size: 24px; font-weight: 600; }
+  .key.press { transform: scale(0.93); background: var(--accent);
+    box-shadow: 0 0 0 4px rgba(255,122,26,.18), 0 10px 26px rgba(255,122,26,.28); }
+  .shake { animation: shake .42s cubic-bezier(.36,.07,.19,.97); }
+  @keyframes shake { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-9px)}
+    40%,80%{transform:translateX(9px)} }
+</style>
+</head>
+<body>
+
+<!-- CONFIG: paste your anon public key below (Supabase > Settings > API > anon). Safe to embed. -->
+<script>
+  const SUPABASE_URL = "https://empfvnriylzmbhkjrhgb.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVtcGZ2bnJpeWx6bWJoa2pyaGdiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4NDc0NjAsImV4cCI6MjA5ODQyMzQ2MH0.XrgBumBvXsJFng0SsTSJaEm6UtTFoTt144S6i4klu1Q";
+</script>
+
+<!-- Login view -->
+<div id="login" class="login-wrap hide">
+  <h1>Antfarm <span>Console</span></h1>
+  <div id="pinDots" class="pin-dots"></div>
+  <div class="keypad" id="keypad">
+    <button class="key" data-n="1" aria-label="key 1">1</button>
+    <button class="key" data-n="2" aria-label="key 2">2</button>
+    <button class="key" data-n="3" aria-label="key 3">3</button>
+    <button class="key" data-n="4" aria-label="key 4">4</button>
+    <button class="key" data-n="5" aria-label="key 5">5</button>
+    <button class="key" data-n="6" aria-label="key 6">6</button>
+  </div>
+  <p id="loginMsg" class="muted" style="margin-top:16px;"></p>
+</div>
+
+<!-- App view -->
+<div id="app" class="hide">
+  <header>
+    <h1>Antfarm <span>Console</span></h1>
+    <button class="btn-ghost" id="signout">Sign out</button>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:1.3;">
+        <label>Repo</label>
+        <input id="repo" value="antfarm-write-test" />
+      </div>
+      <div>
+        <label>Kind</label>
+        <select id="kind">
+          <option value="forge">forge</option>
+          <option value="spec">spec</option>
+          <option value="delegate">delegate</option>
+        </select>
+      </div>
+    </div>
+    <div id="agentWrap" class="hide">
+      <label>Agent</label>
+      <input id="agent" placeholder="jack, clerk, scout, scribe, pulitzer, scholar" />
+    </div>
+    <label id="taskLabel">Task</label>
+    <textarea id="task" placeholder="Describe what you want the crew to do..."></textarea>
+    <button class="btn" id="queue" style="width:100%; margin-top:12px;">Queue job</button>
+  </div>
+
+  <div id="jobs"></div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script type="module">
+  import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+  const $ = (id) => document.getElementById(id);
+  const toast = (msg) => {
+    const t = $("toast"); t.textContent = msg; t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 2200);
+  };
+
+  if (!SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.startsWith("PASTE_")) {
+    $("login").classList.remove("hide");
+    $("loginMsg").innerHTML = '<span class="err">Set your anon key in the page source first.</span>';
+    throw new Error("anon key not set");
+  }
+
+  const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  const STATUS_ORDER = ["queued","running","done","needs_you","error","approved","pushed"];
+  const esc = (s) => (s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  const ago = (iso) => {
+    const s = Math.floor((Date.now() - new Date(iso)) / 1000);
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.floor(s/60) + "m ago";
+    if (s < 86400) return Math.floor(s/3600) + "h ago";
+    return Math.floor(s/86400) + "d ago";
+  };
+
+  // ── Auth ────────────────────────────────────────────────────────────────
+  async function refreshAuth() {
+    const { data } = await sb.auth.getSession();
+    const signedIn = !!data.session;
+    $("login").classList.toggle("hide", signedIn);
+    $("app").classList.toggle("hide", !signedIn);
+    if (signedIn) loadJobs();
+  }
+
+  const LOGIN_EMAIL = "connordore36@gmail.com";
+  const PIN_LENGTH = 6;
+  let seq = [];
+  let pinBusy = false;
+
+  function renderDots() {
+    $("pinDots").innerHTML = Array.from({ length: PIN_LENGTH },
+      (_, i) => '<i class="' + (i < seq.length ? "on" : "") + '"></i>').join("");
+  }
+
+  async function submitPin() {
+    pinBusy = true;
+    const password = seq.join("");
+    const { error } = await sb.auth.signInWithPassword({ email: LOGIN_EMAIL, password });
+    seq = [];
+    renderDots();
+    pinBusy = false;
+    if (error) {
+      $("login").classList.add("shake");
+      setTimeout(() => $("login").classList.remove("shake"), 460);
+      $("loginMsg").innerHTML = '<span class="err">' + esc(error.message) + '</span>';
+    } else {
+      $("loginMsg").textContent = "";
+    }
+  }
+
+  document.querySelectorAll(".key").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      btn.classList.add("press");
+      setTimeout(() => btn.classList.remove("press"), 130);
+      if (pinBusy || seq.length >= PIN_LENGTH) return;
+      seq.push(btn.dataset.n);
+      renderDots();
+      if (seq.length === PIN_LENGTH) submitPin();
+    });
+  });
+  renderDots();
+
+  $("signout").onclick = async () => { await sb.auth.signOut(); refreshAuth(); };
+  sb.auth.onAuthStateChange(() => refreshAuth());
+
+  // ── Queue form ──────────────────────────────────────────────────────────
+  $("kind").onchange = () => {
+    const k = $("kind").value;
+    $("agentWrap").classList.toggle("hide", k !== "delegate");
+    $("taskLabel").textContent = k === "spec" ? "Scope" : "Task";
+  };
+
+  $("queue").onclick = async () => {
+    const repo = $("repo").value.trim();
+    const kind = $("kind").value;
+    const task = $("task").value.trim();
+    const agent = $("agent").value.trim() || null;
+    if (!repo || !task) { toast("Repo and task are required"); return; }
+    $("queue").disabled = true;
+    const { error } = await sb.from("jobs").insert({ repo, kind, task, agent });
+    $("queue").disabled = false;
+    if (error) { toast("Error: " + error.message); return; }
+    $("task").value = "";
+    toast("Queued");
+    loadJobs();
+  };
+
+  // ── Jobs list ───────────────────────────────────────────────────────────
+  async function approve(id) {
+    const { error } = await sb.from("jobs").update({ status: "approved", approved: true }).eq("id", id);
+    toast(error ? "Error: " + error.message : "Approved, pushing...");
+    loadJobs();
+  }
+  window.__approve = approve;
+
+  function jobCard(j) {
+    const badge = '<span class="badge b-' + j.status + '">' + j.status.replace("_"," ") + '</span>';
+    let body = "";
+    if (j.status === "done") {
+      if (j.reviewer_note) body += '<div class="note">' + esc(j.reviewer_note) + '</div>';
+      if (j.diff) body += '<details><summary>View diff</summary><pre>' + esc(j.diff) + '</pre></details>';
+      if (j.commit_hash) body += '<div class="job-meta" style="margin-top:6px;">commit ' + esc(j.commit_hash) + '</div>';
+      body += '<button class="btn-approve" onclick="__approve(\'' + j.id + '\')">Approve &amp; push</button>';
+    } else if (j.status === "needs_you") {
+      body += '<div class="note" style="color:var(--amber);">' + esc(j.result_summary || "Needs your input") + '</div>';
+    } else if (j.status === "error") {
+      body += '<div class="note err">' + esc(j.error || "Error") + '</div>';
+    } else if (j.status === "pushed") {
+      if (j.commit_hash) body += '<div class="job-meta">pushed commit ' + esc(j.commit_hash) + '</div>';
+    }
+    return '<div class="job">' +
+      '<div class="job-top">' + badge +
+        '<span class="job-meta">' + esc(j.repo) + ' &middot; ' + esc(j.kind) + ' &middot; ' + ago(j.created_at) + '</span>' +
+      '</div>' +
+      '<div class="job-task">' + esc(j.task) + '</div>' + body +
+    '</div>';
+  }
+
+  async function loadJobs() {
+    const { data, error } = await sb.from("jobs")
+      .select("*").order("created_at", { ascending: false }).limit(25);
+    if (error) return;
+    const el = $("jobs");
+    el.innerHTML = data.length
+      ? data.map(jobCard).join("")
+      : '<div class="empty">No jobs yet. Queue one above.</div>';
+  }
+
+  // poll every 5s while signed in
+  setInterval(() => { if (!$("app").classList.contains("hide")) loadJobs(); }, 5000);
+
+  refreshAuth();
+</script>
+</body>
+</html>

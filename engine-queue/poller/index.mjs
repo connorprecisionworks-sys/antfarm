@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
@@ -15,6 +15,24 @@ const ANTFARM_BIN =
   process.env.ANTFARM_BIN ||
   "/Users/connordore/Desktop/antfarm/src-tauri/target/release/ant-farm";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 5000;
+
+// Roots scanned for git repos that get published to the `repos` table so the
+// console can show a dropdown. Override with REPO_ROOTS (comma-separated).
+const REPO_ROOTS = (process.env.REPO_ROOTS || path.join(os.homedir(), "Desktop"))
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const REPO_SCAN_INTERVAL_MS = 60000;
+
+// Friendly labels shown in the dropdown, and name aliases so "roastlytics"
+// resolves to the roast-dash folder. Extend freely.
+const REPO_LABELS = {
+  "roast-dash": "Roastlytics",
+  antfarm: "Antfarm",
+  "antfarm-write-test": "Antfarm Test",
+  "connordore-com": "connordore.com",
+};
+const REPO_ALIASES = { roastlytics: "roast-dash" };
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[antfarm-poller] missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env");
@@ -38,13 +56,48 @@ function expandTilde(p) {
 }
 
 // Mirrors resolve_cli_repo in src-tauri/src/main.rs: absolute/~ paths are used
-// as-is, a bare name resolves under ~/Desktop/<name>.
+// as-is, a bare name resolves under ~/Desktop/<name>. Also applies friendly
+// aliases (e.g. "roastlytics" -> "roast-dash") before resolving.
 function resolveRepo(value) {
+  const trimmed = (value || "").trim();
+  const aliased = REPO_ALIASES[trimmed.toLowerCase()] || trimmed;
   const raw =
-    value.startsWith("/") || value.startsWith("~")
-      ? value
-      : path.join(os.homedir(), "Desktop", value);
+    aliased.startsWith("/") || aliased.startsWith("~")
+      ? aliased
+      : path.join(os.homedir(), "Desktop", aliased);
   return expandTilde(raw);
+}
+
+// Scan the configured roots for git repos and publish them to the `repos`
+// table so the console can offer a dropdown instead of free-text entry.
+function findRepos() {
+  const found = [];
+  for (const root of REPO_ROOTS) {
+    const dir = expandTilde(root);
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(dir, e.name);
+      if (fs.existsSync(path.join(full, ".git"))) {
+        found.push({ name: e.name, path: full, label: REPO_LABELS[e.name] || e.name });
+      }
+    }
+  }
+  return found;
+}
+
+async function publishRepos() {
+  const repos = findRepos();
+  if (!repos.length) return;
+  const rows = repos.map((r) => ({ ...r, updated_at: new Date().toISOString() }));
+  const { error } = await supabase.from("repos").upsert(rows, { onConflict: "name" });
+  if (error) log("repo publish failed:", error.message);
+  else log(`published ${rows.length} repos`);
 }
 
 // Best-effort scrape of the antfarm CLI's stdout for forge runs. See
@@ -141,29 +194,75 @@ async function processQueued() {
   }
 
   try {
-    const { stdout } = await execFileAsync(ANTFARM_BIN, args, EXEC_OPTS);
-    const { commitHash, reviewerNote, diff } = parseForgeOutput(stdout);
-    await setJob(job.id, {
-      status: "done",
-      result_summary: stdout,
-      commit_hash: commitHash,
-      reviewer_note: reviewerNote,
-      diff,
-    });
-    log(`job ${job.id} -> done`);
-  } catch (err) {
-    const stderrText = (err.stderr && err.stderr.trim()) || "";
-    if (stderrText.includes("NEEDS YOU")) {
-      await setJob(job.id, { status: "needs_you", result_summary: stderrText });
+    const { code, stdout, stderr } = await runAntfarmStreamed(args, job.id);
+    if (code === 0) {
+      const { commitHash, reviewerNote, diff } = parseForgeOutput(stdout);
+      await setJob(job.id, {
+        status: "done",
+        result_summary: stdout,
+        commit_hash: commitHash,
+        reviewer_note: reviewerNote,
+        diff,
+        current_phase: "done",
+      });
+      log(`job ${job.id} -> done`);
+    } else if (stderr.includes("NEEDS YOU")) {
+      await setJob(job.id, { status: "needs_you", result_summary: stderr });
       log(`job ${job.id} -> needs_you`);
     } else {
-      const text = stderrText || err.message || "unknown error";
+      const text = stderr || `antfarm exited with code ${code}`;
       await setJob(job.id, { status: "error", error: text });
       log(`job ${job.id} -> error: ${text}`);
     }
+  } catch (err) {
+    const text = err.message || "unknown error";
+    await setJob(job.id, { status: "error", error: text });
+    log(`job ${job.id} -> error: ${text}`);
   }
 
   return true;
+}
+
+// Spawns the antfarm binary and streams stderr line-by-line, watching for
+// "[STEP]\t<phase>\t<text>" lines emitted by pod.rs/spec.rs so the console's
+// current_phase/steps columns update live while the job runs.
+function runAntfarmStreamed(args, jobId) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ANTFARM_BIN, args, EXEC_OPTS);
+
+    let stdout = "";
+    let stderr = "";
+    let stderrBuf = "";
+    const steps = [];
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      stderrBuf += text;
+      const lines = stderrBuf.split("\n");
+      stderrBuf = lines.pop();
+      for (const line of lines) {
+        const match = line.match(/^\[STEP\]\t([^\t]*)\t(.*)$/);
+        if (!match) continue;
+        const [, phase, stepText] = match;
+        steps.push({ phase, text: stepText, ts: new Date().toISOString() });
+        supabase
+          .from("jobs")
+          .update({ current_phase: phase, steps })
+          .eq("id", jobId)
+          .then(({ error }) => {
+            if (error) log(`failed to update job ${jobId} step:`, error.message);
+          });
+      }
+    });
+
+    child.on("error", (err) => reject(err));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 async function tick() {
@@ -182,6 +281,12 @@ async function main() {
     log(`warning: antfarm binary not found at ${ANTFARM_BIN}. Jobs will error until it is built.`);
   }
   log(`antfarm engine queue poller started. polling every ${POLL_INTERVAL_MS}ms.`);
+
+  // Publish the repo list now and refresh it periodically.
+  await publishRepos();
+  setInterval(() => {
+    publishRepos().catch((e) => log("repo scan error:", e.message || e));
+  }, REPO_SCAN_INTERVAL_MS);
 
   // Run a single job at a time: the pod loop clears a shared builder session,
   // so concurrent runs would clobber each other. Each tick fully awaits
