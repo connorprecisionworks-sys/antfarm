@@ -16,6 +16,11 @@ const ANTFARM_BIN =
   "/Users/connordore/Desktop/antfarm/src-tauri/target/release/ant-farm";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 5000;
 
+// Chat (Agents tab): how far back to pull prior messages as context, and how
+// long messages live before periodic cleanup deletes them.
+const CHAT_MEMORY_HOURS = Number(process.env.CHAT_MEMORY_HOURS) || 12;
+const CHAT_RETENTION_DAYS = Number(process.env.CHAT_RETENTION_DAYS) || 3;
+
 // Roots scanned for git repos that get published to the `repos` table so the
 // console can show a dropdown. Override with REPO_ROOTS (comma-separated).
 const REPO_ROOTS = (process.env.REPO_ROOTS || path.join(os.homedir(), "Desktop"))
@@ -124,6 +129,14 @@ function parseForgeOutput(stdout) {
   return { commitHash, reviewerNote, diff };
 }
 
+// Deletes messages older than CHAT_RETENTION_DAYS so the Agents tab's chat
+// memory stays short-lived. Run on the same interval as the repo scan.
+async function cleanupMessages() {
+  const cutoff = new Date(Date.now() - CHAT_RETENTION_DAYS * 86400 * 1000).toISOString();
+  const { error } = await supabase.from("messages").delete().lt("created_at", cutoff);
+  if (error) log("message cleanup failed:", error.message);
+}
+
 async function setJob(id, fields) {
   const { error } = await supabase.from("jobs").update(fields).eq("id", id);
   if (error) {
@@ -162,7 +175,66 @@ async function processApproval() {
   return true;
 }
 
+// Chat jobs (Agents tab) are handled ahead of forge/spec/delegate so
+// conversation stays snappy even when a long pod/spec run is queued behind
+// it — the poller is still strictly one job at a time overall.
+async function processChatQueued() {
+  const { data: rows, error } = await supabase
+    .from("jobs")
+    .select("*")
+    .eq("status", "queued")
+    .eq("kind", "chat")
+    .order("created_at", { ascending: true })
+    .limit(1);
+
+  if (error) {
+    log("chat queued query failed:", error.message);
+    return false;
+  }
+  const job = rows && rows[0];
+  if (!job) return false;
+
+  await setJob(job.id, { status: "running" });
+  log(`job ${job.id} [chat] agent=${job.agent} -> running`);
+
+  const sinceIso = new Date(Date.now() - CHAT_MEMORY_HOURS * 3600 * 1000).toISOString();
+  const { data: history, error: historyError } = await supabase
+    .from("messages")
+    .select("*")
+    .eq("agent", job.agent)
+    .gte("created_at", sinceIso)
+    .order("created_at", { ascending: true });
+
+  if (historyError) {
+    await setJob(job.id, { status: "error", error: historyError.message });
+    log(`job ${job.id} -> error (history fetch failed): ${historyError.message}`);
+    return true;
+  }
+
+  const transcript = (history || [])
+    .map((m) => `${m.role === "user" ? "User" : job.agent}: ${m.content}`)
+    .join("\n\n");
+
+  try {
+    const { stdout } = await execFileAsync(ANTFARM_BIN, ["delegate", job.agent, transcript], EXEC_OPTS);
+    const reply = stdout.trim();
+    await supabase.from("messages").insert({ agent: job.agent, role: "assistant", content: reply });
+    await setJob(job.id, { status: "done", result_summary: reply });
+    log(`job ${job.id} -> done`);
+  } catch (err) {
+    const text = (err.stderr && err.stderr.trim()) || err.message || "unknown error";
+    await supabase.from("messages").insert({ agent: job.agent, role: "assistant", content: text });
+    await setJob(job.id, { status: "error", error: text });
+    log(`job ${job.id} -> error: ${text}`);
+  }
+
+  return true;
+}
+
 async function processQueued() {
+  const handledChat = await processChatQueued();
+  if (handledChat) return true;
+
   const { data: rows, error } = await supabase
     .from("jobs")
     .select("*")
@@ -282,10 +354,13 @@ async function main() {
   }
   log(`antfarm engine queue poller started. polling every ${POLL_INTERVAL_MS}ms.`);
 
-  // Publish the repo list now and refresh it periodically.
+  // Publish the repo list now and refresh it periodically. Reuse the same
+  // interval to sweep out expired chat messages.
   await publishRepos();
+  await cleanupMessages();
   setInterval(() => {
     publishRepos().catch((e) => log("repo scan error:", e.message || e));
+    cleanupMessages().catch((e) => log("message cleanup error:", e.message || e));
   }, REPO_SCAN_INTERVAL_MS);
 
   // Run a single job at a time: the pod loop clears a shared builder session,

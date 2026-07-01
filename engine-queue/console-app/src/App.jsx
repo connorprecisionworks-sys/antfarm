@@ -2,7 +2,16 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { supabase, LOGIN_EMAIL } from "./supabase.js";
 
 const PIN_LENGTH = 6;
-const KINDS = ["forge", "spec", "delegate"];
+const KINDS = ["forge", "spec"];
+
+const AGENTS = [
+  { value: "jack", label: "Captain Jack" },
+  { value: "clerk", label: "Clerk" },
+  { value: "scout", label: "Scout" },
+  { value: "scribe", label: "Scribe" },
+  { value: "pulitzer", label: "Pulitzer" },
+  { value: "scholar", label: "Scholar" },
+];
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
@@ -197,7 +206,6 @@ function Composer({ onQueued }) {
   const [kind, setKind] = useState("forge");
   const [repos, setRepos] = useState([]);
   const [repo, setRepo] = useState("");
-  const [agent, setAgent] = useState("");
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
   const taRef = useRef(null);
@@ -235,7 +243,6 @@ function Composer({ onQueued }) {
       repo: repo.trim(),
       kind,
       task: task.trim(),
-      agent: kind === "delegate" ? agent.trim() || null : null,
     });
     setBusy(false);
     if (error) {
@@ -284,16 +291,6 @@ function Composer({ onQueued }) {
             autoCorrect="off"
           />
         )}
-        {kind === "delegate" && (
-          <input
-            className="agent-input"
-            value={agent}
-            onChange={(e) => setAgent(e.target.value)}
-            placeholder="agent (jack, clerk…)"
-            autoCapitalize="off"
-            autoCorrect="off"
-          />
-        )}
       </div>
 
       <div className="input-bar">
@@ -325,9 +322,9 @@ function ArrowUp() {
   );
 }
 
-/* ─────────────────────────── console ─────────────────────────── */
+/* ─────────────────────────── forge tab ─────────────────────────── */
 
-function Console() {
+function ForgeTab() {
   const [jobs, setJobs] = useState([]);
   const [loaded, setLoaded] = useState(false);
 
@@ -335,6 +332,7 @@ function Console() {
     const { data, error } = await supabase
       .from("jobs")
       .select("*")
+      .in("kind", ["forge", "spec"])
       .order("created_at", { ascending: false })
       .limit(40);
     if (!error) setJobs(data || []);
@@ -343,11 +341,9 @@ function Console() {
 
   useEffect(() => {
     load();
-    const active = () =>
-      jobs.some((j) => ["queued", "running", "approved"].includes(j.status));
     const id = setInterval(load, 2500);
     return () => clearInterval(id);
-  }, [load]); // eslint-disable-line
+  }, [load]);
 
   const approve = async (jobId) => {
     setJobs((js) =>
@@ -358,14 +354,7 @@ function Console() {
   };
 
   return (
-    <div className="console">
-      <header className="topbar">
-        <div className="title">
-          <span className="logo-dot sm" />
-          Antfarm <span className="accent">Console</span>
-        </div>
-      </header>
-
+    <>
       <div className="feed">
         {!loaded ? (
           <div className="empty">Loading…</div>
@@ -380,6 +369,180 @@ function Console() {
       </div>
 
       <Composer onQueued={load} />
+    </>
+  );
+}
+
+/* ─────────────────────────── agents tab (chat) ─────────────────────────── */
+
+function ChatBubble({ message }) {
+  const mine = message.role === "user";
+  return (
+    <div className={"bubble-row" + (mine ? " mine" : "")}>
+      <div className={"bubble" + (mine ? " mine" : "")}>{message.content}</div>
+    </div>
+  );
+}
+
+function AgentsTab() {
+  const [agent, setAgent] = useState(AGENTS[0].value);
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const taRef = useRef(null);
+  const threadRef = useRef(null);
+
+  const agentLabel = useMemo(
+    () => AGENTS.find((a) => a.value === agent)?.label || agent,
+    [agent]
+  );
+
+  const load = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("agent", agent)
+      .order("created_at", { ascending: true })
+      .limit(200);
+    if (!error) setMessages(data || []);
+  }, [agent]);
+
+  useEffect(() => {
+    setMessages([]);
+    load();
+    const id = setInterval(load, 2500);
+    return () => clearInterval(id);
+  }, [load]);
+
+  useEffect(() => {
+    const el = threadRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  const grow = () => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 140) + "px";
+  };
+
+  const send = async () => {
+    const content = text.trim();
+    if (!content || busy) return;
+    setBusy(true);
+    const { error: msgError } = await supabase
+      .from("messages")
+      .insert({ agent, role: "user", content });
+    if (!msgError) {
+      const { error: jobError } = await supabase.from("jobs").insert({
+        repo: "-",
+        kind: "chat",
+        agent,
+        task: content,
+      });
+      if (jobError) alert(jobError.message);
+    }
+    setBusy(false);
+    if (msgError) {
+      alert(msgError.message);
+      return;
+    }
+    setText("");
+    grow();
+    load();
+  };
+
+  const waitingReply =
+    messages.length > 0 && messages[messages.length - 1].role === "user";
+
+  return (
+    <div className="agents-tab">
+      <div className="agent-row">
+        <select
+          className="repo-input repo-select agent-select"
+          value={agent}
+          onChange={(e) => setAgent(e.target.value)}
+        >
+          {AGENTS.map((a) => (
+            <option key={a.value} value={a.value}>
+              {a.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className="thread" ref={threadRef}>
+        {messages.length === 0 ? (
+          <div className="empty">
+            <div className="empty-title">No messages yet</div>
+            <div className="empty-sub">Say hi to {agentLabel}.</div>
+          </div>
+        ) : (
+          messages.map((m) => <ChatBubble key={m.id} message={m} />)
+        )}
+        {waitingReply && (
+          <div className="bubble-row">
+            <div className="bubble typing">
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="composer chat-composer">
+        <div className="input-bar">
+          <textarea
+            ref={taRef}
+            className="task-input"
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+              grow();
+            }}
+            placeholder={`Message ${agentLabel}…`}
+            rows={1}
+          />
+          <button className="send" onClick={send} disabled={busy} aria-label="send">
+            {busy ? <span className="spin" /> : <ArrowUp />}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────── console ─────────────────────────── */
+
+function Console() {
+  const [tab, setTab] = useState("forge");
+
+  return (
+    <div className="console">
+      <header className="topbar">
+        <div className="title">
+          <span className="logo-dot sm" />
+          Antfarm <span className="accent">Console</span>
+        </div>
+      </header>
+
+      <div className="tabbar">
+        <button
+          className={"tab" + (tab === "forge" ? " on" : "")}
+          onClick={() => setTab("forge")}
+        >
+          Forge
+        </button>
+        <button
+          className={"tab" + (tab === "agents" ? " on" : "")}
+          onClick={() => setTab("agents")}
+        >
+          Agents
+        </button>
+      </div>
+
+      {tab === "forge" ? <ForgeTab /> : <AgentsTab />}
     </div>
   );
 }
