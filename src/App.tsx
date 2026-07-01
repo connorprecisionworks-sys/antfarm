@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { usePodStreamSync } from "./lib/usePodStreamSync";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
 import { Morning } from "./pages/Morning";
@@ -15,6 +16,7 @@ import { Chat } from "./pages/Chat";
 import { Forge } from "./pages/Forge";
 
 export default function App() {
+  usePodStreamSync();
   return (
     <BrowserRouter>
       <Routes>

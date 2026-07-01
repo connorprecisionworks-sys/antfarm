@@ -18,6 +18,7 @@ export interface StreamEntry {
   activity?: string;
   outputs?: string[];
   repoPath?: string;
+  podId?: string;
   builderWrite?: boolean;
 }
 

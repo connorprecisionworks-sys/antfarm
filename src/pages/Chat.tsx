@@ -29,6 +29,14 @@ import {
   PodDoneCard,
   PodNeedsYouCard,
 } from "../components/ForgePodPanel";
+import {
+  type ActivePodEntry,
+  subscribe as subscribeForge,
+  getSnapshot as getForgeSnapshot,
+  registerActivePod,
+  markActivePodPushed,
+  markPushed,
+} from "../lib/forgeThreadStore";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -94,27 +102,37 @@ interface DelegationTask {
   repoName?: string; // forge only: raw repo name/path to resolve at fanout time
 }
 
-// Inline forge pod state (not persisted to chatStore — local to Chat component)
-interface ForgePodState {
-  podId: string;
-  repoPath: string;
-  roles: Record<PodRoleKey, PodRoleState>;
-  podStep: string;
-  running: boolean;
-  terminal: PodTerminal | null;
-  pushed: boolean;
+function newTurnId(): string {
+  return `turn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-interface PodStreamPayload {
-  podId: string;
-  step: string;
-  kind: string;
-  text: string;
-  commitMsg?: string;
-  diff?: string;
-  reviewerNote?: string;
+// Resolve the pod state for a delegated run: prefer the live activePods entry
+// (covers running + just-finalized pods); fall back to the persisted turn once
+// a later pod for the same repo has evicted it from activePods. The (podId, repoPath)
+// pair comes from the delegated child's StreamEntry — durable in chatStore across
+// /chat unmount/remount, unlike local component state.
+function resolveActivePod(
+  forgeSnapshot: ReturnType<typeof getForgeSnapshot>,
+  podId: string,
+  repoPath: string,
+): ActivePodEntry | null {
+  const active = forgeSnapshot.activePods[podId];
+  if (active) return active;
+  const turn = (forgeSnapshot.threads[repoPath] ?? []).find((t) => t.podId === podId);
+  if (!turn) return null;
+  return {
+    turnId: turn.id,
+    repoPath,
+    userMessage: turn.userMessage,
+    roles: turn.roleEntries,
+    podStep: "",
+    running: false,
+    terminal: turn.terminal,
+    pushed: turn.pushed,
+    hasCumulativeDiff: false,
+    userImages: turn.userImages,
+  };
 }
-
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
@@ -1221,6 +1239,7 @@ export function Chat() {
   const [settings, setSettings]         = useState<SettingsType | null>(null);
   const { streamEntries, messages, runningAgents, fannedIds, chattersOpen } =
     useSyncExternalStore(subscribeToChatStore, getSnapshot);
+  const forgeSnapshot = useSyncExternalStore(subscribeForge, getForgeSnapshot);
   const [filter, setFilter]             = useState<Filter>("needs-you");
   const [draft, setDraft]               = useState("");
   const [overnight, setOvernight]       = useState(false);
@@ -1242,10 +1261,6 @@ export function Chat() {
     after: string;
     parentEntryId: string;
   }>>([]);
-  // Inline forge pod state (not in chatStore — local, not persisted).
-  const [forgePods, setForgePods] = useState<Map<string, ForgePodState>>(new Map());
-  // Stable ref so event listeners can read forgePods without stale closures.
-  const forgePodsRef = useRef<Map<string, ForgePodState>>(new Map());
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -1253,7 +1268,6 @@ export function Chat() {
 
   // Keep agentsRef in sync so the stream listener can resolve names without a stale closure.
   useEffect(() => { agentsRef.current = agents; }, [agents]);
-  useEffect(() => { forgePodsRef.current = forgePods; }, [forgePods]);
 
   // Tauri native drag-drop — HTML5 ondrop never fires for OS file drops in Tauri.
   useEffect(() => {
@@ -1404,50 +1418,6 @@ export function Chat() {
       });
   }, []);
 
-  // ── pod-stream listener (inline forge pods delegated from Jack) ──────────────
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-
-    listen<PodStreamPayload>("pod-stream", (event) => {
-      const p = event.payload;
-      // Find which entry this pod belongs to via forgePodsRef.
-      let matchedEntryId: string | null = null;
-      for (const [entryId, pod] of forgePodsRef.current.entries()) {
-        if (pod.podId === p.podId) { matchedEntryId = entryId; break; }
-      }
-      if (!matchedEntryId) return;
-      const entryId = matchedEntryId;
-
-      setForgePods((prev) => {
-        const pod = prev.get(entryId);
-        if (!pod) return prev;
-        const next = new Map(prev);
-        if (p.kind === "ready_to_push") {
-          next.set(entryId, {
-            ...pod,
-            podStep: p.step,
-            running: false,
-            terminal: { kind: "ready_to_push", commitMsg: p.commitMsg ?? "", diff: p.diff ?? "", reviewerNote: p.reviewerNote },
-          });
-        } else if (p.kind === "needs_you") {
-          next.set(entryId, { ...pod, running: false, terminal: { kind: "needs_you", text: p.text } });
-        } else {
-          next.set(entryId, { ...pod, podStep: p.step });
-        }
-        return next;
-      });
-
-      // Flip stream entry to "done" when terminal fires so the entry stops looking live.
-      if (p.kind === "ready_to_push" || p.kind === "needs_you") {
-        setStreamEntries((prev) =>
-          prev.map((e) => e.id === entryId ? { ...e, status: "done" as const } : e)
-        );
-      }
-    }).then((fn) => { unlisten = fn; });
-
-    return () => { unlisten?.(); };
-  }, []);
-
   // ── agent-stream event listener ──────────────────────────────────────────────
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -1455,38 +1425,14 @@ export function Chat() {
     listen<AgentStreamPayload>("agent-stream", (event) => {
       const { runId, agentId, kind, text, inputTokens = 0, outputTokens = 0, usagePct = 0, outputs = [] } = event.payload;
 
-      // Intercept events belonging to inline forge pod sub-agents (planner/builder/reviewer
-      // whose parentRunId matches a forge pod ID). Handle separately; don't let them
-      // accidentally update regular stream entries.
+      // Events belonging to inline forge pod sub-agents (planner/builder/reviewer,
+      // parentRunId === a tracked podId) are owned by the global usePodStreamSync
+      // reconciler (mounted once in App.tsx), which already updates forgeThreadStore.
+      // Just drop them here so they don't fall through to the regular agentId-based
+      // stream-entry matching below (real "builder"/"planner"/"reviewer" agents share
+      // those same agentId strings).
       const parentRunId = event.payload.parentRunId;
-      const forgePodRole = parentRunId
-        ? [...forgePodsRef.current.entries()].find(([, pod]) => pod.podId === parentRunId)
-        : null;
-
-      if (forgePodRole) {
-        const [entryId] = forgePodRole;
-        const role = agentId as PodRoleKey;
-        if (["planner", "builder", "reviewer"].includes(role)) {
-          setForgePods((prev) => {
-            const pod = prev.get(entryId);
-            if (!pod) return prev;
-            const next = new Map(prev);
-            const r = pod.roles[role];
-            let newRoles = pod.roles;
-            switch (kind) {
-              case "start":    newRoles = { ...pod.roles, [role]: { status: "running" as const, activity: "", text: "" } }; break;
-              case "text":     newRoles = { ...pod.roles, [role]: { ...r, text: r.text + text, status: "running" as const } }; break;
-              case "activity": newRoles = { ...pod.roles, [role]: { ...r, activity: text } }; break;
-              case "done":     newRoles = { ...pod.roles, [role]: { ...r, status: "done" as const, activity: "" } }; break;
-              case "error": case "timeout": case "stopped":
-                               newRoles = { ...pod.roles, [role]: { ...r, status: "error" as const, activity: "" } }; break;
-            }
-            next.set(entryId, { ...pod, roles: newRoles });
-            return next;
-          });
-        }
-        return; // don't fall through to the regular stream-entry updater
-      }
+      if (parentRunId && getForgeSnapshot().activePods[parentRunId]) return;
 
       if (kind === "start") return;
 
@@ -1871,20 +1817,28 @@ export function Chat() {
         console.log("[forge-delegate] calling invoke run_pod with repoPath:", repoPath, "task:", t.task);
         invoke<string>("run_pod", { repoPath, task: t.task, context: null })
           .then((podId) => {
-            console.log("[forge-delegate] run_pod returned podId:", podId, "setting forgePods for childId:", child.id);
-            setForgePods((prev) => {
-              const next = new Map(prev);
-              next.set(child.id, {
-                podId,
-                repoPath,
-                roles: emptyPodRoles(),
-                podStep: "planning",
-                running: true,
-                terminal: null,
-                pushed: false,
-              });
-              return next;
+            console.log("[forge-delegate] run_pod returned podId:", podId, "registering in forgeThreadStore for childId:", child.id);
+            const repoTurns = getForgeSnapshot().threads[repoPath] ?? [];
+            const lastTurn  = repoTurns[repoTurns.length - 1];
+            const hasCumulativeDiff =
+              lastTurn?.terminal?.kind === "ready_to_push" && !lastTurn.pushed;
+
+            registerActivePod(podId, {
+              turnId: newTurnId(),
+              repoPath,
+              userMessage: t.task,
+              roles: emptyPodRoles(),
+              podStep: "planning",
+              running: true,
+              terminal: null,
+              pushed: false,
+              hasCumulativeDiff: !!hasCumulativeDiff,
             });
+            // Persist the pod link on the chat entry itself (chatStore is module-level
+            // state, durable across /chat unmount/remount) instead of local component state.
+            setStreamEntries((prev) =>
+              prev.map((e) => (e.id === child.id ? { ...e, podId, repoPath } : e))
+            );
           })
           .catch((err) => {
             console.error("[forge-delegate] run_pod invoke failed:", err);
@@ -2134,21 +2088,27 @@ export function Chat() {
                         />
                       )}
                       {forgePodKids.map((kid) => {
-                        const pod = forgePods.get(kid.id);
-                        console.log("[forge-delegate] render check — kidId:", kid.id, "pod:", pod ? "found" : "NOT in forgePods");
+                        if (!kid.podId || !kid.repoPath) return null;
+                        const podId = kid.podId;
+                        const repoPath = kid.repoPath;
+                        const pod = resolveActivePod(forgeSnapshot, podId, repoPath);
                         if (!pod) return null;
                         return (
                           <InlineForgePod
                             key={kid.id}
-                            pod={pod}
-                            onPush={() =>
-                              setForgePods((prev) => {
-                                const next = new Map(prev);
-                                const p = next.get(kid.id);
-                                if (p) next.set(kid.id, { ...p, pushed: true });
-                                return next;
-                              })
-                            }
+                            pod={{
+                              podId,
+                              repoPath: pod.repoPath,
+                              roles: pod.roles,
+                              podStep: pod.podStep,
+                              running: pod.running,
+                              terminal: pod.terminal,
+                              pushed: pod.pushed,
+                            }}
+                            onPush={() => {
+                              markActivePodPushed(podId);
+                              markPushed(repoPath, pod.turnId);
+                            }}
                           />
                         );
                       })}
