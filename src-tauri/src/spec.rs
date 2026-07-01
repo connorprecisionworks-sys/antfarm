@@ -72,6 +72,11 @@ pub fn new_spec_id() -> String {
 }
 
 fn emit_spec(app: &AppHandle, event: SpecStreamEvent) {
+    eprintln!(
+        "[STEP]\t{}\t{}",
+        event.phase,
+        event.item_text.clone().unwrap_or_default()
+    );
     let _ = app.emit("spec-stream", event);
 }
 

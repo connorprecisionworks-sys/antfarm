@@ -77,6 +77,7 @@ fn emit_pod(
             reviewer_note,
         },
     );
+    eprintln!("[STEP]\t{}\t{}", step, text);
 }
 
 fn extract_plan(text: &str) -> String {
