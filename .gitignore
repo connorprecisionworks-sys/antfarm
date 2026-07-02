@@ -10,3 +10,4 @@ src-tauri/gen/
 
 .claude/
 .gstack/
+evals/results/

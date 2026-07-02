@@ -184,7 +184,7 @@ pub fn spec_loop(
     repo_path: String,
     scope: String,
 ) {
-    eprintln!("[spec] {spec_id} started — repo={repo_path}");
+    eprintln!("[spec] {spec_id} started - repo={repo_path}");
 
     // ── 1. DECOMPOSE ──────────────────────────────────────────────────────────
     emit_spec(
@@ -390,7 +390,7 @@ pub fn spec_loop(
                 statuses[i].status = "flagged".to_string();
                 statuses[i].flag_reason = Some(reason.clone());
                 eprintln!(
-                    "[spec] {spec_id} item {i} flagged — continuing. reason: {:.100}",
+                    "[spec] {spec_id} item {i} flagged - continuing. reason: {:.100}",
                     reason
                 );
                 emit_spec(
