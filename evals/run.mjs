@@ -24,13 +24,27 @@ const DEFAULT_TIMEOUT_MS = 1200000; // 20 min — pod loops run real agent turns
 const EXEC_MAX_BUFFER = 50 * 1024 * 1024;
 
 // `delegate` (jack/scout/scribe/...) takes no --repo — it reads/writes
-// agents.rs's vault_root(), which is hardcoded to ~/Desktop/antfarm-memory
-// with no env override. That's Connor's live operational vault, not a
-// disposable fixture, so cases that exercise delegate are gated off by
-// default (mirrors the requiresWebApp skip for cases 10/11). Opt in with
-// EVAL_ALLOW_LIVE_VAULT=1 once you're ready to let a case write there.
+// agents.rs's vault_root(), which now honors ANTFARM_VAULT_ROOT. By default,
+// livesInVault cases run against a throwaway copy of the real vault (made
+// once per eval run — see makeScratchVault) so real delegate read/write
+// behavior gets exercised without ever touching Connor's live vault. Set
+// EVAL_ALLOW_LIVE_VAULT=1 as an escape hatch to target the real vault instead.
 const ALLOW_LIVE_VAULT = process.env.EVAL_ALLOW_LIVE_VAULT === "1";
 const VAULT_ROOT = path.join(os.homedir(), "Desktop", "antfarm-memory");
+
+function makeScratchVault() {
+  const dir = path.join(os.tmpdir(), `antfarm-eval-vault-${randomUUID()}`);
+  execFileSync("cp", ["-R", VAULT_ROOT, dir]);
+  return dir;
+}
+
+function removeScratchVault(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // best effort
+  }
+}
 
 function log(...parts) {
   console.log(`[${new Date().toISOString()}]`, ...parts);
@@ -112,10 +126,12 @@ function removeWorktree(dogfoodPath, dir) {
 // ── Setup DSL ─────────────────────────────────────────────────────────────────
 // setup[] entries: { op: "write"|"mkdir"|"rm", path, content?, root? }
 // root defaults to "repo" (the disposable worktree); root: "vault" targets
-// VAULT_ROOT for delegate cases and is only ever reached when a case has
-// already cleared the ALLOW_LIVE_VAULT gate. Any file written under "vault"
-// is tracked in vaultWrites so it can be deleted again after the case runs —
-// the vault has no worktree to throw away.
+// whichever vault root the case resolved to (the scratch copy by default,
+// or VAULT_ROOT itself under EVAL_ALLOW_LIVE_VAULT=1). Any file written under
+// "vault" is tracked in vaultWrites so it can be deleted again after the case
+// runs — the real vault has no worktree to throw away (the scratch copy is
+// deleted wholesale after the run instead, so this only matters for the
+// EVAL_ALLOW_LIVE_VAULT=1 escape hatch).
 
 function applySetup(dirs, setup, vaultWrites) {
   for (const step of setup || []) {
@@ -341,7 +357,7 @@ const GRADERS = {
   },
   dir_count_stable_vault: (ctx, [pattern]) => {
     const before = ctx.preRunVaultCounts[pattern] ?? 0;
-    const after = findFiles(VAULT_ROOT, pattern).length;
+    const after = findFiles(ctx.vaultRoot, pattern).length;
     return { pass: before === after, evidence: `${pattern} (vault): ${before} file(s) before run, ${after} after` };
   },
   llm_grade: async (ctx, [prompt]) => {
@@ -408,7 +424,7 @@ function loadCases() {
 
 // ── Per-case execution ────────────────────────────────────────────────────────
 
-async function runCase(kase, dogfoodPath) {
+async function runCase(kase, dogfoodPath, scratchVaultRoot) {
   const result = {
     id: kase.id,
     guards: kase.guards || [],
@@ -426,11 +442,20 @@ async function runCase(kase, dogfoodPath) {
     return result;
   }
 
-  if (kase.livesInVault && !ALLOW_LIVE_VAULT) {
+  // livesInVault cases target a throwaway copy of the vault by default (see
+  // makeScratchVault in main) so delegate's real read/write behavior gets
+  // exercised without touching Connor's live vault. If the fixture couldn't
+  // be created, skip rather than fall back to the real vault silently.
+  const vaultRootForCase = kase.livesInVault
+    ? ALLOW_LIVE_VAULT
+      ? VAULT_ROOT
+      : scratchVaultRoot
+    : VAULT_ROOT;
+
+  if (kase.livesInVault && !ALLOW_LIVE_VAULT && !vaultRootForCase) {
     result.status = "SKIPPED";
     result.evidence.push(
-      `delegate has no --repo — this agent reads/writes the live vault at ${VAULT_ROOT}, not a disposable worktree. ` +
-        `Skipped by default; set EVAL_ALLOW_LIVE_VAULT=1 to run it for real.`
+      `vault fixture unavailable — could not create a throwaway copy of ${VAULT_ROOT} for this run.`
     );
     result.finishedAt = new Date().toISOString();
     return result;
@@ -440,7 +465,7 @@ async function runCase(kase, dogfoodPath) {
   const vaultWrites = [];
   try {
     worktreeDir = createWorktree(dogfoodPath);
-    applySetup({ repo: worktreeDir, vault: VAULT_ROOT }, kase.setup, vaultWrites);
+    applySetup({ repo: worktreeDir, vault: vaultRootForCase }, kase.setup, vaultWrites);
     const baselineSha = commitBaseline(worktreeDir);
 
     const preRunCounts = {};
@@ -449,12 +474,16 @@ async function runCase(kase, dogfoodPath) {
       if (p.grader === "dir_count_stable") {
         preRunCounts[p.args[0]] = findFiles(worktreeDir, p.args[0]).length;
       } else if (p.grader === "dir_count_stable_vault") {
-        preRunVaultCounts[p.args[0]] = findFiles(VAULT_ROOT, p.args[0]).length;
+        preRunVaultCounts[p.args[0]] = findFiles(vaultRootForCase, p.args[0]).length;
       }
     }
 
     const args = (kase.cli || []).map((tok) => (tok === "{repo}" ? worktreeDir : tok));
-    const run = await runCli(ANTFARM_BIN, args, worktreeDir, kase.env, kase.timeoutMs);
+    const envExtra = { ...(kase.env || {}) };
+    if (kase.livesInVault && !ALLOW_LIVE_VAULT) {
+      envExtra.ANTFARM_VAULT_ROOT = vaultRootForCase;
+    }
+    const run = await runCli(ANTFARM_BIN, args, worktreeDir, envExtra, kase.timeoutMs);
     const combined = `${run.stdout}\n${run.stderr}`;
     const agentText = stripAgentText(combined);
     const changedFiles = computeChangedFiles(worktreeDir, baselineSha);
@@ -465,6 +494,7 @@ async function runCase(kase, dogfoodPath) {
       combined,
       changedFiles,
       worktreeDir,
+      vaultRoot: vaultRootForCase,
       preRunCounts,
       preRunVaultCounts,
     };
@@ -535,16 +565,33 @@ async function main() {
 
   log(`antfarm eval suite — ${cases.length} case(s), dogfood=${dogfoodPath}`);
 
+  // One throwaway vault copy for the whole run, shared by every livesInVault
+  // case — cheaper than re-copying per case and matches how a real vault
+  // accumulates state across a session.
+  let scratchVaultRoot = null;
+  if (cases.some((k) => k.livesInVault) && !ALLOW_LIVE_VAULT) {
+    try {
+      scratchVaultRoot = makeScratchVault();
+      log(`vault fixture: copied ${VAULT_ROOT} -> ${scratchVaultRoot} for livesInVault cases`);
+    } catch (e) {
+      log(`warning: could not create vault fixture (${e.message}) — livesInVault cases will be skipped`);
+    }
+  }
+
   const runId = new Date().toISOString().replace(/[:.]/g, "-");
   const resultsPath = path.join(RESULTS_DIR, `${runId}.json`);
   const results = [];
 
-  for (const kase of cases) {
-    log(`▸ running ${kase.id}...`);
-    const result = await runCase(kase, dogfoodPath);
-    results.push(result);
-    fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2));
-    log(`  ${result.status} — ${result.evidence[result.evidence.length - 1] || ""}`);
+  try {
+    for (const kase of cases) {
+      log(`▸ running ${kase.id}...`);
+      const result = await runCase(kase, dogfoodPath, scratchVaultRoot);
+      results.push(result);
+      fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2));
+      log(`  ${result.status} — ${result.evidence[result.evidence.length - 1] || ""}`);
+    }
+  } finally {
+    if (scratchVaultRoot) removeScratchVault(scratchVaultRoot);
   }
 
   console.log("\n── scorecard ──");

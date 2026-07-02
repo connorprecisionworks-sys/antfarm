@@ -29,6 +29,11 @@ const WALL_SECS: u64    = 1800;
 // ── Path ──────────────────────────────────────────────────────────────────────
 
 pub fn vault_root() -> PathBuf {
+    if let Ok(over) = std::env::var("ANTFARM_VAULT_ROOT") {
+        if !over.is_empty() {
+            return PathBuf::from(expand_tilde(&over));
+        }
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
         .join("Desktop")
         .join("antfarm-memory")
