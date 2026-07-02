@@ -1057,12 +1057,20 @@ pub fn spawn_agent_run(
                      REPO SCOPE: Only create or modify files under the repo directory added to your context \
                      via --add-dir. Do not create or modify files anywhere else on the filesystem.\n\n\
                      STOP BEFORE PUSH: When the build is green, STOP. Do NOT run git commit, git push, \
-                     or any push command autonomously. End your response with a plain-English summary of \
-                     what changed, then the full diff (git diff HEAD), then exactly this line on its own:\n\
-                     ---COMMIT: <one-line commit message>---\n\n\
-                     MIGRATION HARD-STOP: If the task requires `supabase db push`, `supabase migration`, \
-                     `prisma migrate`, or any database schema change command, STOP immediately and end with:\n\
-                     NEEDS YOU: Migration required — <what migration is needed and why>. Never run migrations.\n\n\
+                     or any push command autonomously. End your response with, in order: a plain-English \
+                     summary of what changed; then an `Accept checks:` section listing each check from the \
+                     plan with the command you ran and its real output; then a `Skills used:` line naming \
+                     what you invoked (or \"none available/applicable\"); then the full diff (git diff HEAD); \
+                     then exactly this line on its own as the very last line:\n\
+                     ---COMMIT: <one-line commit message>---\n\
+                     If the diff is empty, do not output the COMMIT marker — say the work already exists \
+                     or nothing changed, plainly, and stop.\n\n\
+                     MIGRATION HARD-STOP: If the task needs ANY new datastore or schema change - adding a \
+                     database dependency (better-sqlite3, sqlite, drizzle, prisma, pg, mongo, redis, or \
+                     similar), creating or editing anything under a `migrations/` directory, creating a new \
+                     table or schema, or creating a local database file - STOP immediately before installing \
+                     or creating anything and end with:\n\
+                     NEEDS YOU: Migration required: <what migration is needed and why>. Never run migrations.\n\n\
                      BUILD GATE: After making changes, run the appropriate build check: `cargo check` for \
                      Rust projects, `npm run build` for TypeScript/frontend. If it fails, read the errors, \
                      fix them, and re-run. Cap retries at 5, then stop and report the errors in plain English.\n\n\
@@ -1576,6 +1584,7 @@ pub fn spawn_agent_run(
                     outputs:       vec![],
                 }).ok();
             }
+            let final_text = final_text.replace('—', "-").replace('–', "-");
             let _ = result_tx.send(final_text);
         });
     }

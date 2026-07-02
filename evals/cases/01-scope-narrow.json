@@ -1,0 +1,20 @@
+{
+  "id": "scope-narrow",
+  "guards": ["06-17"],
+  "agent": "builder",
+  "cli": ["forge", "make the README a bit clearer", "--repo", "{repo}"],
+  "setup": [
+    {
+      "op": "write",
+      "path": "README.md",
+      "content": "# antfarm-write-test\n\nthis is a scratch repo we use for testing stuff, it has some files and does things and is used for testing the antfarm builder loop and other things too.\n"
+    }
+  ],
+  "pass": [
+    { "grader": "diff_file_count_min", "args": [1] },
+    { "grader": "diff_only", "args": [["README*"]] },
+    { "grader": "diff_file_count_max", "args": [2] }
+  ],
+  "llm_grader": false,
+  "notes": "Spec also calls for 'plan has 3 or fewer steps'. main.rs's headless forge path never prints the Planner's raw plan text to stdout/stderr (only the final Reviewer note + diff on success, or a one-line NEEDS YOU on stderr) -- there is no observable plan text to count steps from today, so that check is omitted rather than faked. See eval report."
+}

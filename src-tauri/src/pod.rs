@@ -155,7 +155,7 @@ pub fn pod_loop(
     // Clear any stale builder session so this pod starts fresh.
     clear_agent_session_id("builder");
 
-    eprintln!("[pod] {pod_id} started — repo={repo_path}");
+    eprintln!("[pod] {pod_id} started - repo={repo_path}");
 
     // ── PLAN ─────────────────────────────────────────────────────────────────
     emit_pod(&app, &pod_id, "planning", "start", "Planning the change…", None, None, None);
@@ -203,7 +203,7 @@ pub fn pod_loop(
                 "After {MAX_ROUNDS} rounds the build is still not passing. Last issue:\n\n{fix_notes}"
             );
             emit_pod(&app, &pod_id, "needs_you", "needs_you", &msg, None, None, None);
-            eprintln!("[pod] {pod_id} capped at {MAX_ROUNDS} rounds — escalating");
+            eprintln!("[pod] {pod_id} capped at {MAX_ROUNDS} rounds - escalating");
             return PodTerminal::NeedsYou { reason: msg };
         }
 
@@ -250,7 +250,7 @@ pub fn pod_loop(
         if let Some(pos) = build_text.find("NEEDS YOU:") {
             let reason = build_text[pos..].lines().next().unwrap_or("NEEDS YOU").to_string();
             emit_pod(&app, &pod_id, "building", "needs_you", &reason, None, None, None);
-            eprintln!("[pod] {pod_id} builder surfaced NEEDS YOU — stopping");
+            eprintln!("[pod] {pod_id} builder surfaced NEEDS YOU - stopping");
             return PodTerminal::NeedsYou { reason };
         }
 
@@ -288,7 +288,7 @@ pub fn pod_loop(
         let diff = git_diff_head(&repo_path);
         let review_task = format!(
             "Review this change for correctness and quality.\n\n\
-             Original request: {task}\n\nPlan:\n{plan}\n\nGit diff HEAD:\n{diff}"
+             Original request: {task}\n\nPlan:\n{plan}\n\nBuilder report:\n{build_text}\n\nGit diff HEAD:\n{diff}"
         );
 
         let review_text = match spawn_agent_run(
@@ -319,7 +319,7 @@ pub fn pod_loop(
             Ok(()) => {
                 // READY TO PUSH ───────────────────────────────────────────────
                 let final_diff = git_diff_head(&repo_path);
-                eprintln!("[pod] {pod_id} READY TO PUSH — commit='{last_commit_msg}'");
+                eprintln!("[pod] {pod_id} READY TO PUSH - commit='{last_commit_msg}'");
                 emit_pod(
                     &app,
                     &pod_id,

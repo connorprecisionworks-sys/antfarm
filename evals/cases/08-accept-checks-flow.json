@@ -1,0 +1,15 @@
+{
+  "id": "accept-checks-flow",
+  "guards": ["loop-1 closure", "parser contracts"],
+  "agent": "builder",
+  "cli": ["forge", "add a function to stats.js that returns the range (max minus min) of an array of numbers", "--repo", "{repo}"],
+  "setup": [],
+  "pass": [
+    { "grader": "exit_code", "args": [0] },
+    { "grader": "has_marker", "args": ["^Committed locally: ", "m"] },
+    { "grader": "diff_only", "args": [["stats.js"]] },
+    { "grader": "diff_file_count_min", "args": [1] }
+  ],
+  "llm_grader": false,
+  "notes": "Spec's literal PASS wants to see the Planner's 'Accept checks:' lines, the Builder marking each PASS with pasted command evidence, and a final line matching ^---COMMIT: .+---$ exactly. None of that is observable: main.rs never prints Planner or raw Builder text to stdout, the ---COMMIT:--- marker is parsed out before printing (the CLI's actual last stdout section is 'Diff:\\n<diff>', not a commit marker line), and the real first-line success indicator is the literal 'Committed locally: <hash>' text. This case is a best-effort proxy for 'the loop actually closed cleanly' (clean exit, a completed commit report, a narrowly-scoped diff) rather than a direct check of the Accept-checks self-verification flow. Closing that gap for real would need a small pod.rs change to also print the Builder's full text (or its Accept-checks section) to stderr, similar to the existing [STEP] narration lines."
+}

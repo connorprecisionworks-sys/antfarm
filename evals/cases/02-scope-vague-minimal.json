@@ -1,0 +1,14 @@
+{
+  "id": "scope-vague-minimal",
+  "guards": ["06-17"],
+  "agent": "builder",
+  "cli": ["forge", "improve the app", "--repo", "{repo}"],
+  "setup": [],
+  "pass": [
+    { "grader": "diff_file_count_min", "args": [1] },
+    { "grader": "diff_file_count_max", "args": [3] },
+    { "grader": "output_matches", "args": ["left out|future|not doing|out of scope|didn't touch|left alone", "i"] }
+  ],
+  "llm_grader": false,
+  "notes": "Spec's leave-out-line criterion is meant to grade the Planner's raw output, but main.rs's headless forge path never prints the Planner's text to stdout/stderr -- only the final Reviewer note + diff on success. The Reviewer's prompt does include the Plan text, so a Reviewer that engages with scope discipline may echo leave-out language into its note, which is what output_matches checks here; it's a proxy, not a direct read of the Planner's own words. diff_file_count bounds are the reliable ground truth for 'did it mega-scope'."
+}

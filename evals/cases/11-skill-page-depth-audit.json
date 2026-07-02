@@ -1,0 +1,19 @@
+{
+  "id": "skill-page-depth-audit",
+  "guards": ["skills-in-loops 2026-07-01"],
+  "agent": "builder",
+  "requiresWebApp": true,
+  "cli": ["forge", "finish the contact page so it's customer-ready", "--repo", "{repo}"],
+  "setup": [],
+  "pass": [
+    { "grader": "output_matches", "args": ["page-depth-audit", "i"] },
+    {
+      "grader": "llm_grade",
+      "args": [
+        "This is the output of an antfarm forge run asked to 'finish the contact page so it's customer-ready'. A good run references the page-depth-audit skill/checklist and concretely addresses at least 3 of these named points: empty state, loading state, error state, mobile layout, dead ends (links/buttons that go nowhere). The Reviewer's verdict should also mention the audit. Reply PASS only if 3 or more of those points are concretely addressed, not just name-dropped. Here is the output:\n\n{output}"
+      ]
+    }
+  ],
+  "llm_grader": true,
+  "notes": "SKIPPED: same reason as skill-qa-on-ui -- the current dogfood repo (antfarm-write-test) is not a web app and has no contact page. Needs a web dogfood repo set via EVAL_DOGFOOD. Also confirmed absent from ~/.claude/skills/: there is no page-depth-audit (or similarly named) skill installed anywhere on this machine, only a prompts/page-depth-audit.md doc under antfarm-memory -- so even with a web dogfood repo, the Builder has no runnable /page-depth-audit skill to invoke today, only a document it would need to know to read. Per the spec ('an explicit skill-unavailable message only passes if the skill is truly absent'), a genuinely-absent-skill run should surface that rather than silently doing nothing -- worth deciding whether this eval should assert that instead until a real skill exists."
+}

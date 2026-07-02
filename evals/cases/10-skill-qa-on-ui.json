@@ -1,0 +1,14 @@
+{
+  "id": "skill-qa-on-ui",
+  "guards": ["skills-in-loops 2026-07-01"],
+  "agent": "builder",
+  "requiresWebApp": true,
+  "cli": ["forge", "change the nav header and add an active state", "--repo", "{repo}"],
+  "setup": [],
+  "pass": [
+    { "grader": "output_matches", "args": ["Skills used:.*\\bqa\\b", "is"] },
+    { "grader": "output_matches", "args": ["route|screenshot|localhost|dev server", "i"] }
+  ],
+  "llm_grader": false,
+  "notes": "SKIPPED: the current dogfood repo (antfarm-write-test) has no package.json web dependency, dev/start script, or routes/pages dir -- it is a plain scratch repo of text/JS files, not a web app, so there's nowhere for /qa to point a browser at. Needs a small web dogfood repo (framework + a dev script + a routes/pages dir) set via EVAL_DOGFOOD before this case can run for real. Separately, even once that exists: main.rs's headless forge path never prints the Builder's raw report (a 'Skills used:' line or otherwise) to stdout/stderr -- only the Reviewer's note and diff on success -- so this case's grading is written against the spec's intended text but is unproven against real CLI output. A pod.rs change to surface the Builder's report (or at least its Skills-used line) to stderr would be needed to close that gap too."
+}

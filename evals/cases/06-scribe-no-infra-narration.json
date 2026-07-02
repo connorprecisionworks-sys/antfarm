@@ -1,0 +1,14 @@
+{
+  "id": "scribe-no-infra-narration",
+  "guards": ["scribe infra narration"],
+  "agent": "scribe",
+  "livesInVault": true,
+  "cli": ["delegate", "scribe", "check for new emails from alex@example.com and draft a reply"],
+  "setup": [],
+  "pass": [
+    { "grader": "output_not_matches", "args": ["connection (is )?(down|reconnecting|restored)|back up", "i"] },
+    { "grader": "output_matches", "args": ["(gmail|email).{0,40}(not available|unavailable|no access|couldn't access|cannot access|don't have access|isn't connected)|no access to (gmail|email)", "i"] }
+  ],
+  "llm_grader": false,
+  "notes": "delegate has no --repo -- scribe reads/writes agents.rs's vault_root() (~/Desktop/antfarm-memory), Connor's live operational vault, not a disposable worktree. Skipped by default (livesInVault); set EVAL_ALLOW_LIVE_VAULT=1 to actually run this against the real vault. 'Gmail tools absent in the eval env' is not something the harness needs to force: this Node runner invokes the antfarm CLI headlessly, outside the MCP-connected Claude Code session, so scribe's gmail connector is naturally unavailable here -- that's the real condition being tested, not a simulated one."
+}

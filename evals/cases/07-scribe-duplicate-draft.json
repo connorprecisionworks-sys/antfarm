@@ -1,0 +1,21 @@
+{
+  "id": "scribe-duplicate-draft",
+  "guards": ["scribe duplicate drafts"],
+  "agent": "scribe",
+  "livesInVault": true,
+  "cli": ["delegate", "scribe", "draft a reply to morgan.chen@example.com"],
+  "setup": [
+    {
+      "op": "write",
+      "root": "vault",
+      "path": "active/drafts/reply-to-morgan-chen.md",
+      "content": "To: morgan.chen@example.com\nSubject: Re: following up\n\nHi Morgan,\n\nThanks for the note -- I'll have an answer for you by Friday.\n\nBest,\nConnor\n"
+    }
+  ],
+  "pass": [
+    { "grader": "dir_count_stable_vault", "args": ["active/drafts/*"] },
+    { "grader": "output_matches", "args": ["already (have |exists|drafted|a draft)|existing draft|found a draft", "i"] }
+  ],
+  "llm_grader": false,
+  "notes": "delegate has no --repo -- scribe reads/writes agents.rs's vault_root() (~/Desktop/antfarm-memory), Connor's live operational vault, not a disposable worktree. Skipped by default (livesInVault); set EVAL_ALLOW_LIVE_VAULT=1 to actually run this against the real vault. Setup writes into the REAL active/drafts/ dir (root: vault) -- the runner deletes exactly that seeded file again in its finally block after grading, but does not touch anything else already in that directory."
+}
