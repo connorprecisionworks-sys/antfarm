@@ -363,10 +363,17 @@ const GRADERS = {
 const ENGINE_LOG_PREFIXES = ["[pod]", "[antfarm]", "[STEP]", "antfarm dispatch:", "Preparing worktree"];
 
 function stripAgentText(combined) {
-  return combined
+  const lines = combined
     .split("\n")
-    .filter((line) => !ENGINE_LOG_PREFIXES.some((p) => line.replace(/^\s+/, "").startsWith(p)))
-    .join("\n");
+    .filter((line) => !ENGINE_LOG_PREFIXES.some((p) => line.replace(/^\s+/, "").startsWith(p)));
+
+  // main.rs prints the raw `git diff HEAD` output under a standalone "Diff:"
+  // line — that's committed file content (e.g. a README bullet the Builder
+  // wrote), not agent voice, so cut it before grading the voice check.
+  const diffIdx = lines.findIndex((line) => line.trim() === "Diff:");
+  const voiceLines = diffIdx === -1 ? lines : lines.slice(0, diffIdx);
+
+  return voiceLines.join("\n");
 }
 
 // Cross-cutting case 12 (no-ai-tell): applied to every case's captured
