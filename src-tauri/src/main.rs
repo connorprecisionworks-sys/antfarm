@@ -2493,6 +2493,7 @@ fn run_cli(args: &[String], ctx: tauri::Context) {
                 false,
                 None,
                 None,
+                None,
             ) {
                 Ok((_, rx)) => {
                     let final_text = rx.recv().unwrap_or_default();

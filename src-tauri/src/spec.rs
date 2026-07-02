@@ -221,6 +221,7 @@ pub fn spec_loop(
         false,
         Some(repo_path.clone()),
         Some(false),
+        None,
     ) {
         Ok((_, rx)) => rx.recv().unwrap_or_default(),
         Err(e) => {

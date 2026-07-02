@@ -156,8 +156,12 @@ fn agent_sessions_dir() -> PathBuf {
     d
 }
 
-fn load_agent_session_id(agent_id: &str) -> Option<String> {
-    let path = agent_sessions_dir().join(format!("{agent_id}.txt"));
+// `session_key` names the on-disk session file (e.g. "builder-<pod_id>" so
+// concurrent pods don't share/clobber one resumable session); `agent_id` is
+// the agent definition whose prompt.md/agent.json mtimes gate invalidation —
+// these differ whenever a run namespaces its session by pod_id.
+fn load_agent_session_id(session_key: &str, agent_id: &str) -> Option<String> {
+    let path = agent_sessions_dir().join(format!("{session_key}.txt"));
     // Expire sessions after 24 hours
     let meta = std::fs::metadata(&path).ok()?;
     let session_mtime = meta.modified().ok()?;
@@ -186,12 +190,12 @@ fn load_agent_session_id(agent_id: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn save_agent_session_id(agent_id: &str, sid: &str) {
-    let _ = std::fs::write(agent_sessions_dir().join(format!("{agent_id}.txt")), sid);
+fn save_agent_session_id(session_key: &str, sid: &str) {
+    let _ = std::fs::write(agent_sessions_dir().join(format!("{session_key}.txt")), sid);
 }
 
-pub fn clear_agent_session_id(agent_id: &str) {
-    let _ = std::fs::remove_file(agent_sessions_dir().join(format!("{agent_id}.txt")));
+pub fn clear_agent_session_id(session_key: &str) {
+    let _ = std::fs::remove_file(agent_sessions_dir().join(format!("{session_key}.txt")));
 }
 
 // ── Run trace helpers ─────────────────────────────────────────────────────────
@@ -1002,7 +1006,12 @@ pub fn spawn_agent_run(
     resume_session: bool,
     repo_path: Option<String>,
     builder_write: Option<bool>,
+    session_key: Option<String>,
 ) -> Result<(String, mpsc::Receiver<String>), String> {
+    // Defaults to agent_id — callers only pass a distinct key (e.g.
+    // "builder-<pod_id>") when a run must not share its resumable session
+    // with other concurrent runs of the same agent.
+    let session_key = session_key.unwrap_or_else(|| agent_id.clone());
     let vault = vault_root();
 
     // ── Load agent definition ──────────────────────────────────────────────────
@@ -1132,7 +1141,7 @@ pub fn spawn_agent_run(
     };
 
     // ── Session reuse ──────────────────────────────────────────────────────────
-    let existing_sid = if resume_session { load_agent_session_id(&agent_id) } else { None };
+    let existing_sid = if resume_session { load_agent_session_id(&session_key, &agent_id) } else { None };
     let is_resuming  = existing_sid.is_some();
 
     // ── Spawn child ───────────────────────────────────────────────────────────
@@ -1280,6 +1289,7 @@ pub fn spawn_agent_run(
         let app2            = app.clone();
         let rid             = run_id.clone();
         let aid             = agent_id.clone();
+        let session_key_clone = session_key.clone();
         let task_clone      = task.clone();
         let vault_clone     = vault.clone();
         let children_arc    = agent_run_children.clone();
@@ -1514,10 +1524,10 @@ pub fn spawn_agent_run(
                     if is_resuming_clone || resume_session_clone {
                         if let Some(ref sid) = captured_sid {
                             if usage_pct < COMPACT_THRESHOLD_PCT {
-                                save_agent_session_id(&aid, sid);
+                                save_agent_session_id(&session_key_clone, sid);
                             } else {
                                 // Context over threshold — clear so next turn starts fresh.
-                                clear_agent_session_id(&aid);
+                                clear_agent_session_id(&session_key_clone);
                             }
                         }
                     }
@@ -1623,6 +1633,7 @@ pub fn run_agent(
         resume_session,
         repo_path,
         builder_write,
+        None,
     )?;
     Ok(run_id)
 }

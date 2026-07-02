@@ -48,11 +48,15 @@ pub struct PodStreamEvent {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn new_pod_id() -> String {
+    // Nanosecond resolution + pid: second-resolution alone collides whenever
+    // two `forge` runs start in the same wall-clock second (the whole point
+    // of running them concurrently), which would silently reunite two pods
+    // onto the same namespaced builder session.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("pod-{ts}")
+    format!("pod-{ts}-{}", std::process::id())
 }
 
 fn emit_pod(
@@ -152,8 +156,11 @@ pub fn pod_loop(
     task: String,
     context: Option<String>,
 ) -> PodTerminal {
-    // Clear any stale builder session so this pod starts fresh.
-    clear_agent_session_id("builder");
+    // Clear any stale session under this pod's own builder key so a re-run of
+    // the same pod_id starts fresh. Namespaced by pod_id (not the shared
+    // "builder" key) so concurrent pods never share/clobber one session.
+    let builder_session_key = format!("builder-{pod_id}");
+    clear_agent_session_id(&builder_session_key);
 
     eprintln!("[pod] {pod_id} started - repo={repo_path}");
 
@@ -178,6 +185,7 @@ pub fn pod_loop(
         false,
         Some(repo_path.clone()),
         Some(false),
+        None,
     ) {
         Ok((_, rx)) => {
             let raw = rx.recv().unwrap_or_default();
@@ -233,6 +241,7 @@ pub fn pod_loop(
             true, // resume_session — saves sid on round 0, resumes on 1+
             Some(repo_path.clone()),
             Some(true), // builder_write
+            Some(builder_session_key.clone()), // namespaced so concurrent pods don't share a session
         ) {
             Ok((_, rx)) => {
                 let t = rx.recv().unwrap_or_default();
@@ -302,6 +311,7 @@ pub fn pod_loop(
             false,
             Some(repo_path.clone()),
             Some(false),
+            None,
         ) {
             Ok((_, rx)) => {
                 let t = rx.recv().unwrap_or_default();
