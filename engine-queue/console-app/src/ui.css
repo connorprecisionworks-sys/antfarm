@@ -349,9 +349,21 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
 }
 
 .deleg-card {
+  position: relative; overflow: hidden;
   background: var(--surface); border: 1px solid var(--accent);
   border-radius: 14px; padding: 12px; margin: 2px 0 4px;
   animation: rise .2s ease both;
+}
+.deleg-card::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: -70%; width: 55%;
+  z-index: 0; pointer-events: none;
+  background: linear-gradient(115deg, transparent, rgba(255, 95, 168, 0.22), rgba(255, 138, 61, 0.15), transparent);
+  animation: deleg-wave 3.2s ease-in-out infinite;
+}
+.deleg-card > * { position: relative; z-index: 1; }
+@keyframes deleg-wave {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(320%); }
 }
 .deleg-head {
   font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
