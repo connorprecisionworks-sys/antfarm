@@ -5,13 +5,26 @@ const PIN_LENGTH = 6;
 const KINDS = ["forge", "spec"];
 
 const AGENTS = [
-  { value: "jack", label: "Captain Jack" },
+  { value: "chief-of-staff", label: "Captain Jack" },
   { value: "clerk", label: "Clerk" },
   { value: "scout", label: "Scout" },
   { value: "scribe", label: "Scribe" },
   { value: "pulitzer", label: "Pulitzer" },
   { value: "scholar", label: "Scholar" },
 ];
+
+// @mention aliases -> real vault agent folder ids.
+const AGENT_ALIASES = {
+  jack: "chief-of-staff",
+  captain: "chief-of-staff",
+  chief: "chief-of-staff",
+  "chief-of-staff": "chief-of-staff",
+  clerk: "clerk",
+  scout: "scout",
+  scribe: "scribe",
+  pulitzer: "pulitzer",
+  scholar: "scholar",
+};
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
@@ -53,6 +66,28 @@ const STATUS_TEXT = {
   approved: "Approved — publishing",
   pushed: "Shipped",
 };
+
+// Parse a ```delegate ... ``` block out of an agent reply into editable delegations.
+function parseDelegateBlock(content) {
+  const m = content.match(/```delegate\s*([\s\S]*?)```/i);
+  if (!m) return null;
+  const lines = m[1].trim().split("\n");
+  const aliasRe = /^([a-z][a-z-]*):\s*(.*)$/i;
+  const dels = [];
+  let cur = null;
+  for (const line of lines) {
+    const lm = line.match(aliasRe);
+    if (lm && AGENT_ALIASES[lm[1].toLowerCase()]) {
+      if (cur) dels.push(cur);
+      cur = { agent: AGENT_ALIASES[lm[1].toLowerCase()], task: lm[2] };
+    } else if (cur) {
+      cur.task += "\n" + line;
+    }
+  }
+  if (cur) dels.push(cur);
+  const intro = content.replace(/```delegate[\s\S]*?```/i, "").trim();
+  return dels.length ? { intro, delegations: dels } : null;
+}
 
 /* ─────────────────────────── login ─────────────────────────── */
 
@@ -384,13 +419,43 @@ function ChatBubble({ message }) {
   );
 }
 
+function DelegationCard({ delegation, onSend }) {
+  const [task, setTask] = useState(delegation.task.trim());
+  const [sent, setSent] = useState(false);
+  const label = AGENTS.find((a) => a.value === delegation.agent)?.label || delegation.agent;
+  return (
+    <div className="deleg-card">
+      <div className="deleg-head">Delegate to {label}</div>
+      <textarea
+        className="deleg-task"
+        value={task}
+        onChange={(e) => setTask(e.target.value)}
+        rows={4}
+      />
+      <button
+        className="deleg-send"
+        disabled={sent || !task.trim()}
+        onClick={() => {
+          onSend(delegation.agent, task.trim());
+          setSent(true);
+        }}
+      >
+        {sent ? "Sent to " + label : "Send to " + label}
+      </button>
+    </div>
+  );
+}
+
 function AgentsTab() {
   const [agent, setAgent] = useState(AGENTS[0].value);
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [selectedText, setSelectedText] = useState("");
   const taRef = useRef(null);
   const threadRef = useRef(null);
+  const prevLenRef = useRef(0);
+  const sigRef = useRef("");
 
   const agentLabel = useMemo(
     () => AGENTS.find((a) => a.value === agent)?.label || agent,
@@ -404,20 +469,64 @@ function AgentsTab() {
       .eq("agent", agent)
       .order("created_at", { ascending: true })
       .limit(200);
-    if (!error) setMessages(data || []);
+    if (error) return;
+    const rows = data || [];
+    const sig = rows.length + ":" + (rows[rows.length - 1]?.id || "");
+    if (sig === sigRef.current) return; // nothing changed — skip re-render + scroll
+    sigRef.current = sig;
+    setMessages(rows);
   }, [agent]);
 
   useEffect(() => {
     setMessages([]);
+    prevLenRef.current = 0;
+    sigRef.current = "";
     load();
     const id = setInterval(load, 2500);
     return () => clearInterval(id);
   }, [load]);
 
+  // Only auto-scroll when a NEW message arrived AND you're already near the bottom,
+  // so scrolling up to read a long reply doesn't snap you back down.
   useEffect(() => {
     const el = threadRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const grew = messages.length > prevLenRef.current;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+    if (grew && nearBottom) el.scrollTop = el.scrollHeight;
+    prevLenRef.current = messages.length;
   }, [messages]);
+
+  // Highlight text in a reply -> offer to ask about it.
+  useEffect(() => {
+    const onSel = () => {
+      const sel = window.getSelection();
+      const t = sel ? sel.toString().trim() : "";
+      if (
+        t &&
+        threadRef.current &&
+        sel.anchorNode &&
+        threadRef.current.contains(sel.anchorNode)
+      ) {
+        setSelectedText(t);
+      } else if (!t) {
+        setSelectedText("");
+      }
+    };
+    document.addEventListener("selectionchange", onSel);
+    return () => document.removeEventListener("selectionchange", onSel);
+  }, []);
+
+  const askAboutSelection = () => {
+    const q = selectedText.length > 240 ? selectedText.slice(0, 240) + "…" : selectedText;
+    setText((cur) => `About this: "${q}"\n\n` + cur);
+    setSelectedText("");
+    window.getSelection()?.removeAllRanges();
+    setTimeout(() => {
+      taRef.current?.focus();
+      grow();
+    }, 0);
+  };
 
   const grow = () => {
     const el = taRef.current;
@@ -427,17 +536,29 @@ function AgentsTab() {
   };
 
   const send = async () => {
-    const content = text.trim();
+    let content = text.trim();
     if (!content || busy) return;
+    // A leading @mention routes this message to another agent and switches the thread.
+    let target = agent;
+    const m = content.match(/^@([a-z-]+)\s+/i);
+    if (m) {
+      const resolved = AGENT_ALIASES[m[1].toLowerCase()];
+      if (resolved) {
+        target = resolved;
+        content = content.slice(m[0].length).trim();
+        if (resolved !== agent) setAgent(resolved);
+      }
+    }
+    if (!content) return;
     setBusy(true);
     const { error: msgError } = await supabase
       .from("messages")
-      .insert({ agent, role: "user", content });
+      .insert({ agent: target, role: "user", content });
     if (!msgError) {
       const { error: jobError } = await supabase.from("jobs").insert({
         repo: "-",
         kind: "chat",
-        agent,
+        agent: target,
         task: content,
       });
       if (jobError) alert(jobError.message);
@@ -450,6 +571,13 @@ function AgentsTab() {
     setText("");
     grow();
     load();
+  };
+
+  const handleDelegate = async (agentId, task) => {
+    if (!task) return;
+    await supabase.from("messages").insert({ agent: agentId, role: "user", content: task });
+    await supabase.from("jobs").insert({ repo: "-", kind: "chat", agent: agentId, task });
+    setAgent(agentId); // jump to that agent's thread to watch the reply
   };
 
   const waitingReply =
@@ -478,7 +606,24 @@ function AgentsTab() {
             <div className="empty-sub">Say hi to {agentLabel}.</div>
           </div>
         ) : (
-          messages.map((m) => <ChatBubble key={m.id} message={m} />)
+          messages.map((m) => {
+            if (m.role === "assistant") {
+              const parsed = parseDelegateBlock(m.content);
+              if (parsed) {
+                return (
+                  <div key={m.id}>
+                    {parsed.intro && (
+                      <ChatBubble message={{ ...m, content: parsed.intro }} />
+                    )}
+                    {parsed.delegations.map((d, i) => (
+                      <DelegationCard key={i} delegation={d} onSend={handleDelegate} />
+                    ))}
+                  </div>
+                );
+              }
+            }
+            return <ChatBubble key={m.id} message={m} />;
+          })
         )}
         {waitingReply && (
           <div className="bubble-row">
@@ -492,6 +637,11 @@ function AgentsTab() {
       </div>
 
       <div className="composer chat-composer">
+        {selectedText && (
+          <button className="ask-pill" onClick={askAboutSelection}>
+            Ask about the highlighted text
+          </button>
+        )}
         <div className="input-bar">
           <textarea
             ref={taRef}
@@ -508,6 +658,7 @@ function AgentsTab() {
             {busy ? <span className="spin" /> : <ArrowUp />}
           </button>
         </div>
+        <div className="chat-hint">Tip: start with @jack, @clerk, @scout, @scribe, @pulitzer, or @scholar to switch agent.</div>
       </div>
     </div>
   );
